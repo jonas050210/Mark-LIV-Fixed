@@ -6,6 +6,14 @@ import sys
 import traceback
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so emoji in log/print calls don't crash the
+# background threads on Windows consoles (default cp1252 can't encode them).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import sounddevice as sd
 from google import genai
 from google.genai import types
