@@ -349,6 +349,36 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
+def _exc_text(exc: BaseException) -> str:
+    """Flatten an exception — including every leaf of a (Base)ExceptionGroup —
+    into one string so the reconnect heuristics can see the real cause. str()
+    of a group is only "unhandled errors in a TaskGroup", which hides the 1008
+    close code, the GoAway reason and the resumption-handle errors."""
+    parts: list[str] = []
+
+    def _walk(e: BaseException, depth: int = 0):
+        if depth > 6:
+            return
+        parts.append(f"{type(e).__name__}: {e}")
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                _walk(sub, depth + 1)
+        cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+        if cause is not None and cause is not e:
+            _walk(cause, depth + 1)
+
+    _walk(exc)
+    return " | ".join(parts)
+
+
+def _is_go_away_close(text: str) -> bool:
+    """True when the server ended the session on its own schedule (GoAway →
+    close code 1008 / "policy violation" in the websocket library's wording).
+    The resumption handle is still valid in that case and must be kept."""
+    t = text.lower()
+    return ("1008" in t) or ("go_away" in t) or ("goaway" in t) or ("go away" in t)
+
+
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
@@ -373,6 +403,7 @@ class JarvisLive:
         self.ui.on_audio_device_change = self._on_audio_device_change
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
+        self._go_away_task: asyncio.Task | None = None   # pending GoAway refresh
 
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
@@ -594,6 +625,49 @@ class JarvisLive:
             + ("..." if keep else " (starting a fresh conversation)...")
         )
         raise _ReconnectSignal(keep_context=keep)
+
+    # ── GoAway ────────────────────────────────────────────────────────────────
+    # Shortly before a Live session hits its server-side lifetime the server
+    # sends `go_away` with `time_left`. Left alone, the socket is closed with
+    # 1008 mid-sentence. Instead: wait until the assistant has stopped talking
+    # (but no later than two seconds before the deadline) and rebuild through
+    # the ordinary voluntary-reconnect path, which replays the resumption
+    # handle so the conversation continues where it was.
+
+    @staticmethod
+    def _go_away_seconds(go_away) -> float:
+        tl = getattr(go_away, "time_left", None)
+        try:
+            if tl is None:
+                return 10.0
+            if hasattr(tl, "total_seconds"):
+                return float(tl.total_seconds())
+            if isinstance(tl, (int, float)):
+                return float(tl)
+            m = re.search(r"[\d.]+", str(tl))
+            return float(m.group()) if m else 10.0
+        except Exception:
+            return 10.0
+
+    def _on_go_away(self, go_away) -> None:
+        if self._go_away_task is not None and not self._go_away_task.done():
+            return   # already scheduled for this session
+        secs = self._go_away_seconds(go_away)
+        print(f"[JARVIS] 🔁 GoAway received — {secs:.0f}s left, scheduling session refresh")
+        self._go_away_task = asyncio.create_task(self._go_away_reconnect(secs))
+
+    async def _go_away_reconnect(self, secs: float) -> None:
+        deadline = time.monotonic() + max(0.0, secs - 2.0)
+        try:
+            while time.monotonic() < deadline:
+                with self._speaking_lock:
+                    speaking = self._is_speaking
+                if not speaking:
+                    break
+                await asyncio.sleep(0.1)
+            self.request_reconnect(keep_context=True, reason="session refresh")
+        except asyncio.CancelledError:
+            pass
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -1014,6 +1088,11 @@ class JarvisLive:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
 
+                    # ── GoAway ───────────────────────────────────────────────
+                    _ga = getattr(response, "go_away", None)
+                    if _ga is not None:
+                        self._on_go_away(_ga)
+
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
@@ -1153,6 +1232,9 @@ class JarvisLive:
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
             stream = _open_spk(None)
 
+        _last_audio_t = time.monotonic()
+        _WATCHDOG_S   = 1.5   # no audio for this long while "speaking" → release
+
         try:
             while True:
                 try:
@@ -1168,8 +1250,21 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    elif (
+                        self._is_speaking
+                        and self.audio_in_queue.empty()
+                        and (time.monotonic() - _last_audio_t) > _WATCHDOG_S
+                    ):
+                        # Speaking watchdog: after a tool call the server may
+                        # never send turn_complete for the pre-tool sentence,
+                        # so the flag would stay set and the mic stay gated
+                        # for good. Silence for 1.5 s means it is not talking.
+                        print("[JARVIS] 🐕 speaking flag released by watchdog")
+                        self.set_speaking(False)
+                        _last_audio_t = time.monotonic()
                     continue
 
+                _last_audio_t = time.monotonic()
                 self.set_speaking(True)
 
                 # Batch all immediately-available chunks into one write to reduce
@@ -1610,6 +1705,9 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     self._reconnect_event.clear()  # ignore requests from before this session
+                    if self._go_away_task is not None:
+                        self._go_away_task.cancel()
+                        self._go_away_task = None
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1650,6 +1748,19 @@ class JarvisLive:
                     self._conn_backoff = 0
                     continue
 
+                err_str = _exc_text(e)
+
+                # The server closed the session itself (GoAway → 1008), either
+                # because the refresh task did not get there first or because
+                # the deadline was shorter than announced. The handle is still
+                # good: reconnect at once and keep the conversation.
+                if _is_go_away_close(err_str):
+                    print("[JARVIS] 🔁 Session closed by server (GoAway/1008) — reconnecting with context")
+                    if self._resume_handle is not None:
+                        self.ui.write_log("SYS: Applying session refresh — reconnecting...")
+                    self._conn_backoff = 0
+                    continue
+
                 # A resumption handle the server will not accept — expired, or
                 # belonging to a session it has since dropped. Without this, the
                 # same dead handle would be replayed on every retry and the
@@ -1657,10 +1768,10 @@ class JarvisLive:
                 # survive a reconnect would be the thing preventing one. Drop it
                 # once and let the next attempt start clean.
                 if _resumed_with and (
-                    "resum" in str(e).lower()
-                    or "handle" in str(e).lower()
-                    or "INVALID_ARGUMENT" in str(e)
-                    or "NOT_FOUND" in str(e)
+                    "resum" in err_str.lower()
+                    or "handle" in err_str.lower()
+                    or "INVALID_ARGUMENT" in err_str
+                    or "NOT_FOUND" in err_str
                 ):
                     print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
                     self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
@@ -1668,7 +1779,6 @@ class JarvisLive:
                     self._conn_backoff = 0
                     continue
 
-                err_str = str(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
@@ -1713,6 +1823,9 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                if self._go_away_task is not None:
+                    self._go_away_task.cancel()
+                    self._go_away_task = None
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())

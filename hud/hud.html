@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HUD</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+               background: #00060a; font-family: Bahnschrift, "Segoe UI", sans-serif;
+               user-select: none; -webkit-user-select: none; cursor: default; }
+  #stage  { position: absolute; inset: 0; background: #000; overflow: hidden; }
+  /* video is shown in grey; the tint layer multiplies it with the accent colour */
+  #vid    { position: absolute; left: 50%; top: 50%; min-width: 100%; min-height: 100%;
+            transform: translate(-50%, -50%); object-fit: cover;
+            filter: grayscale(1) brightness(0.9) contrast(1.15);
+            transition: filter 0.6s ease; }
+  #cv     { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+  #tint   { position: absolute; inset: 0; mix-blend-mode: multiply; background: #00d4ff;
+            transition: background 0.6s ease; }
+  #core   { position: absolute; inset: 0; mix-blend-mode: screen; pointer-events: none;
+            background: radial-gradient(circle at 50% 50%, rgba(255,255,255,0.0) 0%, rgba(0,0,0,0) 60%); }
+  #vig    { position: absolute; inset: 0; pointer-events: none;
+            background: radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0) 45%, rgba(0,6,10,0.92) 100%); }
+  #ring   { position: absolute; left: 50%; top: 50%; width: 46vmin; height: 46vmin;
+            margin: -23vmin 0 0 -23vmin; border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.10); pointer-events: none;
+            box-shadow: 0 0 40px rgba(255,255,255,0.04) inset; transition: opacity .4s; }
+  #ring::after { content: ""; position: absolute; inset: 12%; border-radius: 50%;
+            border: 1px dashed rgba(255,255,255,0.08); }
+  #status { position: absolute; left: 0; right: 0; top: 14px; text-align: center;
+            font-size: 11px; letter-spacing: 4px; color: rgba(255,255,255,0.55);
+            text-transform: uppercase; pointer-events: none; }
+  #status.muted { color: #ff3366; }
+  #cap    { position: absolute; left: 8%; right: 8%; bottom: 8%; text-align: center;
+            pointer-events: none; opacity: 0; transition: opacity 0.35s ease; }
+  #cap .who { display: block; font-size: 10px; letter-spacing: 3px; text-transform: uppercase;
+            color: rgba(255,255,255,0.45); margin-bottom: 4px; }
+  #cap .txt { display: inline-block; font-size: 15px; line-height: 1.35; color: #eaffff;
+            background: rgba(0, 6, 10, 0.55); padding: 6px 12px; border-radius: 3px;
+            max-width: 100%; text-shadow: 0 0 8px rgba(0,0,0,0.8); }
+  #cap.you .txt { color: rgba(234,255,255,0.8); }
+  #cap.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="vid" muted loop playsinline preload="auto" autoplay>
+    <source src="plexus_loop.webm" type="video/webm">
+  </video>
+  <canvas id="cv"></canvas>
+  <div id="tint"></div>
+  <div id="core"></div>
+  <div id="vig"></div>
+  <div id="ring"></div>
+  <div id="status">initialising</div>
+  <div id="cap"><span class="who"></span><span class="txt"></span></div>
+</div>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const vid = $("vid"), cv = $("cv"), tint = $("tint"), core = $("core"),
+        statusEl = $("status"), cap = $("cap"), ring = $("ring");
+
+  // ── state ────────────────────────────────────────────────────────────────
+  let accent = "#00d4ff";
+  let state = "INITIALISING", speaking = false, muted = false;
+  let level = 0, levelDisp = 0;
+  let pulse = 0;                 // one-shot pulse from speak()
+  let useVideo = true;
+  let name = "JARVIS";
+
+  const PROFILES = {
+    INITIALISING: { rate: 0.6, bright: 0.55, sat: 0.6, core: 0.10 },
+    LISTENING:    { rate: 1.0, bright: 0.95, sat: 1.0, core: 0.18 },
+    THINKING:     { rate: 1.7, bright: 1.05, sat: 1.0, core: 0.30 },
+    SPEAKING:     { rate: 1.3, bright: 1.15, sat: 1.0, core: 0.40 },
+    SLEEPING:     { rate: 0.35, bright: 0.40, sat: 0.45, core: 0.05 },
+    MUTED:        { rate: 0.5, bright: 0.60, sat: 0.35, core: 0.06 },
+  };
+  const cur = { rate: 1, bright: 0.9, sat: 1, core: 0.1 };
+
+  // ── colour helpers ───────────────────────────────────────────────────────
+  function hexToRgb(h) {
+    h = (h || "").replace("#", "");
+    if (h.length === 3) h = h.split("").map(c => c + c).join("");
+    const n = parseInt(h, 16);
+    if (isNaN(n) || h.length !== 6) return { r: 0, g: 212, b: 255 };
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  }
+  function mix(a, b, t) { return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t }; }
+  function rgbStr(c, a) { return `rgba(${c.r | 0},${c.g | 0},${c.b | 0},${a === undefined ? 1 : a})`; }
+  const WHITE = { r: 255, g: 255, b: 255 };
+
+  // ── video / fallback ─────────────────────────────────────────────────────
+  function enableFallback() {
+    if (!useVideo) return;
+    useVideo = false;
+    vid.style.display = "none";
+    cv.style.display = "block";
+    initPlexus();
+  }
+  vid.addEventListener("error", enableFallback);
+  const src = vid.querySelector("source");
+  if (src) src.addEventListener("error", enableFallback);
+  vid.play && vid.play().catch(() => {});
+  // If nothing has loaded after 4 s, the file is missing or cannot be decoded.
+  setTimeout(() => { if (useVideo && vid.readyState < 2) enableFallback(); }, 4000);
+
+  // ── procedural plexus (used when plexus_loop.webm is absent) ─────────────
+  let pts = [], ctx = null, W = 0, H = 0;
+  function initPlexus() {
+    ctx = cv.getContext("2d");
+    resize();
+    pts = [];
+    const n = Math.max(70, Math.min(140, Math.floor((W * H) / 9000)));
+    for (let i = 0; i < n; i++) {
+      pts.push({ x: Math.random() * W, y: Math.random() * H,
+                 vx: (Math.random() - 0.5) * 0.35, vy: (Math.random() - 0.5) * 0.35,
+                 r: 1 + Math.random() * 1.6 });
+    }
+  }
+  function resize() {
+    W = cv.width = cv.clientWidth || window.innerWidth;
+    H = cv.height = cv.clientHeight || window.innerHeight;
+  }
+  window.addEventListener("resize", () => { if (!useVideo) resize(); });
+
+  function drawPlexus(dt) {
+    if (!ctx) return;
+    const c = hexToRgb(accent);
+    const col = mix(WHITE, c, cur.sat);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    const sp = cur.rate * dt * 0.06;
+    const link = Math.min(W, H) * 0.16;
+    for (const p of pts) {
+      p.x += p.vx * sp; p.y += p.vy * sp;
+      if (p.x < -10) p.x = W + 10; else if (p.x > W + 10) p.x = -10;
+      if (p.y < -10) p.y = H + 10; else if (p.y > H + 10) p.y = -10;
+    }
+    ctx.lineWidth = 1;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      for (let j = i + 1; j < pts.length; j++) {
+        const b = pts[j];
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < link) {
+          ctx.strokeStyle = rgbStr(col, (1 - d / link) * 0.55 * cur.bright);
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+    }
+    for (const p of pts) {
+      ctx.fillStyle = rgbStr(col, 0.9 * cur.bright);
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ── per-frame update ─────────────────────────────────────────────────────
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(64, now - last); last = now;
+    const prof = PROFILES[state] || PROFILES.LISTENING;
+    const k = 1 - Math.pow(0.001, dt / 1000);   // smoothing
+    cur.rate   += (prof.rate   - cur.rate)   * k;
+    cur.bright += (prof.bright - cur.bright) * k;
+    cur.sat    += (prof.sat    - cur.sat)    * k;
+    cur.core   += (prof.core   - cur.core)   * k;
+
+    // audio level: fast attack, slow release
+    if (level > levelDisp) levelDisp += (level - levelDisp) * 0.6;
+    else levelDisp += (level - levelDisp) * 0.08;
+    level *= 0.92;
+    pulse *= 0.94;
+
+    const boost = (speaking ? levelDisp * 0.8 : levelDisp * 0.4) + pulse;
+
+    const c = hexToRgb(accent);
+    const tintCol = mix(WHITE, c, cur.sat);
+    tint.style.background = rgbStr(tintCol);
+
+    if (useVideo) {
+      try { vid.playbackRate = Math.max(0.25, Math.min(3, cur.rate + boost * 0.8)); } catch (e) {}
+      vid.style.filter = `grayscale(1) brightness(${(cur.bright + boost * 0.5).toFixed(3)}) contrast(1.15)`;
+    } else {
+      drawPlexus(dt * (1 + boost));
+    }
+
+    const coreA = Math.min(0.9, cur.core + boost * 0.9);
+    const coreR = 18 + boost * 22;
+    core.style.background =
+      `radial-gradient(circle at 50% 50%, ${rgbStr(mix(c, WHITE, 0.55), coreA)} 0%, ` +
+      `${rgbStr(c, coreA * 0.35)} ${coreR.toFixed(1)}%, rgba(0,0,0,0) ${(coreR * 2.4).toFixed(1)}%)`;
+
+    ring.style.borderColor = rgbStr(mix(c, WHITE, 0.3), 0.10 + boost * 0.35);
+    ring.style.transform = `scale(${(1 + boost * 0.06).toFixed(4)})`;
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ── caption ──────────────────────────────────────────────────────────────
+  let capTimer = null;
+  function setCaption(text, who, live) {
+    text = (text || "").trim();
+    if (capTimer) { clearTimeout(capTimer); capTimer = null; }
+    if (!text) { cap.classList.remove("show"); return; }
+    cap.querySelector(".who").textContent = who === "you" ? "you" : name;
+    cap.querySelector(".txt").textContent = text;
+    cap.classList.toggle("you", who === "you");
+    cap.classList.add("show");
+    if (!live) {
+      const ms = Math.min(14000, 3500 + text.length * 45);
+      capTimer = setTimeout(() => cap.classList.remove("show"), ms);
+    }
+  }
+
+  function setState(s, sp, mu) {
+    state = String(s || "LISTENING").toUpperCase();
+    speaking = !!sp;
+    muted = !!mu;
+    if (muted && state !== "SPEAKING") state = "MUTED";
+    statusEl.textContent = muted ? "microphone muted" : state.toLowerCase();
+    statusEl.classList.toggle("muted", muted);
+  }
+
+  // ── public API ───────────────────────────────────────────────────────────
+  window.hud = {
+    setState: setState,
+    setLevel: function (l) { l = +l || 0; if (l > level) level = Math.min(1, l); },
+    setColor: function (hex) { if (hex) accent = String(hex); },
+    setName:  function (n) { if (n) name = String(n); },
+    speak:    function (text) { pulse = Math.min(1, pulse + 0.6); if (text) setCaption(text, "ai", false); },
+    setCaption: setCaption,
+  };
+
+  // ── demo mode (open the file in a browser with ?demo=1) ──────────────────
+  const q = new URLSearchParams(location.search);
+  if (q.get("demo") === "1") {
+    const seq = ["INITIALISING", "LISTENING", "THINKING", "SPEAKING", "LISTENING", "SLEEPING"];
+    let i = 0;
+    setInterval(() => {
+      const s = seq[i++ % seq.length];
+      setState(s, s === "SPEAKING", false);
+      if (s === "SPEAKING") window.hud.speak("Demo mode: this is what a spoken line looks like.");
+      if (s === "LISTENING") setCaption("and this is what you said", "you", false);
+    }, 2500);
+    setInterval(() => { if (state === "SPEAKING") window.hud.setLevel(0.2 + Math.random() * 0.8); }, 90);
+  }
+})();
+</script>
+</body>
+</html>

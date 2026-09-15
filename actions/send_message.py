@@ -153,7 +153,33 @@ def _send_whatsapp(receiver: str, message: str) -> str:
     return _desktop_send("WhatsApp", receiver, message)
 
 def _send_telegram(receiver: str, message: str) -> str:
-    return _desktop_send("Telegram", receiver, message)
+    """Telegram Desktop has its own flow.
+
+    Ctrl+F inside an OPEN chat searches the messages of that chat, not the
+    contact list — so the second message in a row to the same person was typed
+    into the in-chat search box and never sent. Two Escapes first: the first
+    closes any in-chat search / popup, the second leaves the open chat and
+    returns focus to the chat list. Only then does Ctrl+F reach the global
+    contact search."""
+    _require_pyautogui()
+    if not _open_app("Telegram"):
+        return "Could not open Telegram."
+
+    time.sleep(1.0)
+    pyautogui.press("escape")
+    time.sleep(0.25)
+    pyautogui.press("escape")
+    time.sleep(0.35)
+
+    _search_in_app(receiver)
+    pyautogui.press("enter")
+    time.sleep(0.9)
+
+    _paste_text(message)
+    time.sleep(0.2)
+    pyautogui.press("enter")
+    time.sleep(0.3)
+    return f"Message sent to {receiver} via Telegram."
 
 def _send_signal(receiver: str, message: str) -> str:
     return _desktop_send("Signal", receiver, message)
