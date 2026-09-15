@@ -310,46 +310,212 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+# ── screen_find ───────────────────────────────────────────────────────────────
+# Finds a UI element by description and returns its screen coordinates.
+#
+#  • Captures the ACTIVE window only (via mss) — the element the user means is
+#    almost always in the window in front, and a smaller image gives the model
+#    a much better hit rate than a full multi-monitor desktop. If the active
+#    window is the assistant's own window, or none can be determined, the whole
+#    virtual desktop is captured instead.
+#  • The model answers with a bounding box on Gemini's native 0–1000 grid
+#    ([ymin, xmin, ymax, xmax]); the box is converted back to pixels. A large
+#    box (a whole toolbar, a whole panel) triggers a second, zoomed pass on the
+#    crop around it so the click lands on the element and not on its region.
+#  • Models: gemini-flash-latest first, gemini-flash-lite-latest as fallback.
+#    A 503/504/429 puts that model on a 10-minute block list so the next call
+#    goes straight to the other one. Every request has a 20-second timeout, so
+#    a click never hangs the assistant.
+
+_FIND_MODELS      = ("gemini-flash-latest", "gemini-flash-lite-latest")
+_FIND_BLOCK_S     = 600.0     # 10 minutes
+_FIND_TIMEOUT_S   = 20.0
+_FIND_BLOCKED: dict[str, float] = {}   # model → monotonic time until which it is blocked
+_OWN_WINDOW_TAGS  = ("mark liii", "jarvis")
+
+
+def _own_window_titles() -> tuple[str, ...]:
+    tags = list(_OWN_WINDOW_TAGS)
+    try:
+        nm = (_load_config().get("assistant_name") or "").strip().lower()
+        if nm:
+            tags.append(nm)
+    except Exception:
+        pass
+    return tuple(tags)
+
+
+def _active_window_rect() -> tuple[tuple[int, int, int, int], str] | None:
+    """(left, top, width, height), title of the foreground window — or None if
+    there is none / it is our own window / it is minimised."""
+    try:
+        import pygetwindow as gw
+        win = gw.getActiveWindow()
+        if win is None:
+            return None
+        title = (win.title or "").strip()
+        tl = title.lower()
+        if not title or any(tag in tl for tag in _own_window_titles()):
+            return None
+        if getattr(win, "isMinimized", False):
+            return None
+        l, t, w, h = int(win.left), int(win.top), int(win.width), int(win.height)
+        if w < 40 or h < 40:
+            return None
+        return (l, t, w, h), title
+    except Exception:
+        return None
+
+
+def _grab(region: tuple[int, int, int, int] | None):
+    """Screenshot via mss. region=(left, top, width, height) or None for the
+    whole virtual desktop. Returns (png_bytes, (left, top, width, height))."""
+    import mss
+    import mss.tools
+    with mss.mss() as sct:
+        virt = sct.monitors[0]   # whole virtual desktop
+        vl, vt = int(virt["left"]), int(virt["top"])
+        vw, vh = int(virt["width"]), int(virt["height"])
+        if region is None:
+            l, t, w, h = vl, vt, vw, vh
+        else:
+            l, t, w, h = region
+            # Clamp to the virtual desktop (windows can hang off-screen).
+            r = min(l + w, vl + vw)
+            b = min(t + h, vt + vh)
+            l = max(l, vl)
+            t = max(t, vt)
+            w, h = max(1, r - l), max(1, b - t)
+        shot = sct.grab({"left": l, "top": t, "width": w, "height": h})
+        png = mss.tools.to_png(shot.rgb, shot.size)
+        return png, (l, t, w, h)
+
+
+def _find_model_order() -> list[str]:
+    now = time.monotonic()
+    ready   = [m for m in _FIND_MODELS if _FIND_BLOCKED.get(m, 0.0) <= now]
+    blocked = [m for m in _FIND_MODELS if m not in ready]
+    return ready + blocked        # blocked ones only as a last resort
+
+
+def _is_overload(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in (
+        "503", "504", "429", "unavailable", "resource_exhausted", "resource exhausted",
+        "overloaded", "deadline", "rate limit", "quota",
+    ))
+
+
+def _ask_box(client, gtypes, png: bytes, description: str, deadline: float):
+    """One model round-trip. Returns [ymin, xmin, ymax, xmax] on the 0–1000 grid
+    or None (NOT_FOUND / all models failed)."""
+    prompt = (
+        "This is a screenshot of a computer screen. Find the UI element described as: "
+        f"'{description}'. Answer with ONLY a JSON object of the form "
+        '{"box_2d": [ymin, xmin, ymax, xmax]} using the 0-1000 coordinate grid '
+        "(top-left is 0,0, bottom-right is 1000,1000). Make the box as tight as "
+        "possible around the exact element (the button, icon, field or text itself, "
+        "not the region around it). If the element is not visible, answer exactly: "
+        "NOT_FOUND"
+    )
+    last_err = ""
+    for model in _find_model_order():
+        remaining = deadline - time.monotonic()
+        if remaining < 1.0:
+            break
+        timeout_ms = int(min(_FIND_TIMEOUT_S, remaining) * 1000)
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=[gtypes.Part.from_bytes(data=png, mime_type="image/png"), prompt],
+                config=gtypes.GenerateContentConfig(
+                    temperature=0.0,
+                    http_options=gtypes.HttpOptions(timeout=timeout_ms),
+                ),
+            )
+            text = (resp.text or "").strip()
+            if "NOT_FOUND" in text.upper():
+                return None
+            m = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", text)
+            if not m:
+                last_err = f"{model}: unparsable answer {text[:80]!r}"
+                continue
+            box = [int(m.group(i)) for i in range(1, 5)]
+            box = [max(0, min(1000, v)) for v in box]
+            return box
+        except Exception as e:
+            last_err = f"{model}: {e}"
+            if _is_overload(str(e)):
+                _FIND_BLOCKED[model] = time.monotonic() + _FIND_BLOCK_S
+                print(f"[ComputerControl] ⚠️ {model} overloaded — blocked for 10 min, trying next")
+            else:
+                print(f"[ComputerControl] ⚠️ {model} failed: {e}")
+            continue
+    if last_err:
+        print(f"[ComputerControl] ⚠️ screen_find: {last_err}")
+    return None
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
         return None
 
+    t0       = time.monotonic()
+    deadline = t0 + _FIND_TIMEOUT_S
     try:
         from google import genai
         from google.genai import types as gtypes
 
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
+        # ── 1. capture ─────────────────────────────────────────────────────
+        region = None
+        scope  = "full screen"
+        aw = _active_window_rect()
+        if aw is not None:
+            region = aw[0]
+            scope  = "active window"
+        png, (L, T, W, H) = _grab(region)
 
         client = genai.Client(api_key=api_key)
-        prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
-            f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
-        )
 
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=[
-                gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                prompt,
-            ],
-        )
-
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
+        # ── 2. first pass: box on the 0–1000 grid → pixels ────────────────
+        box = _ask_box(client, gtypes, png, description, deadline)
+        if box is None:
+            print(f"[ComputerControl] screen_find '{description}' -> NOT_FOUND [{scope}]")
             return None
+        ymin, xmin, ymax, xmax = box
+        bx1 = L + xmin / 1000.0 * W
+        by1 = T + ymin / 1000.0 * H
+        bx2 = L + xmax / 1000.0 * W
+        by2 = T + ymax / 1000.0 * H
 
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        # ── 3. zoom pass when the box is large ────────────────────────────
+        bw, bh = bx2 - bx1, by2 - by1
+        big = (bw > 0.18 * W) or (bh > 0.18 * H) or (bw * bh > 0.04 * W * H)
+        if big and (deadline - time.monotonic()) > 4.0:
+            pad = 0.35
+            zl = int(max(L, bx1 - bw * pad))
+            zt = int(max(T, by1 - bh * pad))
+            zr = int(min(L + W, bx2 + bw * pad))
+            zb = int(min(T + H, by2 + bh * pad))
+            zw, zh = max(1, zr - zl), max(1, zb - zt)
+            if zw >= 24 and zh >= 24:
+                png2, (L2, T2, W2, H2) = _grab((zl, zt, zw, zh))
+                box2 = _ask_box(client, gtypes, png2, description, deadline)
+                if box2 is not None:
+                    y1, x1, y2, x2 = box2
+                    bx1 = L2 + x1 / 1000.0 * W2
+                    by1 = T2 + y1 / 1000.0 * H2
+                    bx2 = L2 + x2 / 1000.0 * W2
+                    by2 = T2 + y2 / 1000.0 * H2
+                    scope += " +zoom"
+
+        x = int(round((bx1 + bx2) / 2.0))
+        y = int(round((by1 + by2) / 2.0))
+        print(f"[ComputerControl] screen_find '{description}' -> ({x}, {y}) [{scope}] "
+              f"{time.monotonic() - t0:.1f}s")
+        return x, y
 
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
@@ -475,7 +641,12 @@ def computer_control(
             desc   = params.get("description", "")
             coords = _screen_find(desc)
             if coords:
-                time.sleep(0.2)
+                # Glide to the target first: a visible move lets the user see
+                # where the click is about to land, and some apps only arm a
+                # control on hover.
+                _require_pyautogui()
+                pyautogui.moveTo(coords[0], coords[1], duration=0.25)
+                time.sleep(0.1)
                 _click(x=coords[0], y=coords[1])
                 return f"Clicked '{desc}' at {coords}"
             return f"Element not found on screen: '{desc}'"
