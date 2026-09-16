@@ -288,6 +288,24 @@ python main.py
 
 > ⚠️ **Installation Note:** If you hit a `ModuleNotFoundError` for an OS-specific package, install it with `pip install <module_name>`. The optional **wake word** engine is *not* installed here — grab it in one click from **⚙ → WAKE WORD** inside the app.
 
+### Gmail: read and organize mail
+
+1. In [Google Cloud](https://console.cloud.google.com/), create a project, enable the Gmail API, and configure the OAuth consent screen. For a personal account, add yourself as a test user while the app is in Testing.
+2. Create an OAuth client of type **Desktop app**. Download its JSON to `config/client_secret_gmail.json` (do not commit it).
+3. Start JARVIS and open **Plugin Settings → GMAIL MAILBOX → CONNECT GMAIL**. Complete consent in the browser. If you previously connected in read-only mode, connect again to grant the new permission. The local token is saved as `config/token_gmail.json`; both files are ignored by Git.
+4. Ask JARVIS to summarize today's unread emails, search older or already-read mail, archive selected messages, or create/apply labels. Searches return at most 20 messages per request; narrow the search to reach older results. Archive and label application can be reversed with **undo**. The plugin does not send or delete email.
+
+Google's `gmail.modify` permission is broader than these plugin operations: its consent screen can mention composing and sending mail, even though this plugin has **no send tool**. It is needed for archiving and applying labels. A personal/test app can use Google's testing exception, but an External app left in Testing may require reauthorization after seven days. Message text is sent to Gemini for requested summaries, not added to long-term memory.
+
+### Google Drive: find files by name
+
+1. In Google Cloud, select the **same project** that owns the Desktop OAuth client in `config/client_secret_gmail.json`. Under **APIs & Services → Library**, [enable the Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com). Adding Drive to the OAuth consent screen does **not** enable the API.
+2. If the OAuth app is in **Testing**, add your Google account under **Google Auth Platform → Audience → Test users**.
+3. Restart JARVIS, open **Plugin Settings → GOOGLE DRIVE — FILE SEARCH → CONNECT DRIVE**, and grant `drive.metadata.readonly`. Drive gets its own ignored token at `config/token_drive.json`; it does not reuse the Gmail token.
+4. Ask JARVIS to find a file by name. It returns up to 20 titles, types, modified dates and links per search. This permission **cannot read file contents**; document summaries and file changes are separate future features.
+
+If Google returns `403 accessNotConfigured`, check that the Drive API is enabled in the OAuth client's project—not another project—and wait a few minutes for the change to propagate. The existing Drive token does not need to be reauthorized for this error.
+
 ---
 
 ## 📋 Requirements
@@ -380,12 +398,13 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | What | Where | Notes |
 |---|---|---|
 | Gemini API key, plugin credentials | `config/api_keys.json` | **Plaintext.** Anyone with your user account can read it. Treat it like a password file. |
+| Google OAuth client and tokens | `config/client_secret_gmail.json`, `config/token_gmail.json`, `config/token_drive.json` | Local credentials; never commit or share them. |
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
-All three are listed in `.gitignore`, so a fork or a pull request cannot leak them by accident. **If you have already committed `config/api_keys.json` anywhere public, revoke that key** at [aistudio.google.com](https://aistudio.google.com/app/apikey) and generate a new one — removing the file in a later commit does not remove it from the history.
+These local files are listed in `.gitignore`, so a fork or a pull request cannot leak them by accident. **If you have already committed `config/api_keys.json` anywhere public, revoke that key** at [aistudio.google.com](https://aistudio.google.com/app/apikey) and generate a new one — removing the file in a later commit does not remove it from the history.
 
-Your voice is streamed to Google's Gemini Live API while a session is open; that is the one thing that leaves your computer, and it stops when you mute or close the app.
+Your voice is streamed to Google's Gemini Live API while a session is open. When you request a Gmail summary, selected email text is sent to Gemini; Drive searches send file metadata, not file contents. Neither is added to long-term memory.
 
 ---
 
