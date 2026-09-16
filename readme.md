@@ -297,6 +297,12 @@ python main.py
 
 Google's `gmail.modify` permission is broader than these plugin operations: its consent screen can mention composing and sending mail, even though this plugin has **no send tool**. It is needed for archiving and applying labels. A personal/test app can use Google's testing exception, but an External app left in Testing may require reauthorization after seven days. Message text is sent to Gemini for requested summaries, not added to long-term memory.
 
+### Google Drive: find files by name
+
+Enable the Drive API in the same Google Cloud project, then open **Plugin Settings → GOOGLE DRIVE — FILE SEARCH → CONNECT DRIVE** and grant `drive.metadata.readonly`. The existing Desktop OAuth client at `config/client_secret_gmail.json` is reused; Drive gets its own ignored token at `config/token_drive.json`.
+
+Ask JARVIS to find a file by name. It returns up to 20 titles, types, modified dates and links per search. This permission **cannot read file contents**; document summaries and file changes are separate future features.
+
 ---
 
 ## 📋 Requirements
@@ -389,13 +395,13 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | What | Where | Notes |
 |---|---|---|
 | Gemini API key, plugin credentials | `config/api_keys.json` | **Plaintext.** Anyone with your user account can read it. Treat it like a password file. |
-| Gmail OAuth client and token | `config/client_secret_gmail.json`, `config/token_gmail.json` | Local credentials; never commit or share them. |
+| Google OAuth client and tokens | `config/client_secret_gmail.json`, `config/token_gmail.json`, `config/token_drive.json` | Local credentials; never commit or share them. |
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
 These local files are listed in `.gitignore`, so a fork or a pull request cannot leak them by accident. **If you have already committed `config/api_keys.json` anywhere public, revoke that key** at [aistudio.google.com](https://aistudio.google.com/app/apikey) and generate a new one — removing the file in a later commit does not remove it from the history.
 
-Your voice is streamed to Google's Gemini Live API while a session is open. When you request a Gmail summary, the selected email text is also sent to Gemini; no email copy is kept in long-term memory.
+Your voice is streamed to Google's Gemini Live API while a session is open. When you request a Gmail summary, selected email text is sent to Gemini; Drive searches send file metadata, not file contents. Neither is added to long-term memory.
 
 ---
 
