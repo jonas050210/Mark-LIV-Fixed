@@ -299,9 +299,12 @@ Google's `gmail.modify` permission is broader than these plugin operations: its 
 
 ### Google Drive: find files by name
 
-Enable the Drive API in the same Google Cloud project, then open **Plugin Settings → GOOGLE DRIVE — FILE SEARCH → CONNECT DRIVE** and grant `drive.metadata.readonly`. The existing Desktop OAuth client at `config/client_secret_gmail.json` is reused; Drive gets its own ignored token at `config/token_drive.json`.
+1. In Google Cloud, select the **same project** that owns the Desktop OAuth client in `config/client_secret_gmail.json`. Under **APIs & Services → Library**, [enable the Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com). Adding Drive to the OAuth consent screen does **not** enable the API.
+2. If the OAuth app is in **Testing**, add your Google account under **Google Auth Platform → Audience → Test users**.
+3. Restart JARVIS, open **Plugin Settings → GOOGLE DRIVE — FILE SEARCH → CONNECT DRIVE**, and grant `drive.metadata.readonly`. Drive gets its own ignored token at `config/token_drive.json`; it does not reuse the Gmail token.
+4. Ask JARVIS to find a file by name. It returns up to 20 titles, types, modified dates and links per search. This permission **cannot read file contents**; document summaries and file changes are separate future features.
 
-Ask JARVIS to find a file by name. It returns up to 20 titles, types, modified dates and links per search. This permission **cannot read file contents**; document summaries and file changes are separate future features.
+If Google returns `403 accessNotConfigured`, check that the Drive API is enabled in the OAuth client's project—not another project—and wait a few minutes for the change to propagate. The existing Drive token does not need to be reauthorized for this error.
 
 ---
 
