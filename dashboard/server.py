@@ -822,7 +822,21 @@ class DashboardServer:
                     break
             try:
                 while True:
-                    data = await websocket.receive_json()
+                    # One malformed frame must not cost the socket. Anything on
+                    # the LAN that found this port can send a JSON array, a bare
+                    # string or invalid JSON — receive_json() raises on the last
+                    # and data.get() raises AttributeError on the first two, and
+                    # since only WebSocketDisconnect was caught, that exception
+                    # ended the receive loop: the phone stayed "connected" but
+                    # never controlled anything again until it was reloaded.
+                    try:
+                        data = await websocket.receive_json()
+                    except WebSocketDisconnect:
+                        raise
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("type") == "command":
                         enc = data.get("enc", "")
                         t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
