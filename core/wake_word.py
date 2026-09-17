@@ -32,6 +32,32 @@ DEFAULT_THRESHOLD = 0.5
 SAMPLE_RATE = 16000
 
 
+def _package_dir() -> Path | None:
+    """Locate the installed openwakeword package WITHOUT importing it.
+
+    find_spec() reads only the package's metadata — the module body is never
+    executed, so none of openwakeword's heavy native dependencies
+    (onnxruntime / tflite) are loaded. That is the whole point: is_ready() runs
+    on the GUI thread the moment the ⚙ settings drawer opens, and importing
+    there loaded those DLLs onto the Qt thread — a broken pair of them aborts
+    the entire process with no Python traceback at all, which looked like
+    "clicking the gear closes the app silently". (core/audio_devices.py fixed
+    the same lesson for the device list; this is the remaining call site.)
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("openwakeword")
+        if spec is None:
+            return None
+        if spec.submodule_search_locations:
+            return Path(list(spec.submodule_search_locations)[0])
+        if spec.origin:
+            return Path(spec.origin).resolve().parent
+    except Exception:
+        pass
+    return None
+
+
 def is_installed() -> bool:
     """True if the openwakeword package is importable (no model check)."""
     try:
@@ -47,13 +73,18 @@ def is_ready() -> bool:
     This is a cheap, DETERMINISTIC file-existence check. It deliberately does NOT
     construct a Model to probe readiness — doing that is slow and, worse, can clash
     with the detector's own Model when it's already running, which intermittently
-    returned False and made the UI flicker to 'not downloaded'. Never raises.
+    returned False and made the UI flicker to 'not downloaded'. It also does NOT
+    import the openwakeword package at all (see _package_dir): the check runs on
+    the GUI thread when the settings drawer opens, and an import there can take
+    the whole app down. Never raises.
     """
     if not is_installed():
         return False
     try:
-        import openwakeword
-        models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+        pkg_dir = _package_dir()
+        if pkg_dir is None:
+            return False
+        models_dir = pkg_dir / "resources" / "models"
         if not models_dir.is_dir():
             return False
         has_wake = (any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
