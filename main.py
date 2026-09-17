@@ -84,6 +84,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    save_dashboard_lan_enabled,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -594,6 +595,7 @@ class JarvisLive:
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
+        self.ui.on_lan_toggled    = self._set_dashboard_lan
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
@@ -906,7 +908,45 @@ class JarvisLive:
         key    = self._dashboard.new_key()
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
-        return url, key, f"{url}/auto-login?key={key}", manual
+        # Whether the phone can reach any of that: with LAN access off the
+        # dashboard listens on 127.0.0.1 and this QR code cannot work, so the
+        # overlay says so and offers the switch next to it.
+        lan    = bool(self._dashboard.lan_enabled())
+        return url, key, f"{url}/auto-login?key={key}", manual, lan
+
+    def _set_dashboard_lan(self, enabled: bool) -> bool:
+        """Allow (or stop allowing) other devices to reach the dashboard.
+
+        Saved before it is applied: the server rebinds its socket live, and a
+        setting that lives only in the socket would come back different after a
+        restart. Turning it ON is also what asks the OS firewall for a rule —
+        on Windows that means a UAC prompt, which is the point of asking rather
+        than opening a port at every startup. Returns the state now in effect.
+        """
+        enabled = bool(enabled)
+        try:
+            save_dashboard_lan_enabled(enabled)
+        except Exception as e:
+            self.ui.write_log(f"SYS: Could not save the LAN setting: {e}")
+            if self._dashboard is not None:
+                return bool(self._dashboard.lan_enabled())
+            return not enabled
+        if self._dashboard is None:
+            return enabled
+        try:
+            self._dashboard.set_lan_access(enabled)
+        except Exception as e:
+            self.ui.write_log(f"SYS: Could not apply the LAN setting: {e}")
+            return not enabled
+        if enabled:
+            self.ui.write_log(
+                f"SYS: Dashboard reachable on your network — {self._dashboard.get_url()}"
+            )
+        else:
+            self.ui.write_log(
+                "SYS: Dashboard is back to this PC only — connected phones were dropped."
+            )
+        return enabled
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:

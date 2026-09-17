@@ -130,6 +130,23 @@ def save_push_to_talk_enabled(enabled: bool) -> None:
     _save_flag("push_to_talk_enabled", enabled)
 
 
+def get_dashboard_lan_enabled() -> bool:
+    """Whether the phone dashboard may be reached from other devices.
+
+    Off by default, and that is the point: the server then binds the loopback
+    interface only, so nothing else on the network can even open the pairing
+    screen — the strongest answer to "who gets to guess my key" is "only this
+    PC". Turning it on binds every interface and asks the OS firewall for a rule
+    (dashboard/server.py does both), which is what you want on a trusted home
+    Wi-Fi and a decision nobody should inherit silently.
+    """
+    return load_api_keys().get("dashboard_lan_enabled", False)
+
+
+def save_dashboard_lan_enabled(enabled: bool) -> None:
+    _save_flag("dashboard_lan_enabled", enabled)
+
+
 HUD_STYLES = ("face", "core")
 
 
