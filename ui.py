@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import psutil
@@ -3997,13 +3998,35 @@ class MainWindow(QMainWindow):
         return w
 
     def _toggle_drawer(self, checked: bool):
-        if checked:
-            self._refresh_wake_btns()   # resolve wake state on open (lazy)
-            self._position_quick_drawer()
-            self._quick_drawer.show()
-            self._quick_drawer.raise_()
-        else:
-            self._quick_drawer.hide()
+        # This slot runs on the GUI thread and resolves lazy state the first
+        # time the drawer opens (wake word readiness, cached device list). PyQt
+        # turns ANY unhandled exception in a slot into qFatal — the whole app
+        # vanishes with no visible error, which is exactly the reported
+        # "pressing the gear closes JARVIS silently". The drawer is cosmetic,
+        # so nothing in here is allowed to be fatal: a failure is logged into
+        # the activity log instead and the window carries on.
+        try:
+            if checked:
+                self._refresh_wake_btns()   # resolve wake state on open (lazy)
+                self._position_quick_drawer()
+                self._quick_drawer.show()
+                self._quick_drawer.raise_()
+            else:
+                self._quick_drawer.hide()
+        except Exception as e:
+            try:
+                print(f"[UI] ⚠ Settings drawer failed: {e}")
+                traceback.print_exc()
+            except Exception:
+                pass
+            try:
+                self._log.append_log(f"ERR: Settings panel failed — {e}")
+            except Exception:
+                pass
+            try:
+                self._drawer_btn.setChecked(False)
+            except Exception:
+                pass
 
     def _position_quick_drawer(self):
         if not hasattr(self, '_quick_drawer'):

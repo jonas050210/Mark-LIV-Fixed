@@ -24,6 +24,18 @@ if _platform.system() == "Windows":
 # nothing and makes the app launch the same way in every locale.
 import sys as _sys
 
+# ── Native crashes must leave a trace ────────────────────────────────────────
+# A silent process death with no Python traceback (reported: pressing ⚙ closed
+# the app) is almost always a crash in native code — a DLL aborting inside
+# DllMain during an import, an access violation in a loaded library. Python
+# cannot catch those, but faulthandler still prints the exact stack for them.
+# Costs nothing when nothing crashes.
+try:
+    import faulthandler as _fh
+    _fh.enable()
+except Exception:
+    pass          # pythonw / embedded interpreters — never fatal
+
 for _stream in ("stdout", "stderr"):
     try:
         _s = getattr(_sys, _stream, None)
@@ -1165,16 +1177,23 @@ class JarvisLive:
                     self._vision_last_time = _now
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
-                    if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
-                        self.ui.start_camera_stream()
-                        self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
-                        _stall = "camera"
-                    else:
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                        _stall = "screen"
+                    try:
+                        if angle == "camera":
+                            img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                            self.ui.start_camera_stream()
+                            self._vision_cam_active = True
+                            print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                            _stall = "camera"
+                        else:
+                            img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
+                            print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                            _stall = "screen"
+                    except Exception:
+                        # A failed capture must not leave the busy latch shut
+                        # forever — every later "look at the screen" would be
+                        # refused by the cooldown with no way back.
+                        self._vision_busy = False
+                        raise
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     # The image is attached to this same exchange, so there is
                     # nothing to stall for and nothing to announce. Asking for an
@@ -1359,8 +1378,18 @@ class JarvisLive:
 
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
+                # put_nowait runs on the loop thread. If the send side stalls
+                # the queue fills, and a bare put_nowait would raise QueueFull
+                # there on EVERY mic block — an exception flood instead of a
+                # graceful degrade. Drop the frame instead: the next block
+                # carries the voice on.
+                def _push(item):
+                    try:
+                        self.out_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        pass
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
+                    _push,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
@@ -1488,7 +1517,10 @@ class JarvisLive:
                             _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                try:
+                                    self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                except asyncio.QueueFull:
+                                    pass   # player is behind — drop rather than hoard
 
                     if response.server_content:
                         sc = response.server_content
@@ -2098,7 +2130,10 @@ class JarvisLive:
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
-                    self.audio_in_queue   = asyncio.Queue()
+                    # ~20 s of 50 ms slices. Bounded so a receive flood with a
+                    # stuck player grows memory by seconds of audio, not
+                    # unbounded — the queue drops rather than hoards.
+                    self.audio_in_queue   = asyncio.Queue(maxsize=400)
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
 

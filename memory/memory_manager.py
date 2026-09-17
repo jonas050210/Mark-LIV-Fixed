@@ -1,7 +1,9 @@
 import json
+import os
 import re
+import shutil
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 from pathlib import Path
 import sys
 
@@ -14,7 +16,10 @@ def get_base_dir() -> Path:
 
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
+# One generation of the previous, KNOWN-GOOD store. Written before every
+# replace, so even a bug that saves wrong data has one step back.
+BACKUP_PATH      = BASE_DIR / "memory" / "long_term.bak"
+_lock            = RLock()
 MAX_VALUE_LENGTH = 380
 
 # ── Why there are two very different numbers here ────────────────────────────
@@ -55,21 +60,78 @@ def _empty_memory() -> dict:
     }
 
 def load_memory() -> dict:
+    with _lock:
+        return _load_locked()
+
+
+# ── How this file survives the machine dying mid-write ───────────────────────
+#
+# long_term.json is the only copy of everything the assistant knows about a
+# person. Three failures used to compound into total memory loss:
+#
+#   1. write_text() is not atomic — a crash or power cut mid-write left a
+#      truncated, unparsable file behind;
+#   2. load caught the parse error and silently returned an EMPTY store —
+#      everything the person ever said was treated as never having been said;
+#   3. the next update_memory() then saved that empty store OVER the broken
+#      file, destroying the only copy for good.
+#
+# Each leg is now closed: writes go to a temp file and are moved into place
+# with os.replace (atomic on every supported OS); a load that finds a corrupt
+# file renames it aside to long_term.broken-<timestamp>.json — preserved,
+# never overwritten — and says so in the activity log instead of pretending
+# nothing happened; and the previous good store is kept in long_term.bak.
+
+def _load_locked() -> dict:
+    """Read the store. Caller must hold _lock."""
     if not MEMORY_PATH.exists():
         return _empty_memory()
-    with _lock:
+    try:
+        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            base = _empty_memory()
+            for key in base:
+                if key not in data:
+                    data[key] = {}
+            return data
+        raise ValueError("memory root is not a JSON object")
+    except Exception as e:
+        # Preserve the broken file under a fresh name — never overwrite the
+        # only copy of the person's memory with an empty store.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        quarantine = MEMORY_PATH.with_name(f"long_term.broken-{stamp}.json")
         try:
-            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
-            return _empty_memory()
-        except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+            os.replace(MEMORY_PATH, quarantine)
+            msg = (f"Memory file was corrupt — preserved as {quarantine.name}; "
+                   "starting empty. Keep that file to recover the old memory.")
+        except Exception:
+            msg = "Memory file was corrupt and could not be preserved — starting empty."
+        print(f"[Memory] ⚠️ {msg} ({e})")
+        if _trim_notifier:
+            try:
+                _trim_notifier(f"SYS: {msg}")
+            except Exception:
+                pass
+        return _empty_memory()
+
+
+def _persist_locked(memory: dict) -> None:
+    """Write the store atomically. Caller must hold _lock."""
+    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Back up the current store first — but only if it parses. Backing up a
+    # corrupt file would just preserve the corruption one step behind.
+    if MEMORY_PATH.exists():
+        try:
+            json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            shutil.copyfile(MEMORY_PATH, BACKUP_PATH)
+        except Exception:
+            pass          # unreadable or already quarantined — skip the backup
+    payload = json.dumps(memory, indent=2, ensure_ascii=False)
+    tmp = MEMORY_PATH.with_name(MEMORY_PATH.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    # Same-directory rename: atomic. A reader sees either the old file or the
+    # new one, never a half-written one.
+    os.replace(tmp, MEMORY_PATH)
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -118,13 +180,9 @@ def _trim_to_limit(memory: dict) -> dict:
 def save_memory(memory: dict) -> None:
     if not isinstance(memory, dict):
         return
-    memory = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        memory = _trim_to_limit(memory)
+        _persist_locked(memory)
 
 
 def _truncate_value(val: str) -> str:
@@ -159,11 +217,18 @@ def _recursive_update(target: dict, updates: dict) -> bool:
 def update_memory(memory_update: dict) -> dict:
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
-    memory = load_memory()
-    if _recursive_update(memory, memory_update):
-        save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
-    return memory
+    # The whole read-modify-write holds the lock. Before, only the individual
+    # write did — an update_memory running in an executor thread and a
+    # save_session_summary on the event loop could interleave load→modify→save
+    # and each persist a store missing the other's change (a lost update,
+    # invisible and unrecoverable).
+    with _lock:
+        memory = _load_locked()
+        if _recursive_update(memory, memory_update):
+            memory = _trim_to_limit(memory)
+            _persist_locked(memory)
+            print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        return memory
 
 def _entry_value(entry) -> str:
     """Accept both the {'value': ..., 'updated': ...} shape and a bare string,
@@ -410,13 +475,15 @@ def remember(key: str, value: str, category: str = "notes") -> str:
 
 
 def forget(key: str, category: str = "notes") -> str:
-    memory = load_memory()
-    cat    = memory.get(category, {})
-    if key in cat:
-        del cat[key]
-        memory[category] = cat
-        save_memory(memory)
-        return f"Forgotten: {category}/{key}"
+    # Read-modify-write under the lock, for the same reason as update_memory.
+    with _lock:
+        memory = _load_locked()
+        cat    = memory.get(category, {})
+        if isinstance(cat, dict) and key in cat:
+            del cat[key]
+            memory[category] = cat
+            _persist_locked(memory)
+            return f"Forgotten: {category}/{key}"
     return f"Not found: {category}/{key}"
 
 
@@ -433,24 +500,21 @@ def save_session_summary(summary: str, language: str = "") -> None:
     summary = (summary or "").strip()
     if not summary:
         return
-    memory   = load_memory()
-    sessions = memory.get("sessions", [])
-    if not isinstance(sessions, list):
-        sessions = []
-    entry: dict = {
-        "date":    datetime.now().strftime("%Y-%m-%d"),
-        "summary": summary[:280],
-    }
-    if language:
-        entry["language"] = language
-    sessions.append(entry)
-    memory["sessions"] = sessions[-_SESSION_MAX:]
+    # Load → append → persist under one lock hold (see update_memory).
     with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        memory   = _load_locked()
+        sessions = memory.get("sessions", [])
+        if not isinstance(sessions, list):
+            sessions = []
+        entry: dict = {
+            "date":    datetime.now().strftime("%Y-%m-%d"),
+            "summary": summary[:280],
+        }
+        if language:
+            entry["language"] = language
+        sessions.append(entry)
+        memory["sessions"] = sessions[-_SESSION_MAX:]
+        _persist_locked(memory)
     print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 
@@ -460,20 +524,11 @@ def pop_last_session() -> dict | None:
     Calling this consumes the entry so it is never repeated in future briefings.
     """
     with _lock:
-        if not MEMORY_PATH.exists():
+        memory   = _load_locked()
+        sessions = memory.get("sessions", [])
+        if not isinstance(sessions, list) or not sessions:
             return None
-        try:
-            memory   = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            sessions = memory.get("sessions", [])
-            if not isinstance(sessions, list) or not sessions:
-                return None
-            entry = sessions.pop()          # remove the last entry
-            memory["sessions"] = sessions
-            MEMORY_PATH.write_text(
-                json.dumps(memory, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            return entry
-        except Exception as e:
-            print(f"[Memory] ⚠️ pop_last_session error: {e}")
-            return None
+        entry = sessions.pop()          # remove the last entry
+        memory["sessions"] = sessions
+        _persist_locked(memory)
+        return entry
