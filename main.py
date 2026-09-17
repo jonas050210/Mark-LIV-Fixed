@@ -295,8 +295,19 @@ def _render_prompt(template: str, values: dict) -> str:
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """The configured Gemini key, or "" when there is none.
+
+    A missing file, a missing `gemini_api_key` or an empty one used to raise
+    here, and the exception landed in the run loop's generic error branch —
+    which retries every 3 s forever. No retry can fix "there is no key", so the
+    loop now gets an empty string and asks the user instead (see run()).
+    """
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return str(data.get("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
 
 
 def _load_system_prompt() -> str:
@@ -2182,11 +2193,28 @@ class JarvisLive:
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
+                # A key that is MISSING is neither a network problem nor an
+                # invalid key: nothing a retry can fix, so this used to spin the
+                # reconnect loop every 3 s until someone opened the UI. Ask for
+                # the key instead — the same overlay the invalid-key branch below
+                # uses, and the same one a first launch gets.
+                _api_key = _get_api_key()
+                if not _api_key:
+                    print("[JARVIS] 🔑 No API key configured — opening the setup overlay.")
+                    self.ui.write_log("ERR: No API key configured — please enter your key.")
+                    self.ui.set_state("SLEEPING")
+                    self.ui.prompt_reconfig()
+                    while not self.ui._win._ready:
+                        await asyncio.sleep(1)
+                    print("[JARVIS] New API key saved — reconnecting...")
+                    self._conn_backoff = 0
+                    continue
+
                 # Fresh client on every reconnect — avoids stale HTTP session state
                 # v1alpha carries proactive audio; if it gets rejected we fall
                 # back to v1beta.
                 client = genai.Client(
-                    api_key=_get_api_key(),
+                    api_key=_api_key,
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 
