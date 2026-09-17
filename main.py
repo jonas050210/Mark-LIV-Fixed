@@ -24,6 +24,18 @@ if _platform.system() == "Windows":
 # nothing and makes the app launch the same way in every locale.
 import sys as _sys
 
+# ── Native crashes must leave a trace ────────────────────────────────────────
+# A silent process death with no Python traceback (reported: pressing ⚙ closed
+# the app) is almost always a crash in native code — a DLL aborting inside
+# DllMain during an import, an access violation in a loaded library. Python
+# cannot catch those, but faulthandler still prints the exact stack for them.
+# Costs nothing when nothing crashes.
+try:
+    import faulthandler as _fh
+    _fh.enable()
+except Exception:
+    pass          # pythonw / embedded interpreters — never fatal
+
 for _stream in ("stdout", "stderr"):
     try:
         _s = getattr(_sys, _stream, None)
