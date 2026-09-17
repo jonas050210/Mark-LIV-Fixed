@@ -95,6 +95,7 @@ from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
+from core.session_summary      import SessionSummary
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
@@ -621,6 +622,11 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # Keeps those turns until a summary is actually on disk (see
+        # core/session_summary.py for the loss this prevents). It holds the list
+        # above BY REFERENCE and empties it in place, so every existing reader of
+        # _session_log keeps seeing the same object.
+        self._summary = SessionSummary(self._session_log, self._write_session_summary)
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -1293,7 +1299,11 @@ class JarvisLive:
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
-                    await self._save_session_summary()
+                    # Start the summary now but do NOT wait for it yet: the
+                    # goodbye should not be delayed by an LLM round trip. The wait
+                    # happens at the end, before os._exit() — exiting mid-summary
+                    # is exactly how a session used to disappear.
+                    self._summary.start_task()
                     if self.session:
                         try:
                             await self.session.send_client_content(
@@ -1303,6 +1313,10 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    # os._exit() is unconditional: no atexit, no finally, no
+                    # pending task ever runs again. Whatever the conversation owes
+                    # long_term.json has to be on disk before this line.
+                    await self._summary.flush(20.0)
                     # os._exit() skips atexit handlers, so the wake-word engine
                     # process is stopped here explicitly. It would notice on its
                     # own a moment later (its stdin closes when we die, and an
@@ -1966,19 +1980,27 @@ class JarvisLive:
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
-    async def _save_session_summary(self) -> None:
-        """Summarise the current session in 1-2 sentences and save to long_term.json."""
-        log = self._session_log
-        if len(log) < 3:          # need at least one exchange to be worth saving
-            return
-        self._session_log = []    # reset immediately so the next session starts clean
+    async def _save_session_summary(self) -> bool:
+        """Summarise the session and save it. Thin wrapper over SessionSummary —
+        the turns are only released once the write has happened (see below)."""
+        return await self._summary.save_now()
 
+    async def _write_session_summary(self, turns: list) -> bool:
+        """One attempt at turning conversation turns into a memory entry.
+
+        Returns True ONLY when the summary is on disk. Anything else — the model
+        call raising, an empty reply, a failed write — returns False, and
+        SessionSummary keeps the turns so the next attempt (a later shutdown, the
+        window closing) can finish the job. The old code had already deleted them
+        by this point, which is how a whole session vanished from long_term.json
+        whenever this call did not succeed on the first try.
+        """
         memory = load_memory()
         lang_entry = memory.get("identity", {}).get("language", {})
         lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
         lang = lang or "English"
 
-        convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
+        convo = "\n".join(turns[-40:])   # cap at last 40 turns to stay within token budget
         prompt = (
             f"Summarize this conversation in 1-2 sentences in {lang}. "
             "Focus on what the user accomplished or discussed. "
@@ -1989,10 +2011,39 @@ class JarvisLive:
             summary = await asyncio.to_thread(
                 gemini.text, prompt, gemini.SMART, None, 30_000,
             )
-            if summary:
-                save_session_summary(summary, lang)
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
+            return False
+        if not summary:
+            print("[Memory] ⚠️ Session summary came back empty — the turns are kept for a retry.")
+            return False
+        save_session_summary(summary, lang)
+        return True
+
+    def _on_app_closing(self) -> None:
+        """Last chance to save the session, called on the Qt thread once the last
+        window has closed and BEFORE the process exits.
+
+        The assistant runs on a daemon thread, so it dies with the process
+        without running a single finally block — and the summary is an LLM round
+        trip of a few seconds that was usually still in flight. Blocking the exit
+        here is invisible to the user (the window is already gone) and is the
+        difference between the morning briefing knowing about yesterday and not.
+        """
+        loop = getattr(self, "_loop", None)
+        if loop is None or not self._summary.dirty:
+            return                      # nothing to save → leave immediately
+        try:
+            if loop.is_closed():
+                return
+        except Exception:
+            return
+        try:
+            print("[Memory] Saving the session before exit…")
+            fut = asyncio.run_coroutine_threadsafe(self._summary.flush(12.0), loop)
+            fut.result(timeout=15.0)
+        except Exception as e:
+            print(f"[Memory] ⚠️ Session summary could not be saved on exit: {e}")
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -2153,6 +2204,14 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
+
+        # Closing the window ends the process, and this loop lives on a daemon
+        # thread that dies with it — so the UI hands the exit back to us first
+        # (see _RootShim.mainloop) and we spend it saving the session.
+        try:
+            self.ui.root.on_quit = self._on_app_closing
+        except Exception:
+            pass
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
@@ -2394,9 +2453,11 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
-                # Only save if there was a real conversation (≥3 turns)
-                if len(self._session_log) >= 3:
-                    asyncio.create_task(self._save_session_summary())
+                # Only save if there was a real conversation (≥3 turns). The task
+                # is tracked inside SessionSummary: a bare create_task() here is
+                # dropped by the very next os._exit(), which is how the summary
+                # this line was meant to guarantee never got written.
+                self._summary.start_task()
 
             self.set_speaking(False)
             self.ui.set_state("SLEEPING")

@@ -5230,8 +5230,22 @@ class MainWindow(QMainWindow):
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
+        # Called after the last window closes and before the process exits.
+        # main.py registers the session-memory flush here: the assistant runs on
+        # a daemon thread that dies with the process without running a single
+        # finally block, so anything it still owed has to be collected on the way
+        # out — otherwise closing the window silently loses the session summary.
+        self.on_quit = None
     def mainloop(self):
-        self._app.exec()
+        try:
+            self._app.exec()
+        finally:
+            cb = self.on_quit
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
     def protocol(self, *_):
         pass
 
