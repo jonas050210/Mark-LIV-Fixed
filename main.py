@@ -673,20 +673,50 @@ class JarvisLive:
         return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
 
     def _ensure_wake_detector(self) -> bool:
-        """Load the detector once (model loads on first start). Idempotent."""
+        """Start the wake-word engine once. Idempotent, never raises.
+
+        The engine is a separate process now (core/wake_word.py explains why: the
+        openwakeword import faults natively inside this one). start() only launches
+        it and returns, so this costs the caller milliseconds instead of the 1–3 s
+        the in-process model load used to take on the Qt thread / event loop.
+        Readiness arrives a moment later through the detector's own threads.
+        """
         if self._wake_detector is None:
             self._wake_detector = WakeWordDetector(
                 on_detect=self._on_wake_detected,
                 logger=lambda m: print(f"[Wake] {m}"),
                 notify=lambda m: self.ui.write_log(f"SYS: {m}"),
+                on_down=self._on_wake_engine_down,
             )
-        if not self._wake_detector.ready:
-            return self._wake_detector.start()
-        return True
+        if self._wake_detector.ready:
+            return True
+        return self._wake_detector.start()
 
     def _on_wake_detected(self) -> None:
         """Called from the detector thread when 'Hey Jarvis' is heard."""
         self.wake(reason="wake word")
+
+    def _on_wake_engine_down(self, reason: str) -> None:
+        """The wake-word engine process died — in practice a native crash while
+        onnxruntime loaded its DLLs, which is the failure that used to close the
+        whole app when the model was loaded in-process.
+
+        Called from the detector's reader thread. Two things have to happen:
+          1. Reopen the microphone. With the wake gate still closed and no engine
+             behind it, JARVIS would be deaf until the user found WAKE NOW — the
+             crash would have "fixed" itself into a worse bug.
+          2. Switch the feature off in config, so it is not re-triggered on every
+             reconnect and every restart. Turning it back on is one click in ⚙,
+             and that click is also the retry.
+        """
+        self._wake_enabled = False
+        try:
+            save_wake_word_enabled(False)
+        except Exception:
+            pass
+        self.wake(reason="wake-word engine went down")
+        self.ui.write_log(f"SYS: Wake word went down ({str(reason)[:80]}) — "
+                          "listening continuously. ⚙ → WAKE WORD tries again.")
 
     def wake(self, reason: str = "wake word") -> None:
         if self._awake:
@@ -716,24 +746,45 @@ class JarvisLive:
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
+                # Never fall asleep without an engine that can hear "Hey Jarvis":
+                # if the wake-word process died in the meantime (native crashes are
+                # the reason it lives in its own process), sleeping here would make
+                # JARVIS deaf until someone pressed WAKE NOW.
+                det = self._wake_detector
+                if det is None or not det.ready:
+                    continue
                 self.sleep(reason="no speech for 2 minutes")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 
     def _ui_wake_toggle(self, enable: bool) -> str:
         """Enable/disable wake word from the settings UI. Returns a status token:
-        'enabled' | 'disabled' | 'need_download'."""
+        'enabled' | 'disabled' | 'need_download' | 'unavailable'."""
         if enable:
             if not wake_is_ready():
                 return "need_download"
+            # Start the engine BEFORE closing the mic gate. If it cannot start,
+            # sleeping now would leave JARVIS deaf with nothing listening for the
+            # wake phrase — and the button would claim the feature is on.
+            if not self._ensure_wake_detector():
+                why = getattr(self._wake_detector, "unavailable_reason", None) or "the engine would not start"
+                self.ui.write_log(f"SYS: Wake word could not start — {str(why)[:120]}.")
+                return "unavailable"
             self._wake_enabled = True
             save_wake_word_enabled(True)
-            self._ensure_wake_detector()
             self.sleep(reason="wake word enabled")
             return "enabled"
         else:
             self._wake_enabled = False
             save_wake_word_enabled(False)
+            # Give the engine process back: an idle onnxruntime child holds a
+            # couple of hundred MB for a feature that is now switched off.
+            det = self._wake_detector
+            if det is not None:
+                try:
+                    det.stop()
+                except Exception:
+                    pass
             self.wake(reason="wake word disabled")
             return "disabled"
 
@@ -1241,6 +1292,17 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    # os._exit() skips atexit handlers, so the wake-word engine
+                    # process is stopped here explicitly. It would notice on its
+                    # own a moment later (its stdin closes when we die, and an
+                    # orphan watchdog catches the rest), but a spoken shutdown
+                    # should not leave a 200 MB child behind even briefly.
+                    _det = self._wake_detector
+                    if _det is not None:
+                        try:
+                            _det.stop()
+                        except Exception:
+                            pass
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -1321,9 +1383,12 @@ class JarvisLive:
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
             # nothing leaves the machine). Frames are instead handed to the local
-            # detector, which runs its model in ITS OWN thread — the cost here is
-            # only a queue push, so the audio path is never slowed. When wake word
-            # is off (default) or we're awake, this is a single boolean check.
+            # detector, which pipes them to the wake-word engine — a separate
+            # process, because importing the model in this one crashes it natively
+            # (see core/wake_word.py). The cost here is a single copy into a
+            # bounded queue that drops instead of blocking, so the real-time audio
+            # path is never slowed, whatever the engine is doing. When wake word is
+            # off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
                 det = self._wake_detector
                 if det is not None:
@@ -2154,12 +2219,26 @@ class JarvisLive:
 
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
+                    # Only if the engine actually started, though — sleeping with
+                    # no engine listening would leave JARVIS deaf with nothing to
+                    # say why.
+                    _wake_ok = False
                     if self._wake_enabled:
-                        self._ensure_wake_detector()
+                        _wake_ok = self._ensure_wake_detector()
+                        # The engine is a child process and can die in the
+                        # milliseconds between start() returning and here, so the
+                        # answer is checked again before the mic gate closes.
+                        _det = self._wake_detector
+                        if _det is not None and not _det.running:
+                            _wake_ok = False
+                    if _wake_ok:
                         self._awake = False
                         self.ui.set_state("SLEEPING")
                         self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
                     else:
+                        if self._wake_enabled:
+                            self._wake_enabled = False
+                            self.ui.write_log("SYS: Wake word unavailable — listening continuously.")
                         self._awake = True
                         self.ui.set_state("LISTENING")
                         self.ui.write_log("SYS: JARVIS online.")

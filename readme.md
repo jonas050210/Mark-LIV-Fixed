@@ -34,7 +34,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 🎚️ Push-to-Talk | Hold **Ctrl+Space** and the mic opens — closed the rest of the time. Truly global on Windows, window-scoped elsewhere |
 | 🔇 Self-Echo Guard | Never answers its own last sentence: the tail of its own voice is recognised and dropped without muting you |
 | 🪪 Runtime Self-Knowledge | Name, OS, abilities **and limits** are generated from the live system each session — rename it or add a plugin and it knows |
-| 🎙️ Wake Word | Local **"Hey Jarvis"** detection — sleeps until called, auto-sleeps after 2 min of silence, and never streams audio while asleep |
+| 🎙️ Wake Word | Local **"Hey Jarvis"** detection — sleeps until called, auto-sleeps after 2 min of silence, never streams audio while asleep, and runs its model in a **separate process** so a broken engine can never take the app down |
 | ⚡ Instant Acknowledgment | Speaks a short, context-aware reply in **your language** the instant a longer task starts — no more silent waiting |
 | 🚀 Faster Live Engine | Runs on **Gemini 3.1 Flash Live** — roughly 2× faster time-to-first-word than the previous model |
 | 🧩 Self-Describing Skills | Actions and plugins share one shape (`TOOL` / `PLUGIN` dict + `run()`), auto-discovered at launch — adding a skill is a single file |
@@ -158,6 +158,7 @@ All prompt wording lives in `core/prompt.txt` with `{tokens}` the app fills in �
 * Mouth timing was measured in **frames rather than seconds**, so the same constants meant three different mouths at 60, 30 and 20 fps, and a closure shorter than one frame could vanish entirely. Timing is now in seconds and the mouth is stepped once per 20 ms of audio, not once per repaint.
 * The **brows barely moved** — 6 px of travel on a 250 px head, because the rig weights halved an already small constant. Derived from the anatomy instead: 19 px.
 * The activity log opened with **a dozen lines of plumbing** — one per plugin loaded, plus wake-word and briefing status. The console still carries the full boot transcript; the log now shows your conversation, state changes and anything you have to act on, and nothing else.
+* Pressing **⚙ → WAKE WORD** could **close the entire app with no error and no dialog**. Loading `openwakeword` pulls in onnxruntime's native DLLs, and inside a process that already holds PyQt6, PortAudio, OpenCV and numpy that load can fault — a Windows access violation *below* the interpreter, where no `try/except` reaches and `faulthandler` is the only thing that leaves a trace. The wake model now runs in **its own process**: microphone frames go out over a pipe, detections and a heartbeat come back, and if that process dies the app says so in the log, keeps listening normally, and the button becomes a retry. A wedged engine is noticed and replaced, and no engine process can outlive the app. `python check_wake_word.py` tests the engine exactly the way the app starts it; `python check_wake_isolation.py` is the regression suite behind all of that.
 
 > Built on the Mark LI–LIII foundation: the **🧩 Plugin System**, **♾️ Unlimited Sessions**, **🎨 Live Theming**, **🎙️ Wake Word** and **🧩 Self-Describing Skills** are all still here.
 
@@ -300,7 +301,7 @@ python main.py
 | **Speakers** | Required for voice replies |
 | **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`) |
 | **GPU** | **Not required.** The avatar is rendered in software |
-| **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local) |
+| **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
 
 ---
 
@@ -357,7 +358,9 @@ Mark LIV/
 │   ├── audio_devices.py      # Microphone / speaker list — filtered, measured, resolved by name
 │   ├── plugin_loader.py      # Plugin engine — discovery, validation, crash isolation
 │   ├── action_loader.py      # Bundled-action engine — the built-in twin of plugin_loader
-│   └── wake_word.py          # Local "Hey Jarvis" detector — own thread, offline, opt-in
+│   ├── wake_word.py          # Local "Hey Jarvis" detector — supervises the engine process, offline, opt-in
+│   ├── wake_worker.py        # The engine itself: the only process that ever imports openwakeword
+│   └── wake_proto.py         # The framed pipe protocol between the two — survives stray library output
 └── config/
     ├── api_keys.json         # API key, name, voice, colour, toggles — created on first launch (git-ignored)
     └── certs/                # Self-signed TLS pair for the phone dashboard — generated locally (git-ignored)
