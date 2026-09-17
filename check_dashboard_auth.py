@@ -521,22 +521,41 @@ def test_lan_bind_failure() -> None:
               f"_local_ip()={lan_ip!r}")
         return
 
-    # Hold the chosen port on the LAN interface only: loopback stays free, so a
-    # server asking for 0.0.0.0 cannot bind while one asking for 127.0.0.1 can.
+    # Hold the chosen port on the LAN interface only: loopback stays free. On
+    # POSIX this prevents a later 0.0.0.0 bind and proves the fallback path.
+    # Windows may allow a wildcard socket to coexist with an existing specific
+    # address socket, so the premise is measured after startup instead of being
+    # assumed. SO_EXCLUSIVEADDRUSE asks Windows for the stricter behaviour when
+    # available, but the branch below remains mandatory because uvicorn/socket
+    # semantics can still vary between systems.
     port    = _free_port()
     blocker = socket.socket()
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if exclusive is not None:
+        with contextlib.suppress(Exception):
+            blocker.setsockopt(socket.SOL_SOCKET, exclusive, 1)
     try:
         blocker.bind((lan_ip, port))
         blocker.listen(1)
         with live_server(lan_config=True, port=port) as (srv, p, fw_calls, th):
-            check("the dashboard comes up anyway, on loopback",
+            check("the dashboard comes up anyway",
                   _wait(lambda: _http_status("127.0.0.1", p) == 200))
-            check("it fell back instead of giving up", srv._lan is False,
-                  srv.describe_reach())
-            check("the LAN port is still answered by whoever holds it, not JARVIS",
-                  _http_status(lan_ip, p, timeout=2.0) is None)
-            check("no firewall rule was opened for a socket that never bound",
-                  fw_calls == [], str(fw_calls))
+            if srv._lan is True and sys.platform == "win32":
+                detail = ("Windows allowed the 0.0.0.0 bind to coexist with the "
+                          "specific LAN blocker, so this machine did not produce "
+                          "a LAN-bind failure to test.")
+                check("SKIP: Windows did not force the LAN-bind failure", True, detail)
+                check("SKIP: fallback assertions do not apply to a real LAN socket", True,
+                      srv.describe_reach())
+                check("a firewall rule was opened for the LAN socket that exists",
+                      fw_calls == [port], str(fw_calls))
+            else:
+                check("it fell back instead of giving up", srv._lan is False,
+                      srv.describe_reach())
+                check("the LAN port is still answered by whoever holds it, not JARVIS",
+                      _http_status(lan_ip, p, timeout=2.0) is None)
+                check("no firewall rule was opened for a socket that never bound",
+                      fw_calls == [], str(fw_calls))
             check("the server is still running", th.is_alive())
     finally:
         blocker.close()

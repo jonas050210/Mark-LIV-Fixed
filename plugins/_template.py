@@ -22,6 +22,16 @@ PLUGIN = {
     },
 }
 
+def on_launch(player=None) -> None:
+    """
+    Optional. Called once after the UI facade and a Live session are ready, but
+    only when this plugin is enabled. Use it for user-enabled background services
+    that should resume at startup. Keep it fast or start your own worker thread;
+    startup will not wait for it.
+    """
+    return None
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     """
     parameters: dict of the args Gemini extracted, matching PLUGIN['parameters'].

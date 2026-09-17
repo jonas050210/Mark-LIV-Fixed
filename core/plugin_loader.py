@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import re
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,7 @@ class PluginRecord:
     valid: bool = False
     error: str = ""
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
+    on_launch: Optional[Callable] = None  # optional startup hook, called after UI/session are ready
     behavior: Optional[str] = None    # None = the API's default (blocking)
     scheduling: Optional[str] = None  # None = the API's default (WHEN_IDLE)
 
@@ -124,6 +126,33 @@ class PluginRegistry:
             })
         return out
 
+    # -- called by main.py once the UI facade and a Live session are ready --
+    def launch_enabled(self, player=None) -> None:
+        """Run optional plugin startup hooks without making startup depend on them.
+
+        Tool calls have always received `player`, but discovery intentionally has
+        no UI object. A plugin that wants to resume a user-enabled background
+        service at launch (for example a remote bridge) can define
+        `on_launch(player)`. Only enabled, valid plugins are called, each on its
+        own daemon thread, and failures are logged instead of escaping into the
+        Live session.
+        """
+        for name, rec in self._plugins.items():
+            hook = rec.on_launch
+            if not hook or not get_plugin_enabled(name):
+                continue
+
+            def _run_hook(rec=rec, hook=hook):
+                try:
+                    _call_on_launch(hook, player)
+                except Exception as e:
+                    self._logger(f"Plugin '{rec.name}' crashed during on_launch(): {e}")
+                    self._notify(f"Plugin '{rec.name}' launch hook failed — see the console.")
+                    traceback.print_exc()
+
+            threading.Thread(target=_run_hook, daemon=True,
+                             name=f"plugin-{name}-launch").start()
+
     # -- called by ui.py's Plugin Manager overlay --
     def list_for_ui(self) -> list[dict]:
         out = []
@@ -137,6 +166,22 @@ class PluginRegistry:
                 "enabled": get_plugin_enabled(rec.name) if rec.valid else False,
             })
         return out
+
+
+def _call_on_launch(hook_fn, player):
+    """Invoke on_launch(), tolerating hooks that declare no parameters.
+
+    The documented shape is on_launch(player), but keeping the dispatcher as
+    forgiving as run() preserves the drop-in nature of plugins and makes tests
+    easy to write.
+    """
+    sig = inspect.signature(hook_fn)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_var_kw or "player" in sig.parameters:
+        return hook_fn(player=player)
+    if len(sig.parameters) >= 1:
+        return hook_fn(player)
+    return hook_fn()
 
 
 def _call_run(run_fn, parameters, player, session_memory):
@@ -180,6 +225,10 @@ def _validate(module, filename: str) -> PluginRecord:
         return PluginRecord(name=name, file=filename,
                              error="Missing callable run(parameters, ...) function.")
 
+    on_launch = getattr(module, "on_launch", None)
+    if on_launch is not None and not callable(on_launch):
+        on_launch = None
+
     # Optional, self-describing settings schema (rendered by the settings UI).
     # A malformed schema is ignored, never fatal — the plugin still loads.
     settings = getattr(module, "PLUGIN_SETTINGS", None)
@@ -188,7 +237,7 @@ def _validate(module, filename: str) -> PluginRecord:
 
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
-                         behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
+                         on_launch=on_launch, behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
                          scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING))
 
 

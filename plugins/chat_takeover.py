@@ -38,9 +38,8 @@ import re
 import sys
 import threading
 import time
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+from memory.config_manager import get_gemini_key, load_api_keys
 
 PLUGIN = {
     "name": "chat_takeover",
@@ -156,10 +155,16 @@ _LIVE_SYSTEM = (
 # ── config helpers (same pattern as actions/screen_processor.py) ─────────────
 
 def _config() -> dict:
+    # Plugins may be copied, moved, or bundled, so they must not guess the
+    # project root from __file__. The config manager owns the real runtime
+    # location, including frozen builds and OneDrive-synced checkouts.
     try:
-        return json.loads(
-            (BASE_DIR / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
+        data = load_api_keys()
+        key = get_gemini_key()
+        if key:
+            data = dict(data)
+            data["gemini_api_key"] = key
+        return data
     except Exception:
         return {}
 

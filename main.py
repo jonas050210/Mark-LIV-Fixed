@@ -647,6 +647,7 @@ class JarvisLive:
 
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
+        self._plugins_launched = False
         self._plugin_registry = discover_plugins(
             plugins_dir=_base_dir / "plugins",
             core_tool_names=_core_names,
@@ -744,7 +745,9 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
-        self.ui.write_log(f"SYS: Awake — {reason}.")
+        msg = f"Awake — {reason}."
+        print(f"[JARVIS] {msg}")
+        self.ui.write_log(f"SYS: {msg}")
 
     def sleep(self, reason: str = "timeout") -> None:
         if not self._awake:
@@ -752,7 +755,9 @@ class JarvisLive:
         self._awake = False
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+        msg = f"Sleeping — {reason}. Say 'Hey Jarvis' to wake me."
+        print(f"[JARVIS] {msg}")
+        self.ui.write_log(f"SYS: {msg}")
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -950,13 +955,17 @@ class JarvisLive:
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
+            print(f"[JARVIS] Dropped typed command (no session): {text}")
+            try:
+                self.ui.write_log("SYS: Command could not be sent yet — no Live session is connected.")
+            except Exception:
+                pass
             return
-        # Respect wake-word sleep: a typed command must not be answered while
-        # asleep either (the sleep gate is not just for the mic). Wake first with
-        # "Hey Jarvis" or the WAKE NOW button.
+        # A typed command is deliberate control, just like the phone dashboard:
+        # privacy still gates the microphone while asleep, but text the user
+        # explicitly submitted should wake JARVIS and then be sent.
         if self._wake_enabled and not self._awake:
-            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
-            return
+            self.wake(reason="typed command")
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -2361,6 +2370,7 @@ class JarvisLive:
                     if _wake_ok:
                         self._awake = False
                         self.ui.set_state("SLEEPING")
+                        print("[JARVIS] Sleeping — waiting for 'Hey Jarvis'.")
                         self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
                     else:
                         if self._wake_enabled:
@@ -2368,7 +2378,12 @@ class JarvisLive:
                             self.ui.write_log("SYS: Wake word unavailable — listening continuously.")
                         self._awake = True
                         self.ui.set_state("LISTENING")
+                        print("[JARVIS] Listening continuously.")
                         self.ui.write_log("SYS: JARVIS online.")
+
+                    if not self._plugins_launched:
+                        self._plugins_launched = True
+                        self._plugin_registry.launch_enabled(player=self.ui)
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})

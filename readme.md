@@ -317,12 +317,11 @@ Mark LIV/
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
-│   ├── quiz.py               # Interactive quiz — JARVIS writes the questions, you answer on screen
+│   ├── telegram_remote.py    # Control JARVIS from Telegram; optional extras need _telegram_ops.py
+│   ├── chat_takeover.py      # Watches the focused chat on screen and pastes/sends replies there
 │   ├── document_review.py    # Contracts and policies in plain language, ordered by what matters
-│   ├── _google_core.py       # Shared OAuth for the Gmail/Calendar plugins (not a plugin itself)
-│   ├── _printer_core.py      # Shared printer connectivity (not a plugin itself)
 │   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
-│   └── ...                   # Drop-in skills (each self-describes via a PLUGIN dict + run())
+│   └── _*.py                 # Optional shared helpers; skipped by the plugin loader by design
 ├── actions/                  # Bundled skills — each self-describes via a TOOL dict + handler
 │   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
 │   ├── screen_processor.py   # Screen & webcam capture for vision
@@ -369,6 +368,24 @@ Mark LIV/
     ├── api_keys.json         # API key, name, voice, colour, toggles — created on first launch (git-ignored)
     └── certs/                # Self-signed TLS pair for the phone dashboard — generated locally (git-ignored)
 ```
+
+---
+
+## 🧩 Bundled Plugins
+
+Plugins are discovered only from `plugins/*.py`. Files whose name starts with
+`_` are helper modules, not tools; this is how a plugin can ship shared code
+without the loader showing the helper as a separate skill.
+
+| Plugin | What it does | Setup / safety notes |
+| --- | --- | --- |
+| `telegram_remote` | Starts a Telegram long-poll bridge so approved private chats can send typed or voice-note commands to this JARVIS session from anywhere. It opens no inbound port; all traffic is outbound HTTPS to Telegram. | Configure the bot token, pairing code and approved chat IDs in ⚙ → PLUGIN SETTINGS. It is off until you start it, unless you deliberately enable **Start listening when JARVIS launches**. Screenshot, camera and hardware-readout extras require `plugins/_telegram_ops.py` next to the plugin; without that helper the core remote still loads and works, but `/screen` and `/sys` are unavailable. |
+| `chat_takeover` | Watches the messaging conversation currently visible on screen and replies in the user's texting style until stopped. It can use its own Gemini Live session and falls back to REST if Live is unavailable. | Before starting, click into the message input box yourself. The plugin pastes into the currently focused chat window and uses a focus guard to stop if focus moves, but it still controls the real keyboard/clipboard, so do not start it while another app is focused. |
+| `document_review` | Presents a structured, readable review of a document: summary, serious/caution/note findings, quotes, suggestions and unclear points. | No setup and no legal rulebook inside the plugin. JARVIS must first read the document text from an upload, screen or camera; the plugin only lays out what the model found, in the user's language. |
+
+Plugins may optionally define `on_launch(player)`. JARVIS calls it once after the
+UI facade and Live session are ready, and only when the plugin is enabled. Slow
+startup work belongs in a daemon thread so the assistant can keep booting.
 
 ---
 
