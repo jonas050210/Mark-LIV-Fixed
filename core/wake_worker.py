@@ -21,7 +21,7 @@ MODES
               the *setup* path (pip install + model download) never imports the
               package inside the app.
     selftest  one-shot. Import + load + one predict on a second of silence, with
-              timings and versions. check_wake_word.py runs this to prove that
+              timings and versions. test_overall.py --suite wake_word runs this to prove that
               the isolated engine actually works on a given machine.
 
 TRANSPORT
@@ -48,7 +48,7 @@ import sys
 # modules named `gemini.py`, `tts.py`, `echo.py`, `types`-adjacent things —
 # any of which could shadow a stdlib or site-packages module that onnxruntime
 # imports later. The child's namespace is kept pristine on purpose: it is the
-# one thing that makes the DLL load behave the way it does in check_wake_word.py.
+# one thing that makes the DLL load behave the way it does in test_overall.py --suite wake_word.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)

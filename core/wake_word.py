@@ -32,7 +32,7 @@ WHY A CHILD PROCESS, AND NOT A THREAD (this file used to do it in a thread)
     i.e. pressing ⚙ → WAKE WORD closed the whole app. A DLL fault during load
     cannot be caught — there is no Python frame left to raise into — so no amount
     of try/except around the import helps. The same imports succeed in a *fresh*
-    interpreter, which check_wake_word.py verifies in isolated subprocesses, so
+    interpreter, which test_overall.py --suite wake_word verifies in isolated subprocesses, so
     the only robust fix is to never load them here: core/wake_worker.py owns the
     model, and this module owns the pipe that talks to it (core/wake_proto.py).
 
@@ -401,7 +401,7 @@ def _run_worker_once(extra_args: list, timeout: float = 120.0) -> tuple[bool, st
 
 def selftest(logger: Callable[[str], None] = print) -> tuple[bool, str]:
     """Load the model in a throwaway child and report what happened. Diagnostic
-    helper (check_wake_word.py, and anyone chasing a wake-word bug): it answers
+    helper (test_overall.py --suite wake_word, and anyone chasing a wake-word bug): it answers
     "does the isolated engine work on THIS machine?" without ever risking the
     app process."""
     if not is_ready():
@@ -532,7 +532,7 @@ class WakeWordDetector:
                                            f"the last {int(_CRASH_WINDOW // 60)} minutes")
                 self._logger(f"Wake word: not retrying — {self.unavailable_reason}.")
                 self._notify("Wake word is disabled after repeated engine crashes — "
-                             "run `python check_wake_word.py` and try "
+                             "run `python test_overall.py --suite wake_word` and try "
                              "`pip install --force-reinstall onnxruntime`.")
                 return False
             # Bumped before the spawn: a thread left over from the previous run
