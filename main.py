@@ -84,6 +84,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    save_dashboard_lan_enabled,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -95,6 +96,7 @@ from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
+from core.session_summary      import SessionSummary
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
@@ -295,8 +297,19 @@ def _render_prompt(template: str, values: dict) -> str:
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """The configured Gemini key, or "" when there is none.
+
+    A missing file, a missing `gemini_api_key` or an empty one used to raise
+    here, and the exception landed in the run loop's generic error branch —
+    which retries every 3 s forever. No retry can fix "there is no key", so the
+    loop now gets an empty string and asks the user instead (see run()).
+    """
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return str(data.get("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
 
 
 def _load_system_prompt() -> str:
@@ -582,6 +595,7 @@ class JarvisLive:
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
+        self.ui.on_lan_toggled    = self._set_dashboard_lan
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
@@ -610,6 +624,11 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # Keeps those turns until a summary is actually on disk (see
+        # core/session_summary.py for the loss this prevents). It holds the list
+        # above BY REFERENCE and empties it in place, so every existing reader of
+        # _session_log keeps seeing the same object.
+        self._summary = SessionSummary(self._session_log, self._write_session_summary)
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -673,20 +692,50 @@ class JarvisLive:
         return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
 
     def _ensure_wake_detector(self) -> bool:
-        """Load the detector once (model loads on first start). Idempotent."""
+        """Start the wake-word engine once. Idempotent, never raises.
+
+        The engine is a separate process now (core/wake_word.py explains why: the
+        openwakeword import faults natively inside this one). start() only launches
+        it and returns, so this costs the caller milliseconds instead of the 1–3 s
+        the in-process model load used to take on the Qt thread / event loop.
+        Readiness arrives a moment later through the detector's own threads.
+        """
         if self._wake_detector is None:
             self._wake_detector = WakeWordDetector(
                 on_detect=self._on_wake_detected,
                 logger=lambda m: print(f"[Wake] {m}"),
                 notify=lambda m: self.ui.write_log(f"SYS: {m}"),
+                on_down=self._on_wake_engine_down,
             )
-        if not self._wake_detector.ready:
-            return self._wake_detector.start()
-        return True
+        if self._wake_detector.ready:
+            return True
+        return self._wake_detector.start()
 
     def _on_wake_detected(self) -> None:
         """Called from the detector thread when 'Hey Jarvis' is heard."""
         self.wake(reason="wake word")
+
+    def _on_wake_engine_down(self, reason: str) -> None:
+        """The wake-word engine process died — in practice a native crash while
+        onnxruntime loaded its DLLs, which is the failure that used to close the
+        whole app when the model was loaded in-process.
+
+        Called from the detector's reader thread. Two things have to happen:
+          1. Reopen the microphone. With the wake gate still closed and no engine
+             behind it, JARVIS would be deaf until the user found WAKE NOW — the
+             crash would have "fixed" itself into a worse bug.
+          2. Switch the feature off in config, so it is not re-triggered on every
+             reconnect and every restart. Turning it back on is one click in ⚙,
+             and that click is also the retry.
+        """
+        self._wake_enabled = False
+        try:
+            save_wake_word_enabled(False)
+        except Exception:
+            pass
+        self.wake(reason="wake-word engine went down")
+        self.ui.write_log(f"SYS: Wake word went down ({str(reason)[:80]}) — "
+                          "listening continuously. ⚙ → WAKE WORD tries again.")
 
     def wake(self, reason: str = "wake word") -> None:
         if self._awake:
@@ -716,24 +765,45 @@ class JarvisLive:
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
+                # Never fall asleep without an engine that can hear "Hey Jarvis":
+                # if the wake-word process died in the meantime (native crashes are
+                # the reason it lives in its own process), sleeping here would make
+                # JARVIS deaf until someone pressed WAKE NOW.
+                det = self._wake_detector
+                if det is None or not det.ready:
+                    continue
                 self.sleep(reason="no speech for 2 minutes")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 
     def _ui_wake_toggle(self, enable: bool) -> str:
         """Enable/disable wake word from the settings UI. Returns a status token:
-        'enabled' | 'disabled' | 'need_download'."""
+        'enabled' | 'disabled' | 'need_download' | 'unavailable'."""
         if enable:
             if not wake_is_ready():
                 return "need_download"
+            # Start the engine BEFORE closing the mic gate. If it cannot start,
+            # sleeping now would leave JARVIS deaf with nothing listening for the
+            # wake phrase — and the button would claim the feature is on.
+            if not self._ensure_wake_detector():
+                why = getattr(self._wake_detector, "unavailable_reason", None) or "the engine would not start"
+                self.ui.write_log(f"SYS: Wake word could not start — {str(why)[:120]}.")
+                return "unavailable"
             self._wake_enabled = True
             save_wake_word_enabled(True)
-            self._ensure_wake_detector()
             self.sleep(reason="wake word enabled")
             return "enabled"
         else:
             self._wake_enabled = False
             save_wake_word_enabled(False)
+            # Give the engine process back: an idle onnxruntime child holds a
+            # couple of hundred MB for a feature that is now switched off.
+            det = self._wake_detector
+            if det is not None:
+                try:
+                    det.stop()
+                except Exception:
+                    pass
             self.wake(reason="wake word disabled")
             return "disabled"
 
@@ -838,7 +908,45 @@ class JarvisLive:
         key    = self._dashboard.new_key()
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
-        return url, key, f"{url}/auto-login?key={key}", manual
+        # Whether the phone can reach any of that: with LAN access off the
+        # dashboard listens on 127.0.0.1 and this QR code cannot work, so the
+        # overlay says so and offers the switch next to it.
+        lan    = bool(self._dashboard.lan_enabled())
+        return url, key, f"{url}/auto-login?key={key}", manual, lan
+
+    def _set_dashboard_lan(self, enabled: bool) -> bool:
+        """Allow (or stop allowing) other devices to reach the dashboard.
+
+        Saved before it is applied: the server rebinds its socket live, and a
+        setting that lives only in the socket would come back different after a
+        restart. Turning it ON is also what asks the OS firewall for a rule —
+        on Windows that means a UAC prompt, which is the point of asking rather
+        than opening a port at every startup. Returns the state now in effect.
+        """
+        enabled = bool(enabled)
+        try:
+            save_dashboard_lan_enabled(enabled)
+        except Exception as e:
+            self.ui.write_log(f"SYS: Could not save the LAN setting: {e}")
+            if self._dashboard is not None:
+                return bool(self._dashboard.lan_enabled())
+            return not enabled
+        if self._dashboard is None:
+            return enabled
+        try:
+            self._dashboard.set_lan_access(enabled)
+        except Exception as e:
+            self.ui.write_log(f"SYS: Could not apply the LAN setting: {e}")
+            return not enabled
+        if enabled:
+            self.ui.write_log(
+                f"SYS: Dashboard reachable on your network — {self._dashboard.get_url()}"
+            )
+        else:
+            self.ui.write_log(
+                "SYS: Dashboard is back to this PC only — connected phones were dropped."
+            )
+        return enabled
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -1231,7 +1339,11 @@ class JarvisLive:
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
-                    await self._save_session_summary()
+                    # Start the summary now but do NOT wait for it yet: the
+                    # goodbye should not be delayed by an LLM round trip. The wait
+                    # happens at the end, before os._exit() — exiting mid-summary
+                    # is exactly how a session used to disappear.
+                    self._summary.start_task()
                     if self.session:
                         try:
                             await self.session.send_client_content(
@@ -1241,6 +1353,21 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    # os._exit() is unconditional: no atexit, no finally, no
+                    # pending task ever runs again. Whatever the conversation owes
+                    # long_term.json has to be on disk before this line.
+                    await self._summary.flush(20.0)
+                    # os._exit() skips atexit handlers, so the wake-word engine
+                    # process is stopped here explicitly. It would notice on its
+                    # own a moment later (its stdin closes when we die, and an
+                    # orphan watchdog catches the rest), but a spoken shutdown
+                    # should not leave a 200 MB child behind even briefly.
+                    _det = self._wake_detector
+                    if _det is not None:
+                        try:
+                            _det.stop()
+                        except Exception:
+                            pass
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -1321,9 +1448,12 @@ class JarvisLive:
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
             # nothing leaves the machine). Frames are instead handed to the local
-            # detector, which runs its model in ITS OWN thread — the cost here is
-            # only a queue push, so the audio path is never slowed. When wake word
-            # is off (default) or we're awake, this is a single boolean check.
+            # detector, which pipes them to the wake-word engine — a separate
+            # process, because importing the model in this one crashes it natively
+            # (see core/wake_word.py). The cost here is a single copy into a
+            # bounded queue that drops instead of blocking, so the real-time audio
+            # path is never slowed, whatever the engine is doing. When wake word is
+            # off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
                 det = self._wake_detector
                 if det is not None:
@@ -1890,19 +2020,27 @@ class JarvisLive:
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
-    async def _save_session_summary(self) -> None:
-        """Summarise the current session in 1-2 sentences and save to long_term.json."""
-        log = self._session_log
-        if len(log) < 3:          # need at least one exchange to be worth saving
-            return
-        self._session_log = []    # reset immediately so the next session starts clean
+    async def _save_session_summary(self) -> bool:
+        """Summarise the session and save it. Thin wrapper over SessionSummary —
+        the turns are only released once the write has happened (see below)."""
+        return await self._summary.save_now()
 
+    async def _write_session_summary(self, turns: list) -> bool:
+        """One attempt at turning conversation turns into a memory entry.
+
+        Returns True ONLY when the summary is on disk. Anything else — the model
+        call raising, an empty reply, a failed write — returns False, and
+        SessionSummary keeps the turns so the next attempt (a later shutdown, the
+        window closing) can finish the job. The old code had already deleted them
+        by this point, which is how a whole session vanished from long_term.json
+        whenever this call did not succeed on the first try.
+        """
         memory = load_memory()
         lang_entry = memory.get("identity", {}).get("language", {})
         lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
         lang = lang or "English"
 
-        convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
+        convo = "\n".join(turns[-40:])   # cap at last 40 turns to stay within token budget
         prompt = (
             f"Summarize this conversation in 1-2 sentences in {lang}. "
             "Focus on what the user accomplished or discussed. "
@@ -1913,10 +2051,39 @@ class JarvisLive:
             summary = await asyncio.to_thread(
                 gemini.text, prompt, gemini.SMART, None, 30_000,
             )
-            if summary:
-                save_session_summary(summary, lang)
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
+            return False
+        if not summary:
+            print("[Memory] ⚠️ Session summary came back empty — the turns are kept for a retry.")
+            return False
+        save_session_summary(summary, lang)
+        return True
+
+    def _on_app_closing(self) -> None:
+        """Last chance to save the session, called on the Qt thread once the last
+        window has closed and BEFORE the process exits.
+
+        The assistant runs on a daemon thread, so it dies with the process
+        without running a single finally block — and the summary is an LLM round
+        trip of a few seconds that was usually still in flight. Blocking the exit
+        here is invisible to the user (the window is already gone) and is the
+        difference between the morning briefing knowing about yesterday and not.
+        """
+        loop = getattr(self, "_loop", None)
+        if loop is None or not self._summary.dirty:
+            return                      # nothing to save → leave immediately
+        try:
+            if loop.is_closed():
+                return
+        except Exception:
+            return
+        try:
+            print("[Memory] Saving the session before exit…")
+            fut = asyncio.run_coroutine_threadsafe(self._summary.flush(12.0), loop)
+            fut.result(timeout=15.0)
+        except Exception as e:
+            print(f"[Memory] ⚠️ Session summary could not be saved on exit: {e}")
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -2078,6 +2245,14 @@ class JarvisLive:
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
 
+        # Closing the window ends the process, and this loop lives on a daemon
+        # thread that dies with it — so the UI hands the exit back to us first
+        # (see _RootShim.mainloop) and we spend it saving the session.
+        try:
+            self.ui.root.on_quit = self._on_app_closing
+        except Exception:
+            pass
+
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory
         # trim is invisible without a way to say so. Both are bound once here
@@ -2117,11 +2292,28 @@ class JarvisLive:
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
+                # A key that is MISSING is neither a network problem nor an
+                # invalid key: nothing a retry can fix, so this used to spin the
+                # reconnect loop every 3 s until someone opened the UI. Ask for
+                # the key instead — the same overlay the invalid-key branch below
+                # uses, and the same one a first launch gets.
+                _api_key = _get_api_key()
+                if not _api_key:
+                    print("[JARVIS] 🔑 No API key configured — opening the setup overlay.")
+                    self.ui.write_log("ERR: No API key configured — please enter your key.")
+                    self.ui.set_state("SLEEPING")
+                    self.ui.prompt_reconfig()
+                    while not self.ui._win._ready:
+                        await asyncio.sleep(1)
+                    print("[JARVIS] New API key saved — reconnecting...")
+                    self._conn_backoff = 0
+                    continue
+
                 # Fresh client on every reconnect — avoids stale HTTP session state
                 # v1alpha carries proactive audio; if it gets rejected we fall
                 # back to v1beta.
                 client = genai.Client(
-                    api_key=_get_api_key(),
+                    api_key=_api_key,
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 
@@ -2154,12 +2346,26 @@ class JarvisLive:
 
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
+                    # Only if the engine actually started, though — sleeping with
+                    # no engine listening would leave JARVIS deaf with nothing to
+                    # say why.
+                    _wake_ok = False
                     if self._wake_enabled:
-                        self._ensure_wake_detector()
+                        _wake_ok = self._ensure_wake_detector()
+                        # The engine is a child process and can die in the
+                        # milliseconds between start() returning and here, so the
+                        # answer is checked again before the mic gate closes.
+                        _det = self._wake_detector
+                        if _det is not None and not _det.running:
+                            _wake_ok = False
+                    if _wake_ok:
                         self._awake = False
                         self.ui.set_state("SLEEPING")
                         self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
                     else:
+                        if self._wake_enabled:
+                            self._wake_enabled = False
+                            self.ui.write_log("SYS: Wake word unavailable — listening continuously.")
                         self._awake = True
                         self.ui.set_state("LISTENING")
                         self.ui.write_log("SYS: JARVIS online.")
@@ -2287,9 +2493,11 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
-                # Only save if there was a real conversation (≥3 turns)
-                if len(self._session_log) >= 3:
-                    asyncio.create_task(self._save_session_summary())
+                # Only save if there was a real conversation (≥3 turns). The task
+                # is tracked inside SessionSummary: a bare create_task() here is
+                # dropped by the very next os._exit(), which is how the summary
+                # this line was meant to guarantee never got written.
+                self._summary.start_task()
 
             self.set_speaking(False)
             self.ui.set_state("SLEEPING")

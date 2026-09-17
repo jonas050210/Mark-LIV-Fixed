@@ -104,6 +104,9 @@
     }
     .btn:hover  { opacity: 0.88; }
     .btn:active { transform: scale(0.98); }
+    /* Counting down a server-side lockout: dimmed and unclickable, so the wait
+       is visible rather than something the user has to read. */
+    .btn:disabled { opacity: 0.5; cursor: default; transform: none; }
     @keyframes shake {
       0%,100% { transform: translateX(0); }
       20%,60% { transform: translateX(-7px); }
@@ -139,9 +142,9 @@
     <p id="reconnecting">Reconnecting…</p>
     <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the JARVIS desktop app to get a QR code or session key.</p>
     <div class="key-wrap">
-      <input class="key-input" id="key" type="text" maxlength="6"
+      <input class="key-input" id="key" type="text" maxlength="__KEY_LEN__"
              autocomplete="off" autocorrect="off" spellcheck="false"
-             placeholder="· · · · · ·">
+             placeholder="">
     </div>
     <div class="err" id="err"></div>
     <button class="btn" onclick="doLogin()">CONNECT</button>
@@ -153,6 +156,39 @@
   </div>
 
   <script>
+    // Filled in by the server from its own KEY_LEN, so the field can never
+    // reject the key JARVIS just issued.
+    const KEY_LEN = __KEY_LEN__;
+    let lockTimer = null;
+
+    function showErr(msg) {
+      document.getElementById('err').textContent = msg || '';
+    }
+
+    // The server rate-limits wrong keys per address and answers 429 with
+    // Retry-After. Counting that down here saves a handful of pointless retries,
+    // and the button coming back to life is clearer than a message that sits.
+    function lock(secs) {
+      const btn = document.querySelector('.btn');
+      const inp = document.getElementById('key');
+      clearInterval(lockTimer);
+      btn.disabled = true;
+      const paint = () => {
+        if (secs <= 0) {
+          clearInterval(lockTimer);
+          btn.disabled = false;
+          btn.textContent = 'CONNECT';
+          showErr('');
+          inp.focus();
+          return;
+        }
+        btn.textContent = 'WAIT ' + secs + 's';
+        secs--;
+      };
+      paint();
+      lockTimer = setInterval(paint, 1000);
+    }
+
     // Try auto-reconnect with stored device token (set on first QR login)
     (async function() {
       const devTok = localStorage.getItem('jarvis_device_token');
@@ -171,6 +207,14 @@
           location.replace('/');
           return;
         }
+        if (r.status === 429) {
+          // Throttled, not rejected: the pairing is still valid, so keep the
+          // token and show the wait instead of throwing the device away.
+          document.getElementById('reconnecting').style.display = 'none';
+          showErr(d.error || 'Too many attempts — wait a moment.');
+          if (d.retry_after) lock(d.retry_after);
+          return;
+        }
       } catch (_) {}
       // Device token rejected (server restarted) — clear it and show normal form
       localStorage.removeItem('jarvis_device_token');
@@ -178,17 +222,18 @@
     })();
 
     const inp = document.getElementById('key');
+    inp.placeholder = Array(KEY_LEN).fill('·').join(' ');
     inp.focus();
 
     inp.addEventListener('input', () => {
       inp.value = inp.value.toUpperCase().replace(/[^A-Z2-9]/g, '');
-      if (inp.value.length === 6) doLogin();
+      if (inp.value.length === KEY_LEN) doLogin();
     });
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
     async function doLogin() {
       const key = inp.value.trim();
-      if (key.length < 6) { shake(); return; }
+      if (key.length < KEY_LEN) { shake(); return; }
       let data;
       try {
         const r = await fetch('/login', {
@@ -198,7 +243,7 @@
         });
         data = await r.json();
       } catch (e) {
-        document.getElementById('err').textContent = 'Connection error';
+        showErr('Connection error');
         shake(); return;
       }
       if (data.ok && data.token) {
@@ -208,7 +253,10 @@
       } else {
         inp.value = '';
         inp.focus();
-        document.getElementById('err').textContent = 'Invalid or expired key';
+        // The server says whether this was a wrong key or a lockout, and for how
+        // long — repeating its wording beats guessing at either.
+        showErr(data.error || 'Invalid or expired key');
+        if (data.retry_after) lock(data.retry_after);
         shake();
       }
     }

@@ -2694,10 +2694,11 @@ class RemoteKeyOverlay(QWidget):
 
     closed = pyqtSignal()
 
-    _OW, _OH = 400, 465
+    _OW, _OH = 400, 505
 
     def __init__(self, url: str, key: str, auto_login_url: str = "",
-                 manual_url: str = "", expiry_secs: int = 600, parent=None):
+                 manual_url: str = "", expiry_secs: int = 600,
+                 lan_enabled: bool = True, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -2709,6 +2710,8 @@ class RemoteKeyOverlay(QWidget):
         """)
         self._expiry          = time.time() + expiry_secs
         self._on_new_key      = None
+        self._on_lan          = None
+        self._lan             = bool(lan_enabled)
         self._auto_login_url  = auto_login_url
         self._manual_url      = manual_url or url
 
@@ -2782,6 +2785,29 @@ class RemoteKeyOverlay(QWidget):
         self._timer_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self._timer_lbl)
 
+        # ── who can reach this ────────────────────────────────────────────────
+        # The QR above is only worth showing if a phone can actually open it.
+        # With LAN access off the dashboard binds 127.0.0.1, so the honest thing
+        # is to say that here — with the switch right next to it — instead of
+        # letting the user scan a code that can never connect.
+        self._lan_lbl = _lbl("", 7, color=C.TEXT_DIM)
+        lay.addWidget(self._lan_lbl)
+
+        self._lan_btn = QPushButton("")
+        self._lan_btn.setFixedHeight(26)
+        self._lan_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._lan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lan_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER_B}; border-radius: 5px;
+            }}
+            QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.PRI_DIM}; }}
+        """)
+        self._lan_btn.clicked.connect(self._toggle_lan)
+        lay.addWidget(self._lan_btn)
+        self._paint_lan()
+
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
         new_btn = QPushButton("NEW KEY")
         new_btn.setFixedHeight(32)
@@ -2819,6 +2845,30 @@ class RemoteKeyOverlay(QWidget):
 
     def set_new_key_callback(self, fn) -> None:
         self._on_new_key = fn
+
+    def set_lan_callback(self, fn) -> None:
+        """fn(enabled: bool) -> bool — saves the setting and rebinds the socket."""
+        self._on_lan = fn
+
+    def _paint_lan(self) -> None:
+        if self._lan:
+            self._lan_lbl.setText(
+                "Reachable from your network — any device on your Wi-Fi can open this page")
+            self._lan_btn.setText("PC ONLY")
+        else:
+            self._lan_lbl.setText(
+                "This PC only — your phone cannot reach JARVIS until you allow it")
+            self._lan_btn.setText("ALLOW PHONE ACCESS")
+
+    def _toggle_lan(self) -> None:
+        if not self._on_lan:
+            return
+        try:
+            now = self._on_lan(not self._lan)
+        except Exception:
+            return                 # the app logged it; leave the switch as it was
+        self._lan = bool(now)
+        self._paint_lan()
 
     def _update_qr(self, url: str) -> None:
         if not url:
@@ -2891,6 +2941,11 @@ class RemoteKeyOverlay(QWidget):
                 key    = result[1]
                 auto   = result[2] if len(result) >= 3 else ""
                 manual = result[3] if len(result) >= 4 else url
+                # NEW KEY asks the app again, so it also picks up a LAN switch
+                # that was flipped behind this overlay's back.
+                if len(result) >= 5:
+                    self._lan = bool(result[4])
+                    self._paint_lan()
                 self._manual_url     = manual or url
                 self._url_lbl.setText(self._manual_url)
                 self._key_lbl.setText(key)
@@ -2959,6 +3014,7 @@ class MainWindow(QMainWindow):
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
+        self.on_lan_toggled    = None   # callable: (enabled: bool) -> bool — dashboard reachability
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
@@ -4579,13 +4635,17 @@ class MainWindow(QMainWindow):
         key    = result[1]
         auto   = result[2] if len(result) >= 3 else ""
         manual = result[3] if len(result) >= 4 else url
+        # True when the app does not say: an older backend without the flag is
+        # reachable from the network, and claiming otherwise would be worse.
+        lan    = bool(result[4]) if len(result) >= 5 else True
         if self._remote_overlay:
             self._remote_overlay._do_close()
         cw  = self.centralWidget()
         ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
         ov  = RemoteKeyOverlay(url, key, auto_login_url=auto, manual_url=manual,
-                               expiry_secs=600, parent=cw)
+                               expiry_secs=600, lan_enabled=lan, parent=cw)
         ov.set_new_key_callback(self.on_remote_clicked)
+        ov.set_lan_callback(self.on_lan_toggled)
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
@@ -5230,8 +5290,22 @@ class MainWindow(QMainWindow):
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
+        # Called after the last window closes and before the process exits.
+        # main.py registers the session-memory flush here: the assistant runs on
+        # a daemon thread that dies with the process without running a single
+        # finally block, so anything it still owed has to be collected on the way
+        # out — otherwise closing the window silently loses the session summary.
+        self.on_quit = None
     def mainloop(self):
-        self._app.exec()
+        try:
+            self._app.exec()
+        finally:
+            cb = self.on_quit
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
     def protocol(self, *_):
         pass
 
@@ -5272,6 +5346,14 @@ class JarvisUI:
     @on_remote_clicked.setter
     def on_remote_clicked(self, cb):
         self._win.on_remote_clicked = cb
+
+    @property
+    def on_lan_toggled(self):
+        return self._win.on_lan_toggled
+
+    @on_lan_toggled.setter
+    def on_lan_toggled(self, cb):
+        self._win.on_lan_toggled = cb
 
     @property
     def on_interrupt(self):

@@ -87,6 +87,12 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 # the tiny model) with one click from ⚙ → WAKE WORD in the app, or install it
 # yourself with:  pip install openwakeword
 #
+# It is loaded in a SEPARATE PROCESS (core/wake_worker.py), never in the app:
+# openwakeword pulls in onnxruntime's native DLLs, and loading those next to
+# PyQt6/PortAudio/OpenCV can fault the whole app with no Python traceback.
+# A broken install therefore costs the wake word, not the session. Check any
+# machine with:  python check_wake_word.py
+#
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
 # packages are needed there — nothing Windows-specific is ever pulled in.
