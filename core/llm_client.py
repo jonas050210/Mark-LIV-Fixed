@@ -89,13 +89,19 @@ def _provider_headers(provider: str) -> dict[str, str]:
         return {}
 
     cfg = _load_config()
-    raw_key = cfg.get("llm_api_key")
-    if not isinstance(raw_key, str) or not raw_key.strip():
-        raw_key = cfg.get("openrouter_api_key")
+    if provider == "openrouter":
+        # The named OpenRouter field wins over the generic legacy field when
+        # both exist; otherwise replacing the key in the settings UI would not
+        # take effect until the old generic value was removed manually.
+        raw_key = cfg.get("openrouter_api_key") or cfg.get("llm_api_key")
+    else:
+        raw_key = cfg.get("llm_api_key")
     api_key = raw_key.strip() if isinstance(raw_key, str) else ""
 
     if provider == "openrouter" and not api_key:
-        raise RuntimeError("OpenRouter requires a non-empty llm_api_key")
+        raise RuntimeError(
+            "OpenRouter requires a non-empty llm_api_key or openrouter_api_key"
+        )
 
     headers: dict[str, str] = {}
     if api_key:

@@ -1402,6 +1402,10 @@ class SetupOverlay(QWidget):
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
         layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl(
+            "Gemini Live is the default. Optional provider keys can be added "
+            "later under SETTINGS → API KEYS.", 8, color=C.TEXT_DIM,
+        ))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -1495,6 +1499,325 @@ class SetupOverlay(QWidget):
             )
             return
         self.done.emit(key, self._sel_os)
+
+
+class ApiKeysOverlay(QWidget):
+    """Native provider-key editor with opt-in connection checks.
+
+    Gemini remains the first-launch/default Live provider. This panel keeps
+    optional provider credentials out of the startup gate and lets the user
+    validate one key at a time without ever displaying or logging its value.
+    Plugin-owned credentials, such as the Telegram bot token, stay in the
+    plugin settings panel instead of being duplicated here.
+    """
+
+    _OW = 560
+    _test_done = pyqtSignal(str, bool, str)  # provider key, ok, safe message
+    saved = pyqtSignal()
+
+    _FIELDS = (
+        {
+            "key": "gemini_api_key",
+            "title": "GEMINI API KEY  ·  DEFAULT LIVE PROVIDER",
+            "description": "Required for the normal Gemini Live audio session.",
+            "placeholder": "AIza…  (leave blank to keep the stored key)",
+        },
+        {
+            "key": "openrouter_api_key",
+            "title": "OPENROUTER API KEY  ·  OPTIONAL TEXT PROVIDER",
+            "description": "Stored for the OpenRouter/local text path; it does not replace Gemini Live automatically.",
+            "placeholder": "sk-or-…  (leave blank to keep the stored key)",
+        },
+        {
+            "key": "elevenlabs_api_key",
+            "title": "ELEVENLABS API KEY  ·  OPTIONAL TTS",
+            "description": "Optional cloud TTS credential. It is not required for the default Gemini setup.",
+            "placeholder": "Paste the ElevenLabs key  (leave blank to keep)",
+        },
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumWidth(self._OW)
+        self.setStyleSheet(f"""
+            ApiKeysOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+            QFrame#ApiKeyCard {{
+                background: rgba(1, 15, 24, 220);
+                border: 1px solid {C.BORDER};
+                border-radius: 4px;
+            }}
+        """)
+
+        self._inputs: dict[str, QLineEdit] = {}
+        self._status: dict[str, QLabel] = {}
+        self._test_buttons: dict[str, QPushButton] = {}
+        self._existing: dict[str, str] = {}
+        self._testing: set[str] = set()
+
+        try:
+            from memory.config_manager import load_api_keys
+            cfg = load_api_keys()
+        except Exception:
+            cfg = _read_full_config()
+        cfg = cfg if isinstance(cfg, dict) else {}
+        for field in self._FIELDS:
+            key = field["key"]
+            if key == "openrouter_api_key":
+                value = cfg.get("openrouter_api_key") or cfg.get("llm_api_key") or ""
+            else:
+                value = cfg.get(key) or ""
+            self._existing[key] = str(value).strip()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 16, 22, 16)
+        root.setSpacing(8)
+
+        root.addWidget(self._label("🔑  API KEYS", 12, True, C.PRI,
+                                  Qt.AlignmentFlag.AlignCenter))
+        root.addWidget(self._label(
+            "Gemini Live stays the default. Add optional provider keys here and "
+            "test them before saving.", 8, False, C.TEXT_DIM,
+            Qt.AlignmentFlag.AlignCenter))
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        root.addWidget(sep)
+
+        for field in self._FIELDS:
+            root.addWidget(self._build_card(field))
+
+        self._general_status = self._label("", 8, False, C.TEXT_DIM,
+                                           Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self._general_status)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        save_btn = QPushButton("▸  SAVE KEYS")
+        save_btn.setFixedHeight(34)
+        save_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+        """)
+        save_btn.clicked.connect(self._save_keys)
+        btn_row.addWidget(save_btn)
+
+        close_btn = QPushButton("CLOSE")
+        close_btn.setFixedHeight(34)
+        close_btn.setFont(QFont("Courier New", 9))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+        self._test_done.connect(self._on_test_done)
+
+    @staticmethod
+    def _label(text: str, size: int = 9, bold: bool = False,
+               color: str = C.PRI,
+               align: Qt.AlignmentFlag = Qt.AlignmentFlag.AlignLeft) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(align)
+        label.setWordWrap(True)
+        label.setFont(QFont("Courier New", size,
+                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
+        label.setStyleSheet(f"color: {color}; background: transparent;")
+        return label
+
+    def _build_card(self, field: dict) -> QFrame:
+        key = field["key"]
+        card = QFrame()
+        card.setObjectName("ApiKeyCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(5)
+
+        lay.addWidget(self._label(field["title"], 8, True, C.TEXT_DIM))
+        lay.addWidget(self._label(field["description"], 8, False, C.TEXT_MED))
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        edit = QLineEdit()
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        edit.setPlaceholderText(
+            "Stored — leave blank to keep the existing key"
+            if self._existing.get(key) else field["placeholder"]
+        )
+        edit.setFont(QFont("Courier New", 9))
+        edit.setFixedHeight(30)
+        edit.setStyleSheet(f"""
+            QLineEdit {{ background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px; }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        row.addWidget(edit, 1)
+        self._inputs[key] = edit
+
+        test_btn = QPushButton("TEST")
+        test_btn.setFixedSize(62, 30)
+        test_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_btn.setStyleSheet(f"""
+            QPushButton {{ background: #00091a; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.BORDER}; }}
+        """)
+        test_btn.clicked.connect(lambda _=False, k=key: self._start_test(k))
+        row.addWidget(test_btn)
+        self._test_buttons[key] = test_btn
+        lay.addLayout(row)
+
+        configured = bool(self._existing.get(key))
+        status = self._label(
+            "Configured (hidden)" if configured else "Not configured",
+            8, False, C.GREEN if configured else C.TEXT_DIM,
+        )
+        self._status[key] = status
+        lay.addWidget(status)
+        return card
+
+    def _key_for_test(self, key: str) -> str:
+        typed = self._inputs[key].text().strip()
+        return typed or self._existing.get(key, "")
+
+    def _start_test(self, key: str) -> None:
+        if key in self._testing:
+            return
+        value = self._key_for_test(key)
+        if not value:
+            self._set_status(key, False, "No key entered.")
+            return
+        self._testing.add(key)
+        self._test_buttons[key].setEnabled(False)
+        self._set_status(key, None, "Testing connection…")
+        threading.Thread(
+            target=self._test_worker_entry, args=(key, value), daemon=True,
+        ).start()
+
+    @staticmethod
+    def _test_worker(key: str, value: str) -> tuple[bool, str]:
+        """Check provider reachability without putting the credential in a URL."""
+        try:
+            import requests
+            if key == "gemini_api_key":
+                response = requests.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": value}, timeout=15,
+                )
+                service = "Gemini"
+            elif key == "openrouter_api_key":
+                response = requests.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {value}"}, timeout=15,
+                )
+                service = "OpenRouter"
+            elif key == "elevenlabs_api_key":
+                response = requests.get(
+                    "https://api.elevenlabs.io/v1/user",
+                    headers={"xi-api-key": value}, timeout=15,
+                )
+                service = "ElevenLabs"
+            else:
+                return False, "Unknown provider."
+
+            code = int(getattr(response, "status_code", 0))
+            if 200 <= code < 300:
+                return True, f"{service} connection OK."
+            if code in (401, 403):
+                return False, f"{service} rejected the key (HTTP {code})."
+            return False, f"{service} returned HTTP {code}."
+        except ImportError:
+            return False, "The requests package is not installed."
+        except Exception:
+            # Do not expose response bodies or exception URLs: either could
+            # contain provider-specific details or a credential copied by a
+            # third-party HTTP adapter.
+            return False, "Could not reach the service. Check network access."
+
+    def _set_status(self, key: str, ok: bool | None, message: str) -> None:
+        label = self._status.get(key)
+        if label is None:
+            return
+        if ok is True:
+            color = C.GREEN
+            prefix = "OK — "
+        elif ok is False:
+            color = C.RED
+            prefix = "FAILED — "
+        else:
+            color = C.ACC2
+            prefix = ""
+        label.setText(prefix + message)
+        label.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def _on_test_done(self, key: str, ok: bool, message: str) -> None:
+        self._testing.discard(key)
+        button = self._test_buttons.get(key)
+        if button is not None:
+            button.setEnabled(True)
+        self._set_status(key, ok, message)
+
+    def _test_worker_entry(self, key: str, value: str) -> None:
+        result = self._test_worker(key, value)
+        self._test_done.emit(key, result[0], result[1])
+
+    def _save_keys(self) -> None:
+        updates: dict[str, str] = {}
+        for key, edit in self._inputs.items():
+            typed = edit.text().strip()
+            if typed:
+                updates[key] = typed
+
+        if not updates:
+            self._general_status.setText("No new values — existing keys were kept.")
+            self._general_status.setStyleSheet(
+                f"color: {C.TEXT_DIM}; background: transparent;"
+            )
+            return
+
+        try:
+            from memory.config_manager import save_provider_api_keys
+            if not save_provider_api_keys(updates):
+                raise RuntimeError("configuration file is unreadable")
+            for key, value in updates.items():
+                self._existing[key] = value
+                self._inputs[key].clear()
+                self._inputs[key].setPlaceholderText(
+                    "Stored — leave blank to keep the existing key"
+                )
+                self._set_status(key, True, "Saved locally (hidden).")
+
+            # core.gemini caches its key for side calls. Refresh only the cache;
+            # the active Live session is intentionally not restarted in a UI
+            # callback, so saving a key cannot interrupt a conversation.
+            if "gemini_api_key" in updates:
+                try:
+                    from core.gemini import api_key
+                    api_key(refresh=True)
+                except Exception:
+                    pass
+            self._general_status.setText("Provider keys saved locally ✓")
+            self._general_status.setStyleSheet(
+                f"color: {C.GREEN}; background: transparent;"
+            )
+            self.saved.emit()
+        except Exception as exc:
+            # Keep the diagnostic generic; do not echo config paths or values.
+            self._general_status.setText(f"Could not save provider keys: {type(exc).__name__}")
+            self._general_status.setStyleSheet(
+                f"color: {C.RED}; background: transparent;"
+            )
 
 
 class HueWheel(QWidget):
@@ -3030,6 +3353,7 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        self._api_keys_overlay: ApiKeysOverlay | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -4033,6 +4357,14 @@ class MainWindow(QMainWindow):
         mem_btn.setStyleSheet(_BTN_STYLE_DIM)
         mem_btn.clicked.connect(self._open_memory_panel)
         lay.addWidget(mem_btn)
+
+        api_btn = QPushButton("🔑  API KEYS")
+        api_btn.setFixedHeight(26)
+        api_btn.setFont(QFont("Courier New", 7))
+        api_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        api_btn.setStyleSheet(_BTN_STYLE_DIM)
+        api_btn.clicked.connect(self._open_api_keys)
+        lay.addWidget(api_btn)
 
         plugin_btn = QPushButton("🧩  PLUGINS")
         plugin_btn.setFixedHeight(26)
@@ -5147,6 +5479,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"ERR: Confirmation failed — {e}")
 
+    def _open_api_keys(self):
+        """Open the native provider-key editor from the settings drawer."""
+        if getattr(self, "_api_keys_overlay", None) is not None:
+            self._api_keys_overlay.hide()
+        cw = self.centralWidget()
+        ov = ApiKeysOverlay(parent=cw)
+        ow = ApiKeysOverlay._OW
+        ov.adjustSize()
+        oh = min(max(ov.sizeHint().height(), 420), cw.height() - 16)
+        ov.setGeometry(
+            (cw.width() - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        ov.saved.connect(
+            lambda: self._log.append_log("SYS: Provider keys updated (values hidden).")
+        )
+        ov.show()
+        ov.raise_()
+        self._api_keys_overlay = ov
+
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
         cw = self.centralWidget()
@@ -5273,11 +5626,19 @@ class MainWindow(QMainWindow):
         self._overlay = ov
 
     def _on_setup_done(self, key: str, os_name: str):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        try:
+            from memory.config_manager import save_initial_setup
+            if not save_initial_setup(key, os_name):
+                self._log.append_log(
+                    "ERR: Could not save initial setup — configuration was not changed."
+                )
+                return
+        except Exception as exc:
+            self._log.append_log(
+                f"ERR: Initial setup save failed — {type(exc).__name__}"
+            )
+            return
+
         self._ready = True
         if self._overlay:
             self._overlay.hide()

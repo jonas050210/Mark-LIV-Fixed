@@ -332,7 +332,7 @@ On disk it ends up larger than the download, because those wheels are compressed
 | **Python** | 3.11, 3.12 or 3.13 |
 | **Microphone** | Required for voice interaction (and for the "Hey Jarvis" wake word) |
 | **Speakers** | Required for voice replies |
-| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`) |
+| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); optional OpenRouter and ElevenLabs keys are managed from ⚙ → API KEYS with per-provider connection checks |
 | **GPU** | **Not required.** The avatar is rendered in software |
 | **Disk space** | ~0.8 GB for the packages; ~1.4 GB if you add Chromium (see above) |
 | **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
@@ -438,6 +438,8 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | Gemini API key, plugin credentials | `config/api_keys.json` | **Plaintext.** Anyone with your user account can read it. Treat it like a password file. |
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
+
+The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; optional OpenRouter and ElevenLabs keys can be tested against their provider endpoints before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
 
 The phone dashboard is **not reachable from your network until you say so**: it binds `127.0.0.1` and asks the OS for no firewall rule at all. The switch lives in the Remote Access panel (*ALLOW PHONE ACCESS*), it moves the socket while the app runs, and your choice is remembered in `config/api_keys.json`.
 
