@@ -284,11 +284,41 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 ```bash
 git clone https://github.com/FatihMakes/Mark-LIV.git
 cd Mark-LIV
-python setup.py        # installs deps for YOUR OS + the browser automation engine
+python setup.py        # installs deps for YOUR OS, then asks about browser binaries
 python main.py
 ```
 
 `setup.py` only ever installs what your operating system needs — the Windows-only libraries are skipped automatically on macOS and Linux, and vice-versa. It also checks your Python version up front, so a wrong interpreter fails with a sentence instead of a wall of pip output. Prefer to do it by hand? `pip install -r requirements.txt` works too.
+
+**Browser binaries are optional, and setup asks before fetching them.** Web automation drives a real browser engine from Playwright, and those are the biggest thing setup can download: Chromium ≈ 225 MB, Firefox ≈ 86 MB. So `setup.py` explains the sizes and offers a choice — Chromium only (recommended, covers Chrome/Edge/Brave/Vivaldi/Opera), both engines, Firefox only, or none. Nothing except browser automation needs them, and a skipped browser can always be added later.
+
+| Command | What it does |
+| --- | --- |
+| `python setup.py` | packages, then asks which browsers to download |
+| `python setup.py --yes` | packages + Chromium — recommended, no questions |
+| `python setup.py --minimal` | packages only, no browser binaries |
+| `python setup.py --browsers chromium\|firefox\|chromium-firefox\|none` | packages + exactly those browsers |
+| `python setup.py --dry-run` | prints the plan, changes nothing |
+| `python -m playwright install chromium` | add a browser engine later |
+
+A failed or skipped browser download is never fatal — MARK LIV starts and works, only browser automation stays unavailable. Non-interactive runs (piped output, CI, scheduled tasks) never wait for input; they take the recommended default unless a flag or `MARK_LIV_BROWSERS=none` says otherwise.
+
+### 📦 How much does it actually download?
+
+Measured against PyPI for **Windows + Python 3.11** — 91 packages including transitive dependencies (the numbers drift a little with every release):
+
+| What you install | Download |
+| --- | --- |
+| Python packages only (`--minimal`) | **~235 MB** |
+| packages + Chromium (`--yes`, recommended) | **~460 MB** |
+| packages + Firefox | **~320 MB** |
+| packages + Chromium + Firefox | **~545 MB** |
+
+So: a few hundred megabytes, not gigabytes. macOS and Linux land in the same range — slightly lower, since the Windows-only packages drop away.
+
+Where it goes: the Qt6 runtime alone is ~75 MB, OpenCV ~40 MB, the Playwright **driver** ~37 MB (that is the Python package, *not* a browser), Google's API client ~15 MB, numpy ~12 MB — everything after that is single-digit. The browsers are the only thing that can add a few hundred MB on top.
+
+On disk it ends up larger than the download, because those wheels are compressed and Qt, OpenCV and browsers barely compress: expect roughly **0.7–1.0 GB installed without browsers** and **~1.3–1.6 GB with Chromium**. (Download sizes are measured; the on-disk figures are estimates.) Nothing else is fetched later, except the wake-word model — a few MB, on demand, from inside the app.
 
 > ⚠️ **Installation Note:** If you hit a `ModuleNotFoundError` for an OS-specific package, install it with `pip install <module_name>`. The optional **wake word** engine is *not* installed here — grab it in one click from **⚙ → WAKE WORD** inside the app.
 
@@ -304,6 +334,7 @@ python main.py
 | **Speakers** | Required for voice replies |
 | **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`) |
 | **GPU** | **Not required.** The avatar is rendered in software |
+| **Disk space** | ~0.8 GB for the packages; ~1.4 GB if you add Chromium (see above) |
 | **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
 
 ---

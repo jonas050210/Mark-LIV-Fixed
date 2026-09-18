@@ -7,9 +7,11 @@ Installs only the packages that are actually missing, then exits cleanly.
 from __future__ import annotations
 
 import importlib.util
+import os
 import platform
 import subprocess
 import sys
+from pathlib import Path
 from typing import Callable
 
 # ── Package lists ─────────────────────────────────────────────────────────
@@ -48,6 +50,34 @@ _STT: dict[str, list[tuple[str, str]]] = {
     "whisper": [("faster_whisper", "faster-whisper")],
     "vosk":    [("vosk",           "vosk")],
 }
+
+# Playwright browser binaries. These are the biggest thing any MARK LIV install
+# ever downloads, so the choice is explicit and can be pinned by the environment
+# (same variable name setup.py reads).
+BROWSER_ENV = "MARK_LIV_BROWSERS"
+_BROWSER_ARGS = {
+    "none": [],
+    "chromium": ["chromium"],
+    "firefox": ["firefox"],
+    "chromium-firefox": ["chromium", "firefox"],
+}
+_BROWSER_SIZES = {
+    "none": "0 MB",
+    "chromium": "~225 MB",
+    "firefox": "~86 MB",
+    "chromium-firefox": "~311 MB",
+}
+
+
+def _browser_choice() -> str:
+    """Which browsers this install should fetch (see BROWSER_ENV)."""
+    raw = (os.environ.get(BROWSER_ENV) or "").strip().lower().replace("_", "-")
+    if not raw:
+        return "chromium"          # covers Chrome/Edge/Brave/Vivaldi/Opera
+    if raw in ("none", "skip", "minimal"):
+        return "none"
+    return raw if raw in _BROWSER_ARGS else "chromium"
+
 
 # TTS engine packages
 _TTS: dict[str, list[tuple[str, str]]] = {
@@ -122,17 +152,43 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
     for _mod, pkg in missing:
         _pip(pkg, log)
 
-    # Playwright: install the package + download Chromium browser
+    # Playwright: install the package, then the browser binaries it drives.
     if not _available("playwright"):
-        _pip("playwright", log)
-        if log:
-            log("SYS: Downloading Playwright browser (Chromium, ~150 MB — one-time)…")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-        )
-        if log:
-            log("SYS: Playwright browser ready.")
+        if not _pip("playwright", log):
+            if log:
+                log("ERR: playwright package failed to install — browser "
+                    "automation stays unavailable.")
+        else:
+            choice = _browser_choice()
+            args = _BROWSER_ARGS[choice]
+            if not args:
+                if log:
+                    log(f"SYS: Skipping Playwright browsers ({BROWSER_ENV}=none). "
+                        f"Browser automation stays off until you run:")
+                    log(f"SYS:   {Path(sys.executable).name or 'python'} -m "
+                        f"playwright install chromium")
+            else:
+                if log:
+                    log(f"SYS: Downloading Playwright browser ({' + '.join(args)}, "
+                        f"{_BROWSER_SIZES[choice]} — one-time, this is the big one)…")
+                result = subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", *args],
+                    capture_output=True,
+                )
+                # Not fatal: everything except browser automation works without
+                # it, and the download is several hundred MB from a CDN that a
+                # metered connection or a corporate network can refuse.
+                if result.returncode == 0:
+                    if log:
+                        log("SYS: Playwright browser ready.")
+                elif log:
+                    log("ERR: Playwright browser download failed — browser "
+                        "automation is unavailable. Retry later with:")
+                    log(f"ERR:   {Path(sys.executable).name or 'python'} -m "
+                        f"playwright install {' '.join(args)}")
+                    tail = (result.stderr or b"").decode(errors="replace").strip()
+                    if tail:
+                        log(f"ERR:   {tail.splitlines()[-1][:140]}")
 
     if log:
         log("SYS: All dependencies ready ✓")

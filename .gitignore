@@ -7,6 +7,12 @@
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
 # Your Gemini API key, plus per-plugin credentials.
 config/api_keys.json
+# Leftovers of the atomic write in memory/config_manager.py, and the quarantine
+# copy kept when a config cannot be parsed. Both hold exactly the same secrets.
+# Git does not treat trailing inline explanations as comments, so every pattern
+# sits on a line of its own.
+config/*.tmp
+config/api_keys.corrupt.json
 # The dashboard's TLS private key and certificate.
 config/certs/
 # A LINKED WhatsApp session — committing it hands somebody your WhatsApp
