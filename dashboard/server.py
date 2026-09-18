@@ -14,6 +14,14 @@ every unauthenticated login route is rate limited per client address.
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 """
 
+# PEP 563: the dependency import below is deliberately guarded (`_DEPS_OK`), so this
+# module must still import cleanly when FastAPI is absent. Without it the annotations
+# are evaluated at import time and the first `-> JSONResponse` raises NameError —
+# killing the graceful-degradation path the guard exists for, so the dashboard could
+# not even report what is missing.
+from __future__ import annotations
+
+
 import asyncio
 import base64
 import hashlib
