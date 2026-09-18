@@ -1,7 +1,8 @@
 """
 Local LLM client for MARK XL.
 
-Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
+Supports local and OpenAI-compatible backends — selected via
+"llm_provider" in config/api_keys.json:
 
   "llm_provider": "ollama"   (default)
         Uses Ollama's native /api/chat endpoint.
@@ -15,6 +16,13 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         Set  "llm_url": "http://localhost:1234"  in config.
         Note: tool-calling support depends on the model; use a model that
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
+
+  "llm_provider": "openrouter"
+        Uses OpenRouter's OpenAI-compatible API. Set
+        "llm_url": "https://openrouter.ai/api/v1", an OpenRouter model ID, and
+        "llm_api_key" (or "openrouter_api_key") in the local config. The key is
+        sent only as an Authorization header and is never included in an error
+        message here.
 """
 import json
 import re
@@ -42,14 +50,25 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
     "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai"
+    "llm_provider": "ollama",   # "ollama" | "openai" | "openrouter"
 }
 
 
 def get_llm_provider() -> str:
-    """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
-    raw = _load_config().get("llm_provider", "ollama").strip().lower()
-    return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
+    """Return the configured backend without silently misclassifying it.
+
+    ``openai`` is the generic OpenAI-compatible/local-server mode. OpenRouter
+    is kept separate because it needs bearer authentication and an explicit
+    API key; treating it as Ollama used to send requests to ``/api/chat``
+    without authentication.
+    """
+    raw = _load_config().get("llm_provider", _DEFAULTS["llm_provider"])
+    raw = str(raw).strip().lower()
+    if raw == "openrouter":
+        return "openrouter"
+    if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp", "vllm"):
+        return "openai"
+    return "ollama"
 
 
 def _load_config() -> dict:
@@ -57,6 +76,59 @@ def _load_config() -> dict:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _provider_headers(provider: str) -> dict[str, str]:
+    """Build request headers without ever putting a secret in a URL.
+
+    Local OpenAI-compatible servers normally need no key. OpenRouter does, and
+    deliberately does not reuse ``gemini_api_key``: selecting a local/provider
+    path must not accidentally send the Gemini credential to another service.
+    """
+    if provider not in ("openai", "openrouter"):
+        return {}
+
+    cfg = _load_config()
+    raw_key = cfg.get("llm_api_key")
+    if not isinstance(raw_key, str) or not raw_key.strip():
+        raw_key = cfg.get("openrouter_api_key")
+    api_key = raw_key.strip() if isinstance(raw_key, str) else ""
+
+    if provider == "openrouter" and not api_key:
+        raise RuntimeError("OpenRouter requires a non-empty llm_api_key")
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # OpenRouter accepts these optional attribution headers. They are plain
+    # metadata, never credentials, and are omitted when not configured.
+    if provider == "openrouter":
+        referer = cfg.get("openrouter_http_referer")
+        app_name = cfg.get("openrouter_app_name")
+        if isinstance(referer, str) and referer.strip():
+            headers["HTTP-Referer"] = referer.strip()
+        if isinstance(app_name, str) and app_name.strip():
+            headers["X-Title"] = app_name.strip()
+
+    return headers
+
+
+def _is_openai_compatible(provider: str) -> bool:
+    return provider in ("openai", "openrouter")
+
+
+def _openai_endpoint(base_url: str, resource: str) -> str:
+    """Return an OpenAI-compatible endpoint for either base URL convention.
+
+    Local servers are commonly configured as ``http://localhost:1234`` while
+    OpenRouter is often copied as ``https://openrouter.ai/api/v1``. Supporting
+    both avoids producing the accidental ``/v1/v1`` path.
+    """
+    base = base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return f"{base}/{resource.lstrip('/')}"
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
@@ -68,21 +140,23 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
     url, _   = get_llm_settings()
     provider = get_llm_provider()
 
-    if provider == "openai":
-        # OpenAI-compatible servers (LM Studio, LocalAI, etc.) must be started
-        # by the user — we just check if they're reachable.
-        health = f"{url}/v1/models"
+    if _is_openai_compatible(provider):
+        # OpenAI-compatible servers (including OpenRouter) must be reachable;
+        # unlike Ollama, this client never starts them.
+        health = _openai_endpoint(url, "models")
         try:
-            ok = requests.get(health, timeout=5).status_code == 200
+            ok = requests.get(
+                health, headers=_provider_headers(provider), timeout=5
+            ).status_code == 200
             if ok:
-                print(f"[LLM] OpenAI-compatible server reachable at {url}")
+                print(f"[LLM] {provider} endpoint reachable at {url}")
             else:
                 print(f"[LLM] Server at {url} returned non-200.  Is it running?")
             return ok
-        except Exception as e:
+        except Exception:
             print(
-                f"[LLM] Cannot reach OpenAI-compatible server at {url}.\n"
-                "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
+                f"[LLM] Cannot reach {provider} endpoint at {url}.\n"
+                "      Check the server, URL, model provider, and local API key settings."
             )
             return False
 
@@ -146,9 +220,9 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": "hi"})
 
-    if provider == "openai":
-        # OpenAI-compatible: just fire a minimal request to ensure the model is loaded.
-        # No keep_alive or KV-cache priming available — server manages this internally.
+    if _is_openai_compatible(provider):
+        # OpenAI-compatible: fire a minimal request to ensure the model is
+        # accepted/loaded. No keep_alive or KV-cache priming is assumed.
         payload = {
             "model":      model,
             "messages":   messages,
@@ -156,9 +230,14 @@ def warmup_model(system_prompt: str | None = None) -> bool:
             "max_tokens": 1,
         }
         try:
-            resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
+            resp = requests.post(
+                _openai_endpoint(url, "chat/completions"),
+                headers=_provider_headers(provider),
+                json=payload,
+                timeout=180,
+            )
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
+            print(f"[LLM] '{model}' ready ({provider}).")
             return True
         except Exception as e:
             print(f"[LLM] Warmup failed (non-fatal): {e}")
@@ -185,15 +264,43 @@ def warmup_model(system_prompt: str | None = None) -> bool:
 
 
 def check_model_available(log: Callable | None = None) -> bool:
-    """
-    Returns True if the configured model is already pulled in Ollama.
-    Logs an actionable warning (to console + optional UI callback) if not.
-    Always returns True for non-Ollama providers (cannot inspect their model list).
-    """
-    if get_llm_provider() != "ollama":
-        return True
-
+    """Return whether the configured model is available from its backend."""
+    provider = get_llm_provider()
     url, model = get_llm_settings()
+
+    if _is_openai_compatible(provider):
+        try:
+            resp = requests.get(
+                _openai_endpoint(url, "models"),
+                headers=_provider_headers(provider),
+                timeout=5,
+            )
+            resp.raise_for_status()
+            entries = resp.json().get("data", [])
+            names = [
+                str(item.get("id", ""))
+                for item in entries
+                if isinstance(item, dict)
+            ]
+            # Some compatible servers expose health but not a useful model
+            # list. Reachability is still a meaningful positive result there.
+            if not names:
+                return True
+            found = model in names
+            if not found:
+                available = ", ".join(names) or "none"
+                warn = (
+                    f"WRN: Model '{model}' is not advertised by {provider}.\n"
+                    f"     Available: {available}"
+                )
+                print(warn)
+                if log:
+                    log(f"WRN: '{model}' not found at the configured {provider} endpoint")
+            return found
+        except Exception as e:
+            print(f"[LLM] Could not check {provider} model availability: {e}")
+            return False
+
     try:
         resp = requests.get(f"{url}/api/tags", timeout=5)
         resp.raise_for_status()
@@ -219,10 +326,12 @@ def check_model_available(log: Callable | None = None) -> bool:
 
 
 def get_llm_settings() -> tuple[str, str]:
-    """Returns (base_url, model_name)."""
-    cfg   = _load_config()
-    url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
-    model = cfg.get("llm_model", _DEFAULTS["llm_model"])
+    """Returns (base_url, model_name), with safe string defaults."""
+    cfg = _load_config()
+    raw_url = cfg.get("llm_url", _DEFAULTS["llm_url"])
+    raw_model = cfg.get("llm_model", _DEFAULTS["llm_model"])
+    url = str(raw_url).strip().rstrip("/") or _DEFAULTS["llm_url"]
+    model = str(raw_model).strip() or _DEFAULTS["llm_model"]
     return url, model
 
 
@@ -240,8 +349,8 @@ def call_llm(
     url, model = get_llm_settings()
     provider   = get_llm_provider()
 
-    if provider == "openai":
-        endpoint = f"{url}/v1/chat/completions"
+    if _is_openai_compatible(provider):
+        endpoint = _openai_endpoint(url, "chat/completions")
         payload: dict = {
             "model":      model,
             "messages":   messages,
@@ -252,26 +361,35 @@ def call_llm(
             payload["tools"]       = tools
             payload["tool_choice"] = "auto"
         try:
-            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp = requests.post(
+                endpoint,
+                headers=_provider_headers(provider),
+                json=payload,
+                timeout=timeout,
+            )
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
-            # OpenAI tool_calls format → normalise to Ollama-style
+            # OpenAI tool_calls format → normalise to Ollama-style.
+            # Keep malformed JSON visible to the caller instead of crashing the
+            # whole response while parsing a provider-specific tool call.
             raw_tc  = msg.get("tool_calls") or []
-            tc_list = [
-                {
-                    "id":       t.get("id", ""),
+            tc_list = []
+            for tool_call in raw_tc:
+                function = tool_call.get("function") or {}
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        pass
+                tc_list.append({
+                    "id": tool_call.get("id", ""),
                     "function": {
-                        "name":      t["function"]["name"],
-                        "arguments": (
-                            json.loads(t["function"]["arguments"])
-                            if isinstance(t["function"].get("arguments"), str)
-                            else t["function"].get("arguments", {})
-                        ),
+                        "name": function.get("name", ""),
+                        "arguments": arguments,
                     },
-                }
-                for t in raw_tc
-            ]
+                })
             return {
                 "content":    (msg.get("content") or "").strip(),
                 "tool_calls": tc_list,
@@ -339,15 +457,54 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
-    m        = model or default_model
+    provider = get_llm_provider()
+    m = str(model).strip() if model else default_model
+    m = m or default_model
 
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
+    if _is_openai_compatible(provider):
+        endpoint = _openai_endpoint(url, "chat/completions")
+        payload = {
+            "model": m,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 600,
+        }
+        try:
+            resp = requests.post(
+                endpoint,
+                headers=_provider_headers(provider),
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            choice = resp.json().get("choices", [{}])[0]
+            return (choice.get("message", {}).get("content") or "").strip()
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                f"Cannot connect to {provider} endpoint at {url}. "
+                "Check that the server is running and the URL is correct."
+            )
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"{provider} text request timed out after {timeout} s.")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"{provider} HTTP error: {e.response.status_code}")
+        except Exception as e:
+            raise RuntimeError(f"{provider} text call failed: {e}")
+
+    # ── Ollama ──────────────────────────────────────────────────────────────
+    endpoint = f"{url}/api/chat"
+    payload = {
+        "model": m,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_predict": 600},
+    }
 
     try:
         resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -381,7 +538,7 @@ def _stream_openai(
     so the output format is identical to the Ollama backend.
     """
     url, model = get_llm_settings()
-    endpoint   = f"{url}/v1/chat/completions"
+    endpoint   = _openai_endpoint(url, "chat/completions")
 
     payload: dict = {
         "model":      model,
@@ -393,8 +550,16 @@ def _stream_openai(
         payload["tools"]       = tools
         payload["tool_choice"] = "auto"
 
+    provider = get_llm_provider()
+
     try:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
+        with requests.post(
+            endpoint,
+            headers=_provider_headers(provider),
+            json=payload,
+            timeout=timeout,
+            stream=True,
+        ) as resp:
             resp.raise_for_status()
             full_content = ""
             buf          = ""
@@ -501,7 +666,7 @@ def call_llm_stream(
     Tool calls always appear in the final "done" event.
     """
     provider = get_llm_provider()
-    if provider == "openai":
+    if _is_openai_compatible(provider):
         yield from _stream_openai(messages, tools, timeout)
         return
 
