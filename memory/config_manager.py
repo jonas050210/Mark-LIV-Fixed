@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -22,14 +23,62 @@ def config_exists() -> bool:
     return CONFIG_FILE.exists()
 
 
-def _read_config_unlocked() -> dict:
+def _read_config_state() -> tuple[dict, bool]:
+    """Return `(data, intact)`.
+
+    `intact` is False when the file exists but could not be read or parsed.
+    The distinction is what protects the config: a missing or empty file is a
+    fresh install and safe to initialise, while an unreadable one still holds
+    the API key and every setting, and must never be overwritten.
+    """
     if not CONFIG_FILE.exists():
-        return {}
+        return {}, True
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        raw = CONFIG_FILE.read_text(encoding="utf-8")
     except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
-        return {}
+        print(f"❌ Failed to read api_keys.json: {e}")
+        return {}, False
+    if not raw.strip():
+        return {}, True          # present but empty: nothing to lose, start fresh
+    try:
+        return json.loads(raw), True
+    except Exception as e:
+        print(f"❌ Failed to parse api_keys.json: {e}")
+        return {}, False
+
+
+def _read_config_unlocked() -> dict:
+    return _read_config_state()[0]
+
+
+def _refuse_corrupt_write() -> bool:
+    """Keep a copy of an unreadable config and tell the user. Always False.
+
+    Every save is a read-modify-write. Reading a file that failed to parse
+    returns `{}`, so merging into it and writing back would replace a config
+    that still holds the API key with one that holds almost nothing: a corrupt
+    file would silently become an empty one. OneDrive placeholders, sync
+    conflicts and interrupted editors all produce exactly that state, so the
+    write is refused, the evidence is kept, and the caller gets False.
+    """
+    kept = None
+    if CONFIG_FILE.exists():
+        target = CONFIG_DIR / CONFIG_FILE.name.replace(".json", ".corrupt.json")
+        try:
+            ensure_config_dir()
+            shutil.copyfile(CONFIG_FILE, target)
+            kept = target
+        except Exception as e:
+            print(f"❌ Could not quarantine the unreadable config: {e}")
+    print("❌ Refusing to write api_keys.json: it exists but cannot be parsed.")
+    if kept is not None:
+        print(f"   A copy was kept at {kept}")
+        print("   Repair that copy and move it back, or delete it to start "
+              "fresh — settings will not persist until you do.")
+    else:
+        print("   Repair or delete the file — settings will not persist "
+              "until you do.")
+    return False
 
 
 def _write_config_unlocked(data: dict) -> None:
@@ -59,8 +108,8 @@ def _write_config_unlocked(data: dict) -> None:
             pass
         raise
 
-def save_api_keys(gemini_api_key: str) -> None:
-    _patch_config(gemini_api_key=gemini_api_key.strip())
+def save_api_keys(gemini_api_key: str) -> bool:
+    return _patch_config(gemini_api_key=gemini_api_key.strip())
 
 def load_api_keys() -> dict:
     with _CONFIG_LOCK:
@@ -84,9 +133,9 @@ def get_user_name() -> str:
     return load_api_keys().get("user_name", "")
 
 
-def save_assistant_config(assistant_name: str, user_name: str) -> None:
+def save_assistant_config(assistant_name: str, user_name: str) -> bool:
     """Persist assistant name and user name to config."""
-    _patch_config(assistant_name=assistant_name.strip() or "JARVIS",
+    return _patch_config(assistant_name=assistant_name.strip() or "JARVIS",
                   user_name=user_name.strip())
 
 
@@ -104,27 +153,27 @@ def get_voice() -> str:
     return v if v in AVAILABLE_VOICES else DEFAULT_VOICE
 
 
-def save_voice(voice_name: str) -> None:
+def save_voice(voice_name: str) -> bool:
     """Persist the chosen Live voice. Unknown names collapse to the default so a
     bad value can never reach the API and break the session."""
     v = (voice_name or "").strip()
-    _patch_config(voice_name=v if v in AVAILABLE_VOICES else DEFAULT_VOICE)
+    return _patch_config(voice_name=v if v in AVAILABLE_VOICES else DEFAULT_VOICE)
 
 def get_wake_word_enabled() -> bool:
     """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
     return load_api_keys().get("wake_word_enabled", False)
 
 
-def save_wake_word_enabled(enabled: bool) -> None:
-    _patch_config(wake_word_enabled=bool(enabled))
+def save_wake_word_enabled(enabled: bool) -> bool:
+    return _patch_config(wake_word_enabled=bool(enabled))
 
 def get_push_to_talk_enabled() -> bool:
     """Hold-a-key-to-speak. When on, the mic is closed unless the chord is held."""
     return load_api_keys().get("push_to_talk_enabled", False)
 
 
-def save_push_to_talk_enabled(enabled: bool) -> None:
-    _save_flag("push_to_talk_enabled", enabled)
+def save_push_to_talk_enabled(enabled: bool) -> bool:
+    return _save_flag("push_to_talk_enabled", enabled)
 
 
 def get_dashboard_lan_enabled() -> bool:
@@ -140,8 +189,8 @@ def get_dashboard_lan_enabled() -> bool:
     return load_api_keys().get("dashboard_lan_enabled", False)
 
 
-def save_dashboard_lan_enabled(enabled: bool) -> None:
-    _save_flag("dashboard_lan_enabled", enabled)
+def save_dashboard_lan_enabled(enabled: bool) -> bool:
+    return _save_flag("dashboard_lan_enabled", enabled)
 
 
 HUD_STYLES = ("face", "core")
@@ -159,9 +208,9 @@ def get_hud_style() -> str:
     return v if v in HUD_STYLES else "face"
 
 
-def save_hud_style(style: str) -> None:
+def save_hud_style(style: str) -> bool:
     s = str(style or "").strip().lower()
-    _save_flag("hud_style", s if s in HUD_STYLES else "face")
+    return _save_flag("hud_style", s if s in HUD_STYLES else "face")
 
 
 # ── Live-session tuning ──────────────────────────────────────────────────────
@@ -179,8 +228,8 @@ def get_thinking_enabled() -> bool:
     return bool(load_api_keys().get("thinking_enabled", False))
 
 
-def save_thinking_enabled(enabled: bool) -> None:
-    _save_flag("thinking_enabled", enabled)
+def save_thinking_enabled(enabled: bool) -> bool:
+    return _save_flag("thinking_enabled", enabled)
 
 
 def get_turn_tuning() -> dict:
@@ -217,14 +266,17 @@ def get_turn_tuning() -> dict:
     }
 
 
-def save_turn_tuning(values: dict) -> None:
+def save_turn_tuning(values: dict) -> bool:
     with _CONFIG_LOCK:
-        data = _read_config_unlocked()
+        data, intact = _read_config_state()
+        if not intact:
+            return _refuse_corrupt_write()
         cur = data.get("turn_tuning")
         cur = dict(cur) if isinstance(cur, dict) else {}
         cur.update(values or {})
         data["turn_tuning"] = cur
         _write_config_unlocked(data)
+        return True
 
 def get_proactive_audio_enabled() -> bool:
     """Whether the model gets to decide an utterance was not aimed at it and
@@ -239,8 +291,8 @@ def get_proactive_audio_enabled() -> bool:
     return bool(load_api_keys().get("proactive_audio", True))
 
 
-def save_proactive_audio_enabled(enabled: bool) -> None:
-    _save_flag("proactive_audio", enabled)
+def save_proactive_audio_enabled(enabled: bool) -> bool:
+    return _save_flag("proactive_audio", enabled)
 
 
 MEDIA_RESOLUTIONS = ("default", "low", "medium", "high")
@@ -255,21 +307,21 @@ def get_media_resolution() -> str:
     return v if v in MEDIA_RESOLUTIONS else "medium"
 
 
-def save_media_resolution(value: str) -> None:
+def save_media_resolution(value: str) -> bool:
     v = str(value or "").strip().lower()
-    _save_flag("media_resolution", v if v in MEDIA_RESOLUTIONS else "medium")
+    return _save_flag("media_resolution", v if v in MEDIA_RESOLUTIONS else "medium")
 
 
-def _save_flag(key: str, value) -> None:
+def _save_flag(key: str, value) -> bool:
     """Read-modify-write one key without disturbing the rest of the config."""
-    _patch_config(**{key: bool(value) if isinstance(value, bool) else value})
+    return _patch_config(**{key: bool(value) if isinstance(value, bool) else value})
 
 def get_brief_enabled() -> bool:
     return load_api_keys().get("morning_brief_enabled", True)
 
 
-def save_brief_enabled(enabled: bool) -> None:
-    _patch_config(morning_brief_enabled=bool(enabled))
+def save_brief_enabled(enabled: bool) -> bool:
+    return _patch_config(morning_brief_enabled=bool(enabled))
 
 
 # ── Audio devices ────────────────────────────────────────────────────────────
@@ -279,20 +331,27 @@ def save_brief_enabled(enabled: bool) -> None:
 # both the factory setting and what an unresolvable saved device falls back to —
 # so unplugging a headset degrades to the built-in speakers instead of crashing.
 
-def _patch_config(**fields) -> None:
-    """Read-modify-write one or more keys in api_keys.json atomically."""
+def _patch_config(**fields) -> bool:
+    """Read-modify-write one or more keys in api_keys.json atomically.
+
+    Returns False and writes nothing if the existing file is unreadable
+    (see _refuse_corrupt_write).
+    """
     with _CONFIG_LOCK:
-        data = _read_config_unlocked()
+        data, intact = _read_config_state()
+        if not intact:
+            return _refuse_corrupt_write()
         data.update(fields)
         _write_config_unlocked(data)
+        return True
 
 def get_input_device() -> str:
     """Microphone device name, or '' for the system default."""
     return (load_api_keys().get("input_device", "") or "").strip()
 
 
-def save_input_device(name: str) -> None:
-    _patch_config(input_device=(name or "").strip())
+def save_input_device(name: str) -> bool:
+    return _patch_config(input_device=(name or "").strip())
 
 
 def get_output_device() -> str:
@@ -300,8 +359,8 @@ def get_output_device() -> str:
     return (load_api_keys().get("output_device", "") or "").strip()
 
 
-def save_output_device(name: str) -> None:
-    _patch_config(output_device=(name or "").strip())
+def save_output_device(name: str) -> bool:
+    return _patch_config(output_device=(name or "").strip())
 
 
 def get_plugin_enabled(plugin_name: str) -> bool:
@@ -327,10 +386,15 @@ def get_plugin_setting(namespace: str, key: str, default=None):
     return get_plugin_config(namespace).get(key, default)
 
 
-def save_plugin_config(namespace: str, values: dict) -> None:
-    """Merge `values` into a namespace's stored config atomically."""
+def save_plugin_config(namespace: str, values: dict) -> bool:
+    """Merge `values` into a namespace's stored config atomically.
+
+    Returns False and writes nothing if the existing file is unreadable.
+    """
     with _CONFIG_LOCK:
-        data = _read_config_unlocked()
+        data, intact = _read_config_state()
+        if not intact:
+            return _refuse_corrupt_write()
         pc = data.get("plugin_config")
         if not isinstance(pc, dict):
             pc = {}
@@ -341,13 +405,17 @@ def save_plugin_config(namespace: str, values: dict) -> None:
         pc[namespace] = cur
         data["plugin_config"] = pc
         _write_config_unlocked(data)
+        return True
 
-def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
+def save_plugin_enabled(plugin_name: str, enabled: bool) -> bool:
     with _CONFIG_LOCK:
-        data = _read_config_unlocked()
+        data, intact = _read_config_state()
+        if not intact:
+            return _refuse_corrupt_write()
         plugins_cfg = data.get("plugins_enabled")
         if not isinstance(plugins_cfg, dict):
             plugins_cfg = {}
         plugins_cfg[plugin_name] = enabled
         data["plugins_enabled"] = plugins_cfg
         _write_config_unlocked(data)
+        return True
