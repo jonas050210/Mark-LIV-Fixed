@@ -43,6 +43,7 @@ It's not just an assistant — it's an extension of your digital life.
 | ↩️ Undo | Take back what the assistant did — files it moved, renamed, created or wrote, and settings it changed |
 | ⚠️ Real Confirmation | Shutdown, restart and WiFi wait for a button **you** press — the model cannot confirm its own irreversible actions |
 | 🎧 Audio Device Picker | Choose the microphone and speakers by name, filtered to the short list your OS shows — and measured, so every entry actually works |
+| 🔊 Audio Devices by Voice | Ask which microphones and speakers exist and switch either one by name — the choice is saved and lands on the undo stack |
 | 🔗 Session Continuity | A dropped connection, a voice change or a device change no longer wipes the conversation |
 | 🧩 Plugin System | Drop a single `.py` file into `plugins/` — JARVIS learns a new skill on next launch |
 | 🎙️ Real-time Voice | Ultra-low latency conversation in any language via Gemini Live API |
@@ -64,9 +65,13 @@ It's not just an assistant — it's an extension of your digital life.
 | 🗺️ Dynamic Content Panel | Scrollable display layer beneath the HUD that renders web results, news, and search data |
 | 🔍 Multi-Mode Web Search | `news` / `research` / `price` / `compare` / `search` — Gemini Grounded first, DDG fallback |
 | ⏰ Smart Reminders | OS-native scheduled notifications (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) |
+| ⏱️ Timers by Voice | "Remind me in 10 minutes" — a countdown that keeps running while you talk, announces itself out loud, and can be listed or cancelled |
+| 🔔 Desktop Notifications | Push any message to the OS notification centre; falls back from toast to `msg` to the activity log instead of failing silently |
 | ✈️ Flight Finder | Live flight price and availability lookup |
 | 🎮 Game Updater | Checks and triggers game updates on Steam and Epic Games on demand |
 | 📂 File Processor | Read, summarize, and answer questions about local files |
+| 📄 Document Q&A | Ask questions of a PDF, Word, Excel or PowerPoint file — read-only, page-ranged, and idle-scheduled so it never interrupts you |
+| 📝 Summarize Anything | Summarise the clipboard, a URL, a text file or dictated text into spoken bullet points — with an SSRF guard on URLs |
 | 💻 Code Helper | Inline code review, debugging, and generation |
 | 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
@@ -303,6 +308,26 @@ python main.py
 
 A failed or skipped browser download is never fatal — MARK LIV starts and works, only browser automation stays unavailable. Non-interactive runs (piped output, CI, scheduled tasks) never wait for input; they take the recommended default unless a flag or `MARK_LIV_BROWSERS=none` says otherwise.
 
+### 🧩 Five new skills
+
+Five files in `actions/`, no new dependencies, nothing else touched. Each one is a single `TOOL` dict plus a handler, discovered at launch like every other skill.
+
+* **⏱️ `timer`** — *"Set a timer for 10 minutes."* The countdown runs in a daemon thread, so the conversation never blocks on it, and it announces itself through the same thread-safe `speak()` the rest of the app uses. Durations are matched against a whitelist (`10m`, `1h30m`, `90s`, `10:30`, `1.5h`, `45 seconds`) and never evaluated — there is no `eval()` anywhere in the file. Timers can be listed and cancelled, and a cancelled timer leaves the registry immediately.
+* **🔔 `notify`** — puts any message into the OS notification centre. The ladder is `win10toast` → **the Windows shell's own notification** → `notify-send` on Linux → `msg *` → activity log, and if nothing answers it *says so* rather than pretending the toast appeared. That second tier exists for Windows 11, where `win10toast` frequently raises and `msg.exe` is missing from Home editions — without it a Windows 11 Home machine would only ever get a log line. It is pure standard library (`ctypes` around `Shell_NotifyIconW`), so no package, no PowerShell and no batch file: the text is written into the notification structure as *data*, which leaves no command line to inject into. Every subprocess notifier is called with an argument vector.
+* **📝 `summarize`** — summarises the clipboard, a URL, a text file or dictated text through `core.gemini` at the SMART tier, speaks the result and shows it in the content panel. URLs are restricted to `http`/`https` and resolved through `ipaddress`, so a page cannot point the assistant at `127.0.0.1`, a private range or link-local address. File paths go through the same home/tempdir guard `file_controller` uses. Office and PDF files are deliberately refused and handed to `document_qa`.
+* **📄 `document_qa`** — answers questions about PDF, DOCX, XLSX, PPTX and plain-text files. It is strictly read-only: it never writes, renames or executes anything, and the file is byte-identical afterwards. Page ranges (`"3"`, `"1-5"`, `"2,4,6-8"`) keep long documents inside the context budget, and it falls back to the currently open file the same way `main.py` does. This is the one action declared `NON_BLOCKING` / `WHEN_IDLE`, so extraction happens while the assistant is idle instead of interrupting a sentence.
+* **🔊 `audio_device`** — lists microphones and speakers and switches either one by name via `core.audio_devices`, with the change pushed onto `core.undo`. Matching is exact-or-unique: an ambiguous name is reported instead of guessed. It writes the choice to config and tells you honestly that the running audio session is rebuilt on the next start — it does not claim a live switch it cannot perform.
+
+**Also fixed while in there:**
+
+* `weather_report` read a `time` parameter it had never declared, so the model could not offer it. Declared now; the 32-character description was replaced with one that says when to use it.
+* `code_helper` declared `args` as `STRING` but concatenated it onto an interpreter command line, where one malformed answer raised `TypeError` and killed the whole run/build path. It is an `ARRAY` now, and every shape the model actually sends is normalised.
+* `core/llm_client.py` claimed five callers that have never existed. There are zero, and the docstring now says so.
+* **`open_app` ran your app names through a shell.** Both Windows launch paths used `shell=True`, the second one building `f"start {app_name}"` out of a model-supplied string — so *"open ms-settings: & calc.exe"* would have launched calc.exe. It checked `shutil.which()` and then threw the answer away. Protocol handlers now go to `os.startfile()` and executables are resolved to an absolute path and launched as an argument vector.
+* **`dev_agent` did the same with your project folder.** `project_dir` comes straight from the model's `project_name`, and Windows allows `&` in a folder name. It now launches the real `Code.exe` with no shell at all; where only a `code.cmd` wrapper exists it goes through an explicit `cmd.exe` vector and simply refuses a path containing `& | < > ^ % " '`.
+
+Both launch fixes were made on a Linux sandbox and verified by simulating Windows — platform flag, `shutil.which`, `subprocess.Popen` and `os.startfile` replaced with recording fakes: **54 assertions** over argv shapes, path resolution, 14 rejected URI forms and 15 injection payloads, plus **30 more** for the notification ladder and the `NOTIFYICONDATAW` layout. Worth one real launch on your machine to confirm.
+
 ### 📦 How much does it actually download?
 
 Measured against PyPI for **Windows + Python 3.11** — 91 packages including transitive dependencies (the numbers drift a little with every release):
@@ -332,7 +357,7 @@ On disk it ends up larger than the download, because those wheels are compressed
 | **Python** | 3.11, 3.12 or 3.13 |
 | **Microphone** | Required for voice interaction (and for the "Hey Jarvis" wake word) |
 | **Speakers** | Required for voice replies |
-| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); optional OpenRouter and ElevenLabs keys are managed from ⚙ → API KEYS with per-provider connection checks |
+| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); an optional ElevenLabs key is managed from ⚙ → API KEYS with a per-provider connection check |
 | **GPU** | **Not required.** The avatar is rendered in software |
 | **Disk space** | ~0.8 GB for the packages; ~1.4 GB if you add Chromium (see above) |
 | **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
@@ -374,7 +399,12 @@ Mark LIV/
 │   ├── game_updater.py       # Game update management (Steam / Epic)
 │   ├── code_helper.py        # Code review and generation
 │   ├── dev_agent.py          # Developer task agent
-│   └── desktop.py            # Desktop and taskbar control
+│   ├── desktop.py            # Desktop and taskbar control
+│   ├── timer.py              # Voice countdowns — daemon thread, announces itself
+│   ├── notify.py             # OS notification centre, with honest fallbacks
+│   ├── summarize.py          # Clipboard / URL / file / text → spoken bullet points
+│   ├── document_qa.py        # Read-only Q&A over PDF, Word, Excel, PowerPoint
+│   └── audio_device.py       # List and switch microphone / speakers by name
 ├── memory/
 │   ├── memory_manager.py     # Load/save long_term.json — sessions, monitors, identity
 │   ├── config_manager.py     # api_keys.json access — key, OS, name, voice, colour, toggles
@@ -439,7 +469,7 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
-The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; optional OpenRouter and ElevenLabs keys can be tested against their provider endpoints before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
+The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; an optional ElevenLabs key can be tested against its provider endpoint before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
 
 The phone dashboard is **not reachable from your network until you say so**: it binds `127.0.0.1` and asks the OS for no firewall rule at all. The switch lives in the Remote Access panel (*ALLOW PHONE ACCESS*), it moves the socket while the app runs, and your choice is remembered in `config/api_keys.json`.
 
