@@ -159,9 +159,9 @@ All prompt wording lives in `core/prompt.txt` with `{tokens}` the app fills in �
 * The **brows barely moved** — 6 px of travel on a 250 px head, because the rig weights halved an already small constant. Derived from the anatomy instead: 19 px.
 * The activity log opened with **a dozen lines of plumbing** — one per plugin loaded, plus wake-word and briefing status. The console still carries the full boot transcript; the log now shows your conversation, state changes and anything you have to act on, and nothing else.
 * **Another program using port 8000 killed the assistant, not just the dashboard.** uvicorn answers a port it cannot bind with `sys.exit()`, and asyncio deliberately re-raises `SystemExit` out of the event loop — so the thread carrying the session, the audio and the tools died with no traceback, while the window stayed up and looked perfectly healthy. The dashboard now catches it, names the port, and keeps running; if it was the network bind that failed it falls back to this PC only instead of giving up.
-* The phone dashboard was **open to your entire network from the first launch**: it bound every interface, asked Windows for a firewall rule at startup, and paired through a 6-character key that three endpoints would let anyone guess forever. Reachability is now a switch — off means the server listens on `127.0.0.1` only and requests no firewall rule, and flipping it moves the **live socket** rather than waiting for a restart. Keys are 8 characters, one-time, and compared in constant time; wrong guesses are limited **per device** (five a minute, then a lockout that doubles, counted once for the typed key and the QR link together), and the phone counts the wait down instead of just failing. `python check_dashboard_auth.py` is the regression suite — it drives the real endpoints and rebinds a real uvicorn.
-* **Closing the window, saying "shutdown", or losing the connection could erase the session from memory.** Saving a session summary is an LLM round trip of a few seconds, and the conversation was deleted *before* that call — so an unreachable model, a timeout, an empty reply, or the process ending mid-call cost the whole session instead of one summary. `shutdown_jarvis` then ends in `os._exit()`, which runs no `finally` block and no pending task, the end-of-session save was a task nobody held a reference to, and closing the window saved nothing at all. The turns now stay in a retry buffer until the summary is genuinely on disk; every exit path waits for it — bounded, so it still quits when the model cannot be reached, and says that it could not save. `python check_session_memory.py` is the regression suite behind that.
-* Pressing **⚙ → WAKE WORD** could **close the entire app with no error and no dialog**. Loading `openwakeword` pulls in onnxruntime's native DLLs, and inside a process that already holds PyQt6, PortAudio, OpenCV and numpy that load can fault — a Windows access violation *below* the interpreter, where no `try/except` reaches and `faulthandler` is the only thing that leaves a trace. The wake model now runs in **its own process**: microphone frames go out over a pipe, detections and a heartbeat come back, and if that process dies the app says so in the log, keeps listening normally, and the button becomes a retry. A wedged engine is noticed and replaced, and no engine process can outlive the app. `python check_wake_word.py` tests the engine exactly the way the app starts it; `python check_wake_isolation.py` is the regression suite behind all of that.
+* The phone dashboard was **open to your entire network from the first launch**: it bound every interface, asked Windows for a firewall rule at startup, and paired through a 6-character key that three endpoints would let anyone guess forever. Reachability is now a switch — off means the server listens on `127.0.0.1` only and requests no firewall rule, and flipping it moves the **live socket** rather than waiting for a restart. Keys are 8 characters, one-time, and compared in constant time; wrong guesses are limited **per device** (five a minute, then a lockout that doubles, counted once for the typed key and the QR link together), and the phone counts the wait down instead of just failing. `python test_overall.py --suite dashboard_auth` is the regression suite — it drives the real endpoints and rebinds a real uvicorn.
+* **Closing the window, saying "shutdown", or losing the connection could erase the session from memory.** Saving a session summary is an LLM round trip of a few seconds, and the conversation was deleted *before* that call — so an unreachable model, a timeout, an empty reply, or the process ending mid-call cost the whole session instead of one summary. `shutdown_jarvis` then ends in `os._exit()`, which runs no `finally` block and no pending task, the end-of-session save was a task nobody held a reference to, and closing the window saved nothing at all. The turns now stay in a retry buffer until the summary is genuinely on disk; every exit path waits for it — bounded, so it still quits when the model cannot be reached, and says that it could not save. `python test_overall.py --suite session_memory` is the regression suite behind that.
+* Pressing **⚙ → WAKE WORD** could **close the entire app with no error and no dialog**. Loading `openwakeword` pulls in onnxruntime's native DLLs, and inside a process that already holds PyQt6, PortAudio, OpenCV and numpy that load can fault — a Windows access violation *below* the interpreter, where no `try/except` reaches and `faulthandler` is the only thing that leaves a trace. The wake model now runs in **its own process**: microphone frames go out over a pipe, detections and a heartbeat come back, and if that process dies the app says so in the log, keeps listening normally, and the button becomes a retry. A wedged engine is noticed and replaced, and no engine process can outlive the app. `python test_overall.py --suite wake_word` tests the engine exactly the way the app starts it; `python test_overall.py --suite wake_isolation` is the regression suite behind all of that.
 
 > Built on the Mark LI–LIII foundation: the **🧩 Plugin System**, **♾️ Unlimited Sessions**, **🎨 Live Theming**, **🎙️ Wake Word** and **🧩 Self-Describing Skills** are all still here.
 
@@ -315,14 +315,14 @@ Mark LIV/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, viseme extraction, tool dispatch
 ├── ui.py                     # PyQt6 HUD — avatar canvas, waveform, log panel, settings drawer, camera feed
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
+├── test_overall.py           # One-command validation report: PASS / FAIL / SKIPPED
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
-│   ├── quiz.py               # Interactive quiz — JARVIS writes the questions, you answer on screen
+│   ├── telegram_remote.py    # Control JARVIS from Telegram; optional extras need _telegram_ops.py
+│   ├── chat_takeover.py      # Watches the focused chat on screen and pastes/sends replies there
 │   ├── document_review.py    # Contracts and policies in plain language, ordered by what matters
-│   ├── _google_core.py       # Shared OAuth for the Gmail/Calendar plugins (not a plugin itself)
-│   ├── _printer_core.py      # Shared printer connectivity (not a plugin itself)
 │   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
-│   └── ...                   # Drop-in skills (each self-describes via a PLUGIN dict + run())
+│   └── _*.py                 # Optional shared helpers; skipped by the plugin loader by design
 ├── actions/                  # Bundled skills — each self-describes via a TOOL dict + handler
 │   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
 │   ├── screen_processor.py   # Screen & webcam capture for vision
@@ -369,6 +369,24 @@ Mark LIV/
     ├── api_keys.json         # API key, name, voice, colour, toggles — created on first launch (git-ignored)
     └── certs/                # Self-signed TLS pair for the phone dashboard — generated locally (git-ignored)
 ```
+
+---
+
+## 🧩 Bundled Plugins
+
+Plugins are discovered only from `plugins/*.py`. Files whose name starts with
+`_` are helper modules, not tools; this is how a plugin can ship shared code
+without the loader showing the helper as a separate skill.
+
+| Plugin | What it does | Setup / safety notes |
+| --- | --- | --- |
+| `telegram_remote` | Starts a Telegram long-poll bridge so approved private chats can send typed or voice-note commands to this JARVIS session from anywhere. It opens no inbound port; all traffic is outbound HTTPS to Telegram. | Configure the bot token, pairing code and approved chat IDs in ⚙ → PLUGIN SETTINGS. It is off until you start it, unless you deliberately enable **Start listening when JARVIS launches**. Screenshot, camera and hardware-readout extras require `plugins/_telegram_ops.py` next to the plugin; without that helper the core remote still loads and works, but `/screen` and `/sys` are unavailable. |
+| `chat_takeover` | Watches the messaging conversation currently visible on screen and replies in the user's texting style until stopped. It can use its own Gemini Live session and falls back to REST if Live is unavailable. | Before starting, click into the message input box yourself. The plugin pastes into the currently focused chat window and uses a focus guard to stop if focus moves, but it still controls the real keyboard/clipboard, so do not start it while another app is focused. |
+| `document_review` | Presents a structured, readable review of a document: summary, serious/caution/note findings, quotes, suggestions and unclear points. | No setup and no legal rulebook inside the plugin. JARVIS must first read the document text from an upload, screen or camera; the plugin only lays out what the model found, in the user's language. |
+
+Plugins may optionally define `on_launch(player)`. JARVIS calls it once after the
+UI facade and Live session are ready, and only when the plugin is enabled. Slow
+startup work belongs in a daemon thread so the assistant can keep booting.
 
 ---
 

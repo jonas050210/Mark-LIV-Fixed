@@ -213,9 +213,7 @@ _SPEAK_CHARS   = 700     # never synthesise more than this in one go
 _SPEAK_MAX     = 3       # ...nor more than this many answers in one turn
 _FILE_BYTES    = 20_000_000   # refuse an incoming file bigger than this
 _FILE_HOLD     = 900     # a file the phone sent stays attached to the next command
-_AUTOSTART_WAIT   = 300  # how long to wait for the interface to appear
-_AUTOSTART_POLL   = 2.0
-_AUTOSTART_SETTLE = 3.0  # ...then this, so the first line is not stepped on
+_AUTOSTART_SETTLE = 3.0  # let the normal boot lines finish before logging auto-start
 
 
 # ── the capability table ─────────────────────────────────────────────────────
@@ -2011,40 +2009,6 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
 # ── starting without being asked, when the desk has asked once ───────────────
 
-def _player_candidates():
-    """Objects that might be the running interface.
-
-    A plugin is handed `player` when a TOOL CALL arrives; nothing hands one to a
-    plugin at launch, because there is no launch hook to hand it through. What
-    the app does do is bind interface methods into two shared modules while it
-    starts — the confirmation gate's banner callbacks (main.py:2318) and the
-    memory trimmer's notifier (main.py:2323) — and a bound method carries the
-    object it belongs to. That is read here, never written.
-
-    It is deliberately a guess that is then CHECKED, rather than a lookup that
-    is trusted: whatever comes back is only used if it has the two methods this
-    bridge actually needs. If the app ever binds a lambda instead, or moves
-    these, nothing breaks — the waiter simply never finds anything and the
-    auto-start quietly does not happen.
-    """
-    try:
-        from core import confirm
-        for cb in (confirm._show_cb, confirm._log_cb, confirm._hide_cb):
-            owner = getattr(cb, "__self__", None)
-            if owner is not None:
-                yield owner
-    except Exception:
-        pass
-    try:
-        from memory import memory_manager
-        owner = getattr(getattr(memory_manager, "_trim_notifier", None),
-                        "__self__", None)
-        if owner is not None:
-            yield owner
-    except Exception:
-        pass
-
-
 def _usable_player(obj) -> bool:
     """The contract _deliver needs, checked rather than assumed.
 
@@ -2056,44 +2020,44 @@ def _usable_player(obj) -> bool:
             and callable(getattr(obj, "on_text_command", None)))
 
 
-def _autostart() -> None:
-    """Wait for the app to finish coming up, then start the bridge once.
+def _autostart(player) -> None:
+    """Start the bridge once the real launch hook hands us the UI facade.
 
-    The wait is long because the first launch of a fresh install blocks in
-    `wait_for_api_key()` until somebody types a key — which can be minutes, and
-    is not a failure. When the time runs out, this gives up in silence: the
-    setting is a convenience, and a convenience that cannot be delivered must
-    not turn into an error message on a HUD nobody was looking at.
+    Older drafts had to guess the player by reading bound callbacks from shared
+    modules, because plugins received `player` only during a tool call. That was
+    intentionally fragile: a remote-control bridge should not depend on where
+    main.py stores unrelated callbacks. The loader now calls on_launch(player)
+    after the Live session is ready, so auto-start uses the same explicit object
+    every normal plugin call receives.
     """
-    deadline = time.monotonic() + _AUTOSTART_WAIT
-    while time.monotonic() < deadline:
-        for obj in _player_candidates():
-            if not _usable_player(obj):
-                continue
-            # A moment more, so the first line lands after the app has finished
-            # announcing itself rather than in the middle of it.
-            time.sleep(_AUTOSTART_SETTLE)
-            try:
-                said = run({"action": "start"}, player=obj)
-                # Neutral wording, because this same line carries the refusals:
-                # no token, no approved chat, already running. "Started itself —
-                # there is no bot token" would be a sentence that contradicts
-                # itself halfway through.
-                _log(obj, f"SYS: Telegram remote (auto-start) — {said}")
-            except Exception as e:
-                print(f"[TelegramRemote] auto-start failed: {e}")
-            return
-        time.sleep(_AUTOSTART_POLL)
+    if not _usable_player(player):
+        return
+    time.sleep(_AUTOSTART_SETTLE)
+    try:
+        said = run({"action": "start"}, player=player)
+        # Neutral wording, because this same line carries the refusals: no token,
+        # no approved chat, already running. "Started itself — there is no bot
+        # token" would be a sentence that contradicts itself halfway through.
+        _log(player, f"SYS: Telegram remote (auto-start) — {said}")
+    except Exception as e:
+        print(f"[TelegramRemote] auto-start failed: {e}")
 
 
-# The only code in this file that runs at plugin-discovery time, and on a
-# default install it is one config read that answers "no" — measured below the
-# cost of the stat() the settings cache already pays. Nothing is imported,
-# no thread is created and no socket is opened unless the switch is on.
-if _HAS_CONFIG:
+def on_launch(player=None) -> None:
+    """Optional plugin launch hook, called by core.plugin_loader for enabled plugins.
+
+    The switch still lives in local plugin settings and defaults to OFF; merely
+    installing this file must never open a remote-control channel. When the owner
+    has explicitly enabled start_on_launch, the hook starts a tiny daemon so a
+    Telegram network check cannot slow JARVIS startup.
+    """
+    if not _HAS_CONFIG:
+        return
     try:
         if _cfg().get("start_on_launch"):
-            threading.Thread(target=_autostart, daemon=True,
+            threading.Thread(target=_autostart, args=(player,), daemon=True,
                              name="telegram-remote-autostart").start()
     except Exception:
         pass
+
+

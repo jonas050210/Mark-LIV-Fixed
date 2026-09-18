@@ -10,7 +10,7 @@ WHY THERE IS A SUBPROCESS AT ALL
     interpreter. (Reported: ⚙ → WAKE WORD closed the whole app; the faulthandler
     dump ended in `onnxruntime/capi/_pybind_state.py:32`, reached from
     `openwakeword/vad.py:48` ← `core/wake_word.py:169` on the Qt main thread.)
-    The same three imports succeed in a *fresh* interpreter — `check_wake_word.py`
+    The same three imports succeed in a *fresh* interpreter — `test_overall.py --suite wake_word`
     proves that on the user's machine — so the cure is to never load them here.
     All openwakeword work lives in `core/wake_worker.py`, a child process, and
     this module is the pipe protocol that joins the two.

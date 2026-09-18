@@ -91,7 +91,7 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 # openwakeword pulls in onnxruntime's native DLLs, and loading those next to
 # PyQt6/PortAudio/OpenCV can fault the whole app with no Python traceback.
 # A broken install therefore costs the wake word, not the session. Check any
-# machine with:  python check_wake_word.py
+# machine with:  python test_overall.py --suite wake_word
 #
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
