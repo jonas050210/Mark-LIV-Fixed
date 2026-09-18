@@ -1,8 +1,7 @@
 """
 Local LLM client for MARK XL.
 
-Supports local and OpenAI-compatible backends — selected via
-"llm_provider" in config/api_keys.json:
+Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
 
   "llm_provider": "ollama"   (default)
         Uses Ollama's native /api/chat endpoint.
@@ -16,13 +15,6 @@ Supports local and OpenAI-compatible backends — selected via
         Set  "llm_url": "http://localhost:1234"  in config.
         Note: tool-calling support depends on the model; use a model that
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
-
-  "llm_provider": "openrouter"
-        Uses OpenRouter's OpenAI-compatible API. Set
-        "llm_url": "https://openrouter.ai/api/v1", an OpenRouter model ID, and
-        "llm_api_key" (or "openrouter_api_key") in the local config. The key is
-        sent only as an Authorization header and is never included in an error
-        message here.
 """
 import json
 import re
@@ -50,22 +42,19 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
     "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai" | "openrouter"
+    "llm_provider": "ollama",   # "ollama" | "openai"
 }
 
 
 def get_llm_provider() -> str:
-    """Return the configured backend without silently misclassifying it.
+    """Return the configured local backend: ``ollama`` or ``openai``.
 
-    ``openai`` is the generic OpenAI-compatible/local-server mode. OpenRouter
-    is kept separate because it needs bearer authentication and an explicit
-    API key; treating it as Ollama used to send requests to ``/api/chat``
-    without authentication.
+    ``openai`` is the generic OpenAI-compatible local-server mode and covers
+    LM Studio, LocalAI, Jan, llama.cpp and vLLM. Anything unrecognised falls
+    back to Ollama, so a typo cannot silently select a different backend.
     """
     raw = _load_config().get("llm_provider", _DEFAULTS["llm_provider"])
     raw = str(raw).strip().lower()
-    if raw == "openrouter":
-        return "openrouter"
     if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp", "vllm"):
         return "openai"
     return "ollama"
@@ -78,65 +67,6 @@ def _load_config() -> dict:
         return {}
 
 
-def _provider_headers(provider: str) -> dict[str, str]:
-    """Build request headers without ever putting a secret in a URL.
-
-    Local OpenAI-compatible servers normally need no key. OpenRouter does, and
-    deliberately does not reuse ``gemini_api_key``: selecting a local/provider
-    path must not accidentally send the Gemini credential to another service.
-    """
-    if provider not in ("openai", "openrouter"):
-        return {}
-
-    cfg = _load_config()
-    if provider == "openrouter":
-        # The named OpenRouter field wins over the generic legacy field when
-        # both exist; otherwise replacing the key in the settings UI would not
-        # take effect until the old generic value was removed manually.
-        raw_key = cfg.get("openrouter_api_key") or cfg.get("llm_api_key")
-    else:
-        raw_key = cfg.get("llm_api_key")
-    api_key = raw_key.strip() if isinstance(raw_key, str) else ""
-
-    if provider == "openrouter" and not api_key:
-        raise RuntimeError(
-            "OpenRouter requires a non-empty llm_api_key or openrouter_api_key"
-        )
-
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    # OpenRouter accepts these optional attribution headers. They are plain
-    # metadata, never credentials, and are omitted when not configured.
-    if provider == "openrouter":
-        referer = cfg.get("openrouter_http_referer")
-        app_name = cfg.get("openrouter_app_name")
-        if isinstance(referer, str) and referer.strip():
-            headers["HTTP-Referer"] = referer.strip()
-        if isinstance(app_name, str) and app_name.strip():
-            headers["X-Title"] = app_name.strip()
-
-    return headers
-
-
-def _is_openai_compatible(provider: str) -> bool:
-    return provider in ("openai", "openrouter")
-
-
-def _openai_endpoint(base_url: str, resource: str) -> str:
-    """Return an OpenAI-compatible endpoint for either base URL convention.
-
-    Local servers are commonly configured as ``http://localhost:1234`` while
-    OpenRouter is often copied as ``https://openrouter.ai/api/v1``. Supporting
-    both avoids producing the accidental ``/v1/v1`` path.
-    """
-    base = base_url.rstrip("/")
-    if not base.endswith("/v1"):
-        base += "/v1"
-    return f"{base}/{resource.lstrip('/')}"
-
-
 def ensure_ollama_running(timeout: int = 15) -> bool:
     """
     For Ollama: ping /api/tags; auto-launch 'ollama serve' if not running.
@@ -146,23 +76,22 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
     url, _   = get_llm_settings()
     provider = get_llm_provider()
 
-    if _is_openai_compatible(provider):
-        # OpenAI-compatible servers (including OpenRouter) must be reachable;
-        # unlike Ollama, this client never starts them.
-        health = _openai_endpoint(url, "models")
+    if provider == "openai":
+        # OpenAI-compatible servers (LM Studio, LocalAI, etc.) must be started
+        # by the user — we just check if they're reachable. Unlike Ollama, this
+        # client never launches them.
+        health = f"{url}/v1/models"
         try:
-            ok = requests.get(
-                health, headers=_provider_headers(provider), timeout=5
-            ).status_code == 200
+            ok = requests.get(health, timeout=5).status_code == 200
             if ok:
-                print(f"[LLM] {provider} endpoint reachable at {url}")
+                print(f"[LLM] OpenAI-compatible server reachable at {url}")
             else:
                 print(f"[LLM] Server at {url} returned non-200.  Is it running?")
             return ok
         except Exception:
             print(
-                f"[LLM] Cannot reach {provider} endpoint at {url}.\n"
-                "      Check the server, URL, model provider, and local API key settings."
+                f"[LLM] Cannot reach the OpenAI-compatible server at {url}.\n"
+                "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
             )
             return False
 
@@ -226,7 +155,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": "hi"})
 
-    if _is_openai_compatible(provider):
+    if provider == "openai":
         # OpenAI-compatible: fire a minimal request to ensure the model is
         # accepted/loaded. No keep_alive or KV-cache priming is assumed.
         payload = {
@@ -236,14 +165,9 @@ def warmup_model(system_prompt: str | None = None) -> bool:
             "max_tokens": 1,
         }
         try:
-            resp = requests.post(
-                _openai_endpoint(url, "chat/completions"),
-                headers=_provider_headers(provider),
-                json=payload,
-                timeout=180,
-            )
+            resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready ({provider}).")
+            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
             return True
         except Exception as e:
             print(f"[LLM] Warmup failed (non-fatal): {e}")
@@ -274,13 +198,9 @@ def check_model_available(log: Callable | None = None) -> bool:
     provider = get_llm_provider()
     url, model = get_llm_settings()
 
-    if _is_openai_compatible(provider):
+    if provider == "openai":
         try:
-            resp = requests.get(
-                _openai_endpoint(url, "models"),
-                headers=_provider_headers(provider),
-                timeout=5,
-            )
+            resp = requests.get(f"{url}/v1/models", timeout=5)
             resp.raise_for_status()
             entries = resp.json().get("data", [])
             names = [
@@ -296,15 +216,16 @@ def check_model_available(log: Callable | None = None) -> bool:
             if not found:
                 available = ", ".join(names) or "none"
                 warn = (
-                    f"WRN: Model '{model}' is not advertised by {provider}.\n"
+                    f"WRN: Model '{model}' is not advertised by the "
+                    f"OpenAI-compatible server.\n"
                     f"     Available: {available}"
                 )
                 print(warn)
                 if log:
-                    log(f"WRN: '{model}' not found at the configured {provider} endpoint")
+                    log(f"WRN: '{model}' not found at the configured OpenAI-compatible endpoint")
             return found
         except Exception as e:
-            print(f"[LLM] Could not check {provider} model availability: {e}")
+            print(f"[LLM] Could not check OpenAI-compatible model availability: {e}")
             return False
 
     try:
@@ -355,8 +276,8 @@ def call_llm(
     url, model = get_llm_settings()
     provider   = get_llm_provider()
 
-    if _is_openai_compatible(provider):
-        endpoint = _openai_endpoint(url, "chat/completions")
+    if provider == "openai":
+        endpoint = f"{url}/v1/chat/completions"
         payload: dict = {
             "model":      model,
             "messages":   messages,
@@ -367,12 +288,7 @@ def call_llm(
             payload["tools"]       = tools
             payload["tool_choice"] = "auto"
         try:
-            resp = requests.post(
-                endpoint,
-                headers=_provider_headers(provider),
-                json=payload,
-                timeout=timeout,
-            )
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
@@ -459,8 +375,14 @@ def call_llm_text(
     timeout: int = 120,
 ) -> str:
     """
-    Simple text-only generation (no tools).
-    Used by planner, executor, error_handler, code_helper, dev_agent.
+    Simple text-only generation (no tools), routed through the configured
+    local backend.
+
+    Note: nothing in this repository imports this module yet — the running
+    assistant talks to Gemini Live directly (main.py + core/gemini.py), and the
+    actions reach Gemini through core.gemini as well. This client is the
+    standalone local-LLM path for callers that want Ollama or an
+    OpenAI-compatible local server instead of a hosted model.
     """
     url, default_model = get_llm_settings()
     provider = get_llm_provider()
@@ -472,8 +394,8 @@ def call_llm_text(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    if _is_openai_compatible(provider):
-        endpoint = _openai_endpoint(url, "chat/completions")
+    if provider == "openai":
+        endpoint = f"{url}/v1/chat/completions"
         payload = {
             "model": m,
             "messages": messages,
@@ -481,26 +403,23 @@ def call_llm_text(
             "max_tokens": 600,
         }
         try:
-            resp = requests.post(
-                endpoint,
-                headers=_provider_headers(provider),
-                json=payload,
-                timeout=timeout,
-            )
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             return (choice.get("message", {}).get("content") or "").strip()
         except requests.exceptions.ConnectionError:
             raise RuntimeError(
-                f"Cannot connect to {provider} endpoint at {url}. "
+                f"Cannot connect to the OpenAI-compatible server at {url}. "
                 "Check that the server is running and the URL is correct."
             )
         except requests.exceptions.Timeout:
-            raise RuntimeError(f"{provider} text request timed out after {timeout} s.")
+            raise RuntimeError(
+                f"OpenAI-compatible text request timed out after {timeout} s."
+            )
         except requests.exceptions.HTTPError as e:
-            raise RuntimeError(f"{provider} HTTP error: {e.response.status_code}")
+            raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
         except Exception as e:
-            raise RuntimeError(f"{provider} text call failed: {e}")
+            raise RuntimeError(f"OpenAI-compatible text call failed: {e}")
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
@@ -544,7 +463,7 @@ def _stream_openai(
     so the output format is identical to the Ollama backend.
     """
     url, model = get_llm_settings()
-    endpoint   = _openai_endpoint(url, "chat/completions")
+    endpoint   = f"{url}/v1/chat/completions"
 
     payload: dict = {
         "model":      model,
@@ -556,16 +475,8 @@ def _stream_openai(
         payload["tools"]       = tools
         payload["tool_choice"] = "auto"
 
-    provider = get_llm_provider()
-
     try:
-        with requests.post(
-            endpoint,
-            headers=_provider_headers(provider),
-            json=payload,
-            timeout=timeout,
-            stream=True,
-        ) as resp:
+        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
             full_content = ""
             buf          = ""
@@ -672,7 +583,7 @@ def call_llm_stream(
     Tool calls always appear in the final "done" event.
     """
     provider = get_llm_provider()
-    if _is_openai_compatible(provider):
+    if provider == "openai":
         yield from _stream_openai(messages, tools, timeout)
         return
 

@@ -124,7 +124,6 @@ def save_initial_setup(gemini_api_key: str, os_system: str) -> bool:
 # credentials stay in the plugin settings namespace and are not duplicated here.
 _PROVIDER_API_KEYS = frozenset({
     "gemini_api_key",
-    "openrouter_api_key",
     "elevenlabs_api_key",
 })
 

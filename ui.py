@@ -1523,12 +1523,6 @@ class ApiKeysOverlay(QWidget):
             "placeholder": "AIza…  (leave blank to keep the stored key)",
         },
         {
-            "key": "openrouter_api_key",
-            "title": "OPENROUTER API KEY  ·  OPTIONAL TEXT PROVIDER",
-            "description": "Stored for the OpenRouter/local text path; it does not replace Gemini Live automatically.",
-            "placeholder": "sk-or-…  (leave blank to keep the stored key)",
-        },
-        {
             "key": "elevenlabs_api_key",
             "title": "ELEVENLABS API KEY  ·  OPTIONAL TTS",
             "description": "Optional cloud TTS credential. It is not required for the default Gemini setup.",
@@ -1567,11 +1561,7 @@ class ApiKeysOverlay(QWidget):
         cfg = cfg if isinstance(cfg, dict) else {}
         for field in self._FIELDS:
             key = field["key"]
-            if key == "openrouter_api_key":
-                value = cfg.get("openrouter_api_key") or cfg.get("llm_api_key") or ""
-            else:
-                value = cfg.get(key) or ""
-            self._existing[key] = str(value).strip()
+            self._existing[key] = str(cfg.get(key) or "").strip()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 16, 22, 16)
@@ -1716,12 +1706,6 @@ class ApiKeysOverlay(QWidget):
                     headers={"x-goog-api-key": value}, timeout=15,
                 )
                 service = "Gemini"
-            elif key == "openrouter_api_key":
-                response = requests.get(
-                    "https://openrouter.ai/api/v1/models",
-                    headers={"Authorization": f"Bearer {value}"}, timeout=15,
-                )
-                service = "OpenRouter"
             elif key == "elevenlabs_api_key":
                 response = requests.get(
                     "https://api.elevenlabs.io/v1/user",
