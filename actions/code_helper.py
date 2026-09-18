@@ -208,6 +208,34 @@ Fixed code:"""
     return _clean_code(response.text)
 
 
+def _as_arg_list(raw) -> list[str]:
+    """Normalise model-supplied CLI arguments into a list of strings.
+
+    `args` is declared as an ARRAY, but a model is not type-safe: it answers
+    with a plain string often enough. Concatenating that string onto the
+    interpreter command line used to raise `TypeError: can only concatenate
+    list (not "str") to list`, which killed the whole run/build path. Splitting
+    on shell whitespace keeps "--verbose --out x" working, and a real list is
+    passed through untouched.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            import shlex
+            return shlex.split(text)
+        except (ValueError, ImportError):
+            return text.split()
+    if isinstance(raw, (list, tuple)):
+        # Strip each element: padded argv items are model noise, never intent,
+        # and every other string in this module is stripped the same way.
+        return [str(a).strip() for a in raw if str(a).strip()]
+    return [str(raw)]
+
+
 def _run_file(path: Path, args: list, timeout: int) -> str:
     interpreters = {
         ".py":  [sys.executable],
@@ -549,7 +577,7 @@ def code_helper(
     output_path = p.get("output_path", "").strip()
     file_path   = p.get("file_path", "").strip()
     code        = p.get("code", "").strip()
-    args        = p.get("args", [])
+    args        = _as_arg_list(p.get("args"))
     timeout     = int(p.get("timeout", 30))
 
     if action == "auto":
@@ -617,8 +645,9 @@ TOOL = {
                 "description": "Raw code string for explain"
             },
             "args": {
-                "type": "STRING",
-                "description": "CLI arguments for run/build"
+                "type": "ARRAY",
+                "description": "CLI arguments for run/build, e.g. ['--verbose', 'input.txt']",
+                "items": {"type": "STRING"}
             },
             "timeout": {
                 "type": "INTEGER",

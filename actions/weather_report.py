@@ -7,8 +7,9 @@ def weather_action(
     player=None,
     session_memory=None,
 ) -> str:
-    city     = parameters.get("city")
-    when     = parameters.get("time", "today")  
+    p    = parameters if isinstance(parameters, dict) else {}
+    city = p.get("city")
+    when = p.get("time", "today")
 
     if not city or not isinstance(city, str) or not city.strip():
         msg = "Sir, the city is missing for the weather report."
@@ -54,13 +55,23 @@ def _log(message: str, player=None) -> None:
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "weather_report",
-    "description": "Gives the weather report to user",
+    "description": (
+        "Opens a live Google weather search for a city in the browser and speaks "
+        "the result. Use it when the user asks about weather, rain, temperature, "
+        "wind or a forecast for a place, optionally for a day other than today. "
+        "For any other topic use web_search instead."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "city": {
                 "type": "STRING",
-                "description": "City name"
+                "description": "City name, e.g. 'Neumarkt in der Oberpfalz'."
+            },
+            "time": {
+                "type": "STRING",
+                "description": "Optional time frame such as 'today', 'tomorrow' "
+                               "or 'this weekend'. Defaults to 'today'."
             }
         },
         "required": [
