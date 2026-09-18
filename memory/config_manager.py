@@ -111,6 +111,38 @@ def _write_config_unlocked(data: dict) -> None:
 def save_api_keys(gemini_api_key: str) -> bool:
     return _patch_config(gemini_api_key=gemini_api_key.strip())
 
+
+def save_initial_setup(gemini_api_key: str, os_system: str) -> bool:
+    """Persist first-launch values while preserving every existing setting."""
+    return _patch_config(
+        gemini_api_key=(gemini_api_key or "").strip(),
+        os_system=(os_system or "").strip(),
+    )
+
+
+# Core provider credentials shown in the native API Keys overlay. Plugin-owned
+# credentials stay in the plugin settings namespace and are not duplicated here.
+_PROVIDER_API_KEYS = frozenset({
+    "gemini_api_key",
+    "openrouter_api_key",
+    "elevenlabs_api_key",
+})
+
+
+def save_provider_api_keys(values: dict[str, str]) -> bool:
+    """Atomically persist known provider keys without replacing other settings.
+
+    Callers may pass only the fields that changed. Unknown names are ignored so
+    a UI or plugin cannot accidentally turn this helper into an unrestricted
+    config writer.
+    """
+    updates: dict[str, str] = {}
+    for name, value in (values or {}).items():
+        if name in _PROVIDER_API_KEYS:
+            updates[name] = str(value or "").strip()
+    return _patch_config(**updates) if updates else True
+
+
 def load_api_keys() -> dict:
     with _CONFIG_LOCK:
         return _read_config_unlocked()
