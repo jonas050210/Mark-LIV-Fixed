@@ -1,3 +1,5 @@
+import os
+import shutil
 import subprocess
 import sys
 import json
@@ -274,20 +276,60 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     except Exception as e:
         return f"Install error (non-fatal): {e}"
 
+# Windows allows these in a folder name, and cmd.exe re-parses its own command
+# line, so a path containing one of them must never be handed to a shell.
+_SHELL_META = ("&", "|", "<", ">", "^", "%", '"', "'")
+
+
 def _open_vscode(project_dir: Path) -> bool:
-    vscode_candidates = [
-        "code",
-        rf"C:\Users\{Path.home().name}\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd",
-        r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
-    ]
-    for cmd in vscode_candidates:
+    """Open VS Code on a project directory without giving a shell anything.
+
+    `project_dir` is built from the model's `project_name`, so it is untrusted.
+    The previous `Popen([cmd, str(project_dir)], shell=True)` let a project
+    called `x & calc.exe` launch calc.exe: cmd.exe split the line at the `&`.
+
+    A real `Code.exe` is launched as an argument vector, which CreateProcess
+    passes through without parsing. A `.cmd` wrapper cannot be run that way —
+    CreateProcess rejects batch files — so that path goes through `cmd.exe`
+    explicitly and is refused outright when the directory holds a metacharacter,
+    rather than sanitised and hoped for.
+    """
+    target = str(project_dir)
+    home = Path.home()
+
+    for exe in (home / "AppData/Local/Programs/Microsoft VS Code/Code.exe",
+                Path("C:/Program Files/Microsoft VS Code/Code.exe"),
+                Path("C:/Program Files (x86)/Microsoft VS Code/Code.exe")):
+        if not exe.is_file():
+            continue
         try:
-            subprocess.Popen(
-                [cmd, str(project_dir)],
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            subprocess.Popen([str(exe), target],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.5)
+            print(f"[DevAgent] 💻 VSCode opened: {project_dir}")
+            return True
+        except Exception:
+            continue
+
+    if any(c in target for c in _SHELL_META):
+        print(f"[DevAgent] VS Code not opened — the project path contains shell "
+              f"metacharacters: {target}")
+        return False
+
+    for wrapper in ("code",
+                    str(home / "AppData/Local/Programs/Microsoft VS Code/bin/code.cmd"),
+                    r"C:\Program Files\Microsoft VS Code\bin\code.cmd"):
+        resolved = shutil.which(wrapper)
+        if not resolved and Path(wrapper).is_file():
+            resolved = wrapper
+        if not resolved:
+            continue
+        argv = [resolved, target]
+        if resolved.lower().endswith((".cmd", ".bat")):
+            argv = [os.environ.get("ComSpec", "cmd.exe"), "/c", resolved, target]
+        try:
+            subprocess.Popen(argv,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(1.5)
             print(f"[DevAgent] 💻 VSCode opened: {project_dir}")
             return True

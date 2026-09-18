@@ -1,3 +1,5 @@
+import os
+import re
 import time
 import subprocess
 import platform
@@ -77,13 +79,56 @@ def _normalize(raw: str) -> str:
 
     return raw  
 
+# A bare protocol handler such as "ms-settings:" and nothing else. Anchored, so
+# a string containing "://" or a space can never reach the shell-open path.
+_URI_ONLY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:$")
+
+
+def _resolve_windows_executable(name: str) -> str | None:
+    """Absolute path of a real executable on PATH, or None.
+
+    Returns what `shutil.which()` actually found on disk, never the caller's
+    string, so a model-supplied name cannot smuggle arguments, separators or
+    redirections into a launch. The old code checked `which()` and then threw
+    the result away, passing the raw name to `Popen(..., shell=True)`.
+    """
+    seen = set()
+    for candidate in (name, name.split(".")[0], name.lower()):
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
 def _launch_windows(app_name: str) -> bool:
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    name = str(app_name or "").strip()
+    if not name:
+        return False
+
+    # 1) A registered protocol handler ("ms-settings:"). Handed to the shell as
+    #    something to *open*, not as a command line to parse, so nothing can be
+    #    appended to it. This replaces `Popen(f"start {app_name}", shell=True)`,
+    #    where "ms-settings: & calc.exe" would have run calc.exe.
+    if _URI_ONLY_RE.match(name):
+        try:
+            os.startfile(name)          # Windows-only, and this branch is too
+            time.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"[open_app] startfile({name}) failed: {e}")
+
+    # 2) A real executable on PATH, launched as an argument vector with no shell
+    #    in between. This replaces `Popen(app_name, shell=True)`.
+    resolved = _resolve_windows_executable(name)
+    if resolved:
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [resolved],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -91,14 +136,6 @@ def _launch_windows(app_name: str) -> bool:
             return True
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
-
-    if ":" in app_name:
-        try:
-            subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
 
     try:
         import pyautogui
