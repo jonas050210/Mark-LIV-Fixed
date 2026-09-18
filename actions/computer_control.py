@@ -14,6 +14,7 @@ else:
 import time
 import random
 from pathlib import Path
+from typing import Optional
 
 try:
     import pyautogui
@@ -28,6 +29,18 @@ try:
     _PYPERCLIP = True
 except ImportError:
     _PYPERCLIP = False
+
+# Windows UI Automation (UIA) support for robust, DPI-independent, and
+# window-position-independent control access on Windows.
+_UIA_AVAILABLE = False
+if platform.system() == "Windows":
+    try:
+        import uiautomation as auto
+        _UIA_AVAILABLE = True
+    except (ImportError, Exception):
+        auto = None
+else:
+    auto = None
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -310,6 +323,83 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+
+# ── UI Automation semantic helpers (Windows) ──────────────────────────────────
+
+def _find_uia_control(name: str = "", control_type: str = "", search_depth: int = 8):
+    """Find a UI Automation control on the active or foreground window."""
+    if not _UIA_AVAILABLE or auto is None:
+        return None
+    try:
+        root = auto.GetForegroundControl() or auto.GetRootControl()
+        if not root:
+            return None
+
+        # Build search criteria
+        kwargs = {"searchDepth": search_depth}
+        if name:
+            kwargs["SubName"] = name
+        
+        type_lower = control_type.lower()
+        if type_lower in ("button", "btn"):
+            control = root.ButtonControl(**kwargs)
+        elif type_lower in ("edit", "input", "textbox", "field"):
+            control = root.EditControl(**kwargs)
+        elif type_lower in ("checkbox", "check"):
+            control = root.CheckBoxControl(**kwargs)
+        elif type_lower in ("window", "dialog", "pane"):
+            control = root.WindowControl(**kwargs)
+        elif type_lower in ("text", "label"):
+            control = root.TextControl(**kwargs)
+        else:
+            control = root.Control(**kwargs)
+
+        if control.Exists(maxSearchSeconds=1.5):
+            return control
+        return None
+    except Exception as e:
+        print(f"[ComputerControl] UIA search error: {e}")
+        return None
+
+
+def _uia_click(name: str, control_type: str = "button") -> Optional[str]:
+    """Semantic click using Windows UI Automation, with click fallback."""
+    control = _find_uia_control(name=name, control_type=control_type)
+    if control:
+        try:
+            rect = control.BoundingRectangle
+            if hasattr(control, "Click"):
+                control.Click()
+                return f"UIA Clicked '{name}' [{control_type or control.ControlTypeName}]"
+            elif rect:
+                mid_x = (rect.left + rect.right) // 2
+                mid_y = (rect.top + rect.bottom) // 2
+                _click(mid_x, mid_y)
+                return f"UIA Clicked '{name}' at ({mid_x}, {mid_y})"
+        except Exception as e:
+            print(f"[ComputerControl] UIA Click invocation failed ({e}), falling back to mouse")
+    return None
+
+
+def _uia_type(name: str, text: str, clear_first: bool = True) -> Optional[str]:
+    """Semantic text entry using Windows UI Automation."""
+    control = _find_uia_control(name=name, control_type="edit")
+    if control:
+        try:
+            if hasattr(control, "SetValue"):
+                control.SetValue(text)
+                return f"UIA SetValue '{name}': {text[:40]}"
+            elif hasattr(control, "SendKeys"):
+                control.SetFocus()
+                time.sleep(0.1)
+                if clear_first:
+                    control.SendKeys("{Ctrl}a{Delete}")
+                control.SendKeys(text)
+                return f"UIA Typed '{name}': {text[:40]}"
+        except Exception as e:
+            print(f"[ComputerControl] UIA typing failed ({e}), falling back to mouse/keyboard")
+    return None
+
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
     if not api_key:
@@ -404,7 +494,7 @@ def computer_control(
       user_data     — pull real data from memory
     """
     params = parameters or {}
-    action = params.get("action", "").lower().strip()
+    action = str(params.get("action") or "").lower().strip()
 
     if not action:
         return "No action specified for computer_control."
@@ -417,15 +507,30 @@ def computer_control(
     try:
 
         if action == "type":
+            target_name = params.get("field") or params.get("description")
+            if target_name and _UIA_AVAILABLE:
+                uia_res = _uia_type(target_name, params.get("text", ""), clear_first=params.get("clear_first", True))
+                if uia_res:
+                    return uia_res
             return _type(params.get("text", ""))
 
         if action == "smart_type":
+            target_name = params.get("field") or params.get("description")
+            if target_name and _UIA_AVAILABLE:
+                uia_res = _uia_type(target_name, params.get("text", ""), clear_first=params.get("clear_first", True))
+                if uia_res:
+                    return uia_res
             return _smart_type(
                 params.get("text", ""),
                 clear_first=params.get("clear_first", True),
             )
 
         if action in ("click", "left_click"):
+            target_name = params.get("description") or params.get("field")
+            if target_name and _UIA_AVAILABLE and params.get("x") is None:
+                uia_res = _uia_click(target_name, control_type=params.get("type", "button"))
+                if uia_res:
+                    return uia_res
             return _click(params.get("x"), params.get("y"), "left", 1)
 
         if action == "double_click":

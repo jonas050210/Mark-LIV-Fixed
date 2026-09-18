@@ -4,6 +4,7 @@ import time
 import subprocess
 import platform
 import shutil
+from pathlib import Path
 
 try:
     import psutil
@@ -83,15 +84,72 @@ def _normalize(raw: str) -> str:
 # a string containing "://" or a space can never reach the shell-open path.
 _URI_ONLY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:$")
 
+# Persistent application shortcut cache (Windows) for sub-10ms lookup
+_APP_CACHE_FILE = Path.home() / ".jarvis_app_cache.json"
+_APP_CACHE: dict[str, str] = {}
+_APP_CACHE_LOADED = False
+
+
+def _load_app_cache() -> dict[str, str]:
+    global _APP_CACHE, _APP_CACHE_LOADED
+    if _APP_CACHE_LOADED:
+        return _APP_CACHE
+    if _APP_CACHE_FILE.exists():
+        try:
+            import json
+            _APP_CACHE = json.loads(_APP_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _APP_CACHE = {}
+    _APP_CACHE_LOADED = True
+    return _APP_CACHE
+
+
+def _save_app_cache(cache: dict[str, str]) -> None:
+    try:
+        import json
+        _APP_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _index_windows_shortcuts() -> dict[str, str]:
+    """Index .lnk files from Start Menu and ProgramData."""
+    shortcuts = {}
+    if _SYSTEM != "Windows":
+        return shortcuts
+    roots = [
+        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob("*.lnk"):
+                key = p.stem.lower().strip()
+                shortcuts[key] = str(p)
+        except Exception:
+            continue
+    return shortcuts
+
 
 def _resolve_windows_executable(name: str) -> str | None:
-    """Absolute path of a real executable on PATH, or None.
+    """Absolute path of a real executable on PATH or cached shortcut, or None.
 
-    Returns what `shutil.which()` actually found on disk, never the caller's
-    string, so a model-supplied name cannot smuggle arguments, separators or
-    redirections into a launch. The old code checked `which()` and then threw
-    the result away, passing the raw name to `Popen(..., shell=True)`.
+    Returns what `shutil.which()` or shortcut indexing actually found on disk,
+    never the caller's string.
     """
+    key = name.lower().strip()
+
+    # Fast path: in-memory / disk cache
+    cache = _load_app_cache()
+    if key in cache:
+        target = Path(cache[key])
+        if target.exists():
+            return str(target)
+        else:
+            cache.pop(key, None)
+
     seen = set()
     for candidate in (name, name.split(".")[0], name.lower()):
         candidate = candidate.strip()
@@ -100,7 +158,18 @@ def _resolve_windows_executable(name: str) -> str | None:
         seen.add(candidate)
         found = shutil.which(candidate)
         if found:
+            cache[key] = found
+            _save_app_cache(cache)
             return found
+
+    # Index shortcuts if not found on PATH
+    shortcuts = _index_windows_shortcuts()
+    for s_name, s_path in shortcuts.items():
+        if key == s_name or key in s_name or s_name in key:
+            cache[key] = s_path
+            _save_app_cache(cache)
+            return s_path
+
     return None
 
 
@@ -222,6 +291,23 @@ def _launch_linux(app_name: str) -> bool:
                     return True
                 except Exception:
                     continue
+
+    # Handle commands with arguments (e.g. 'libreoffice --writer') safely via shlex
+    import shlex
+    parts = shlex.split(app_name) if app_name else []
+    if parts:
+        cmd_bin = shutil.which(parts[0]) or shutil.which(parts[0].lower())
+        if cmd_bin:
+            try:
+                subprocess.Popen(
+                    [cmd_bin] + parts[1:],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                time.sleep(1.0)
+                return True
+            except Exception:
+                pass
 
     binary = (
         shutil.which(app_name) or

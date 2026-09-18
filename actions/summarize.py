@@ -120,7 +120,6 @@ def _from_url(raw) -> tuple[str, str]:
 
     try:
         import requests
-        from bs4 import BeautifulSoup
     except ImportError:
         return "", "The web helper packages are not installed."
 
@@ -138,13 +137,28 @@ def _from_url(raw) -> tuple[str, str]:
     except Exception as exc:
         return "", f"I could not fetch that page: {type(exc).__name__}."
 
+    # Tier 1: trafilatura (strips boilerplate, ads, cookie notices, and extracts clean main article)
+    text = ""
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "template", "svg", "form"]):
-            tag.decompose()
-        text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines())
+        import trafilatura
+        extracted = trafilatura.extract(html, include_links=False, include_images=False)
+        if extracted and len(extracted.strip()) >= 80:
+            text = extracted.strip()
+    except ImportError:
+        pass
     except Exception:
-        return "", "I fetched the page but could not read its text."
+        pass
+
+    # Tier 2: BeautifulSoup fallback
+    if not text:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "template", "svg", "form"]):
+                tag.decompose()
+            text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines())
+        except Exception:
+            return "", "I fetched the page but could not read its text."
 
     text = "\n".join(line for line in (l.strip() for l in text.splitlines()) if line)
     if len(text.strip()) < 80:

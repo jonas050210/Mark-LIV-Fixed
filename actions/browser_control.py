@@ -930,7 +930,7 @@ def browser_control(
     session_memory=None,
 ) -> str:
     params  = parameters or {}
-    action  = params.get("action", "").lower().strip()
+    action  = str(params.get("action") or "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
     result  = "Unknown action."
 

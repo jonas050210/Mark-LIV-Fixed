@@ -18,22 +18,29 @@ google-genai>=2.8.0,<3
 # ── Web search & browser control ──────────────────────────────────────────────
 requests>=2.31,<3
 beautifulsoup4>=4.12,<5
+trafilatura>=1.8,<2
+lxml_html_clean
 playwright>=1.40,<2
+httpx>=0.28,<1
+browser-harness>=0.1.13,<1
 
 # ── Automation / input control ────────────────────────────────────────────────
 pyautogui
 pyperclip
 pygetwindow
+uiautomation>=2.0,<3; sys_platform == "win32"
 
 # ── Vision & media ────────────────────────────────────────────────────────────
 pillow>=10,<13
 opencv-python>=4.8,<5
 mss>=9,<11
+yt-dlp
 
 # ── System, files & documents ─────────────────────────────────────────────────
 psutil>=5.9,<8
 send2trash
 youtube-transcript-api
+pymupdf>=1.24,<2
 python-pptx
 openpyxl
 

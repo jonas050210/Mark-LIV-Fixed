@@ -58,8 +58,11 @@ _YT_VIDEO_FILTER = "EgIQAQ%3D%3D"
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    try:
+        from memory.config_manager import get_gemini_key
+        return get_gemini_key() or ""
+    except Exception:
+        return ""
 
 
 def _open_url(url: str) -> None:
@@ -134,36 +137,64 @@ def _ask_for_url(prompt_text: str = "YouTube video URL:") -> str | None:
 
 
 def _get_transcript(video_id: str) -> str | None:
-    if not _TRANSCRIPT_OK:
-        return None
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript      = None
-
-        lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
-
+    # Tier 1: Try youtube-transcript-api
+    if _TRANSCRIPT_OK:
         try:
-            transcript = transcript_list.find_manually_created_transcript(lang_priority)
-        except Exception:
-            pass
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript      = None
 
-        if transcript is None:
+            lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
+
             try:
-                transcript = transcript_list.find_generated_transcript(lang_priority)
+                transcript = transcript_list.find_manually_created_transcript(lang_priority)
             except Exception:
-                for t in transcript_list:
-                    transcript = t
-                    break
+                pass
 
-        if transcript is None:
-            return None
+            if transcript is None:
+                try:
+                    transcript = transcript_list.find_generated_transcript(lang_priority)
+                except Exception:
+                    for t in transcript_list:
+                        transcript = t
+                        break
 
-        fetched = transcript.fetch()
-        return " ".join(entry["text"] for entry in fetched)
+            if transcript is not None:
+                fetched = transcript.fetch()
+                return " ".join(entry["text"] for entry in fetched)
+        except Exception as e:
+            print(f"[YouTube] ⚠️ YouTubeTranscriptApi failed ({e}), trying yt-dlp fallback...")
 
+    # Tier 2: yt-dlp fallback for resilient subtitle extraction
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "tr", "de", "fr", "es", "all"],
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            subs = info.get("subtitles") or info.get("automatic_captions") or {}
+            # Check for captions in preferred languages
+            for lang in ["en", "tr", "de", "fr", "es"]:
+                if lang in subs and subs[lang]:
+                    sub_url = subs[lang][0].get("url")
+                    if sub_url and _REQUESTS_OK:
+                        resp = requests.get(sub_url, timeout=10)
+                        if resp.ok:
+                            # Subtitles are JSON3 or VTT, extract text blocks
+                            clean_txt = re.sub(r"<[^>]+>", " ", resp.text)
+                            clean_txt = re.sub(r"\b\d{2}:\d{2}:\d{2}\.\d{3}\b", " ", clean_txt)
+                            clean_txt = " ".join(clean_txt.split())
+                            if len(clean_txt) > 80:
+                                return clean_txt[:80000]
     except Exception as e:
-        print(f"[YouTube] ⚠️ Transcript fetch failed: {e}")
-        return None
+        print(f"[YouTube] ⚠️ yt-dlp transcript fetch failed: {e}")
+
+    return None
 
 
 def _summarize_with_gemini(transcript: str, video_url: str) -> str:
@@ -223,6 +254,24 @@ def _save_summary(content: str, video_url: str) -> str:
 
 
 def _scrape_video_info(video_id: str) -> dict:
+    # Tier 1: Try yt-dlp for rich metadata
+    try:
+        import yt_dlp
+        ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            meta = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
+            if meta:
+                duration_secs = meta.get('duration') or 0
+                return {
+                    'title': meta.get('title', ''),
+                    'channel': meta.get('uploader', ''),
+                    'views': f"{meta.get('view_count', 0):,}",
+                    'duration': f"{duration_secs // 60}:{duration_secs % 60:02d}",
+                    'likes': f"{meta.get('like_count', 0):,} likes",
+                }
+    except Exception:
+        pass
+
     if not _REQUESTS_OK:
         return {}
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -419,7 +468,7 @@ def youtube_video(
     speak=None,
 ) -> str:
     params = parameters or {}
-    action = params.get("action", "play").lower().strip()
+    action = str(params.get("action") or "play").lower().strip()
 
     if player:
         player.write_log(f"[YouTube] Action: {action}")
