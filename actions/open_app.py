@@ -1,3 +1,4 @@
+import os
 import time
 import subprocess
 import platform
@@ -78,12 +79,25 @@ def _normalize(raw: str) -> str:
     return raw  
 
 def _launch_windows(app_name: str) -> bool:
+    """Open an application on Windows.
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    `app_name` comes from the model, which means it is ultimately influenced by
+    whatever the assistant just looked at — a web page, a document, a chat
+    window. Running that string through a shell turned "open notepad &
+    <anything>" into a command line instead of a program name, and the old
+    `start {app_name}` fallback did the same through a cmd builtin.
+
+    So: resolve the name to a real executable and launch it as an argument
+    list, with no shell anywhere in the path. URIs (https:, ms-settings:,
+    mailto:) and file paths go to `os.startfile`, which is the API for "open
+    this with whatever handles it" and needs no shell either. Only the Start
+    menu fallback below types the name, and typing cannot execute anything.
+    """
+    binary = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
+    if binary:
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [binary],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -92,13 +106,14 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
-    if ":" in app_name:
+    startfile = getattr(os, "startfile", None)
+    if startfile is not None and (":" in app_name or os.path.exists(app_name)):
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            startfile(app_name)
             time.sleep(1.0)
             return True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[open_app] startfile failed: {e}")
 
     try:
         import pyautogui
