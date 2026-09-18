@@ -3,7 +3,6 @@ Text-to-Speech engines for MARK XL.
 
 EdgeTTS     – free Microsoft TTS (internet required, no API key)
 Kokoro      – fully offline neural TTS (~330 MB model)
-ElevenLabs  – cloud API (API key required, best quality)
 """
 from __future__ import annotations
 
@@ -350,32 +349,6 @@ class KokoroTTSEngine:
             raise synth_error[0]
 
 
-class ElevenLabsTTSEngine:
-    """ElevenLabs cloud TTS – API key required."""
-
-    def __init__(self, api_key: str, voice_id: str = "pNInz6obpgDQGcFmaJgB"):
-        self.api_key  = api_key
-        self.voice_id = voice_id
-
-    def speak(self, text: str) -> None:
-        import requests
-        headers = {
-            "xi-api-key":   self.api_key,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "text":     text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        }
-        resp = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}",
-            json=payload, headers=headers, timeout=30,
-        )
-        resp.raise_for_status()
-        _play_audio_bytes(resp.content)
-
-
 # ---------------------------------------------------------------------------
 # Thread-safe player wrapper
 # ---------------------------------------------------------------------------
@@ -432,10 +405,6 @@ def create_tts_player(config: dict) -> TTSPlayer:
         voice  = config.get("tts_voice", "af_heart")
         speed  = float(config.get("tts_speed", 1.0))
         engine = KokoroTTSEngine(voice=voice, speed=speed)
-    elif engine_name == "elevenlabs":
-        api_key  = config.get("elevenlabs_api_key", "")
-        voice_id = config.get("tts_voice", "pNInz6obpgDQGcFmaJgB")
-        engine   = ElevenLabsTTSEngine(api_key=api_key, voice_id=voice_id)
     else:   # edgetts (default)
         voice  = config.get("tts_voice", "en-US-GuyNeural")
         engine = EdgeTTSEngine(voice=voice)

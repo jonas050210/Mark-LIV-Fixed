@@ -936,7 +936,7 @@ def _get_schedule_status() -> str:
 
 def game_updater(parameters: dict, player=None, speak=None) -> str:
     p         = parameters or {}
-    action    = p.get("action",    "update").lower().strip()
+    action    = str(p.get("action") or "update").lower().strip()
     platform  = p.get("platform",  "both").lower().strip()
     game_name = (p.get("game_name") or "").strip() or None
     app_id    = (p.get("app_id")    or "").strip() or None

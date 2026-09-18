@@ -38,9 +38,11 @@ def _get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 def _get_api_key() -> str:
-    path = _get_base_dir() / "config" / "api_keys.json"
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    try:
+        from memory.config_manager import get_gemini_key
+        return get_gemini_key() or ""
+    except Exception:
+        return ""
 
 def _get_macos_wifi_interface() -> str:
     try:
@@ -592,6 +594,60 @@ def shutdown_computer():
     else:
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
 
+def set_wallpaper(image_path: str) -> str:
+    """Set the desktop wallpaper across Windows, macOS, and Linux without exec()."""
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        return f"Image not found: {image_path}"
+    if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        return f"Unsupported format: {path.suffix}. Use jpg, png, bmp or webp."
+
+    try:
+        if _OS == "Windows":
+            import ctypes
+            if path.suffix.lower() in {".webp", ".png"}:
+                try:
+                    from PIL import Image
+                    import tempfile
+                    bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
+                    Image.open(path).convert("RGB").save(bmp_path, "BMP")
+                    path = bmp_path
+                except ImportError:
+                    pass
+            ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3)
+            return f"Wallpaper set: {path.name}"
+        elif _OS == "Darwin":
+            script = (
+                f'tell application "System Events" to tell every desktop to '
+                f'set picture to POSIX file "{path}"'
+            )
+            subprocess.run(["osascript", "-e", script], capture_output=True)
+            return f"Wallpaper set: {path.name}"
+        else:
+            desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+            uri = f"file://{path}"
+            if "gnome" in desktop_env or "unity" in desktop_env:
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri], capture_output=True)
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri], capture_output=True)
+            elif "kde" in desktop_env:
+                script = f"""
+var allDesktops = desktops();
+for (var i = 0; i < allDesktops.length; i++) {{
+    d = allDesktops[i];
+    d.wallpaperPlugin = "org.kde.image";
+    d.currentConfigGroup = ["Wallpaper", "org.kde.image", "General"];
+    d.writeConfig("Image", "file://{path}");
+}}
+"""
+                subprocess.run(["qdbus", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script], capture_output=True)
+            elif "xfce" in desktop_env:
+                subprocess.run(["xfconf-query", "-c", "xfce4-desktop", "-p", "/backdrop/screen0/monitor0/workspace0/last-image", "-s", str(path)], capture_output=True)
+            else:
+                subprocess.run(["feh", "--bg-scale", str(path)], capture_output=True)
+            return f"Wallpaper set: {path.name}"
+    except Exception as e:
+        return f"Could not set wallpaper: {e}"
+
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
     "volume_down":         volume_down,
@@ -840,6 +896,12 @@ def computer_settings(
         except Exception as e:
             return f"Could not set volume: {e}"
 
+    if action in ("set_wallpaper", "wallpaper"):
+        path_val = str(value or params.get("path", "")).strip()
+        if not path_val:
+            return "No image path specified for wallpaper."
+        return set_wallpaper(path_val)
+
     if action in ("type_text", "write_on_screen", "type", "write"):
         text = str(value or params.get("text", "")).strip()
         if not text:
@@ -941,7 +1003,7 @@ TOOL = {
                     "undo | redo | select_all | save | enter | escape | press_key | "
                     "type_text | screenshot | lock_screen | open_settings | "
                     "file_explorer | open_run | dark_mode | toggle_wifi | "
-                    "restart | shutdown"
+                    "set_wallpaper | restart | shutdown"
                 )
             },
             "description": {

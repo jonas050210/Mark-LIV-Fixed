@@ -112,12 +112,22 @@ def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
     """Invoke the handler passing only the context kwargs it actually declares
     (or all of them if it has **kwargs), so each action's existing signature
     works unchanged."""
+    if not isinstance(parameters, dict):
+        parameters = {}
     sig = inspect.signature(fn)
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     kwargs = {}
     for key in _CTX_KEYS:
         if has_var_kw or key in sig.parameters:
             kwargs[key] = ctx.get(key)
+    
+    # Check what the first parameter is named ('parameters', 'params', etc.)
+    params_list = list(sig.parameters.values())
+    if params_list and params_list[0].name not in ("parameters", ""):
+        # e.g. fn(params, ...)
+        first_param_name = params_list[0].name
+        kwargs[first_param_name] = parameters
+        return fn(**kwargs)
     return fn(parameters=parameters, **kwargs)
 
 

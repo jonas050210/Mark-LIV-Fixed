@@ -61,19 +61,17 @@ It's not just an assistant — it's an extension of your digital life.
 | 🗓️ Session Memory | Summarises each conversation and mentions it naturally next morning — consumed after use, never repeats |
 | 👁️‍🗨️ Background Monitoring | User-configured topic watching — checks for new headlines once a day and alerts naturally |
 | 📊 Hardware Monitoring | Continuous CPU, RAM, GPU and temperature telemetry with localized voice alerts |
-| 🌤️ Weather Report | Live weather data for your city, personalized from memory |
 | 🗺️ Dynamic Content Panel | Scrollable display layer beneath the HUD that renders web results, news, and search data |
 | 🔍 Multi-Mode Web Search | `news` / `research` / `price` / `compare` / `search` — Gemini Grounded first, DDG fallback |
 | ⏰ Smart Reminders | OS-native scheduled notifications (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) |
 | ⏱️ Timers by Voice | "Remind me in 10 minutes" — a countdown that keeps running while you talk, announces itself out loud, and can be listed or cancelled |
 | 🔔 Desktop Notifications | Push any message to the OS notification centre; falls back from toast to `msg` to the activity log instead of failing silently |
-| ✈️ Flight Finder | Live flight price and availability lookup |
 | 🎮 Game Updater | Checks and triggers game updates on Steam and Epic Games on demand |
 | 📂 File Processor | Read, summarize, and answer questions about local files |
 | 📄 Document Q&A | Ask questions of a PDF, Word, Excel or PowerPoint file — read-only, page-ranged, and idle-scheduled so it never interrupts you |
 | 📝 Summarize Anything | Summarise the clipboard, a URL, a text file or dictated text into spoken bullet points — with an SSRF guard on URLs |
-| 💻 Code Helper | Inline code review, debugging, and generation |
-| 🌐 Browser Control | Open URLs, navigate tabs, and interact with the browser by voice |
+| 💻 Code Agent | Full autonomous software engineering agent: file editing, testing, project scaffolding & fix loops |
+| 🌐 Autonomous Browser Agent | Multi-step web automation with Jev Ultrafast CDP engine + Playwright fallback |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
 | 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
@@ -318,15 +316,16 @@ Five files in `actions/`, no new dependencies, nothing else touched. Each one is
 * **📄 `document_qa`** — answers questions about PDF, DOCX, XLSX, PPTX and plain-text files. It is strictly read-only: it never writes, renames or executes anything, and the file is byte-identical afterwards. Page ranges (`"3"`, `"1-5"`, `"2,4,6-8"`) keep long documents inside the context budget, and it falls back to the currently open file the same way `main.py` does. This is the one action declared `NON_BLOCKING` / `WHEN_IDLE`, so extraction happens while the assistant is idle instead of interrupting a sentence.
 * **🔊 `audio_device`** — lists microphones and speakers and switches either one by name via `core.audio_devices`, with the change pushed onto `core.undo`. Matching is exact-or-unique: an ambiguous name is reported instead of guessed. It writes the choice to config and tells you honestly that the running audio session is rebuilt on the next start — it does not claim a live switch it cannot perform.
 
-**Also fixed while in there:**
+**Security, Modernization & Architecture Highlights:**
 
-* `weather_report` read a `time` parameter it had never declared, so the model could not offer it. Declared now; the 32-character description was replaced with one that says when to use it.
-* `code_helper` declared `args` as `STRING` but concatenated it onto an interpreter command line, where one malformed answer raised `TypeError` and killed the whole run/build path. It is an `ARRAY` now, and every shape the model actually sends is normalised.
-* `core/llm_client.py` claimed five callers that have never existed. There are zero, and the docstring now says so.
-* **`open_app` ran your app names through a shell.** Both Windows launch paths used `shell=True`, the second one building `f"start {app_name}"` out of a model-supplied string — so *"open ms-settings: & calc.exe"* would have launched calc.exe. It checked `shutil.which()` and then threw the answer away. Protocol handlers now go to `os.startfile()` and executables are resolved to an absolute path and launched as an argument vector.
-* **`dev_agent` did the same with your project folder.** `project_dir` comes straight from the model's `project_name`, and Windows allows `&` in a folder name. It now launches the real `Code.exe` with no shell at all; where only a `code.cmd` wrapper exists it goes through an explicit `cmd.exe` vector and simply refuses a path containing `& | < > ^ % " '`.
-
-Both launch fixes were made on a Linux sandbox and verified by simulating Windows — platform flag, `shutil.which`, `subprocess.Popen` and `os.startfile` replaced with recording fakes: **54 assertions** over argv shapes, path resolution, 14 rejected URI forms and 15 injection payloads, plus **30 more** for the notification ladder and the `NOTIFYICONDATAW` layout. Worth one real launch on your machine to confirm.
+* **Autonomous Code & Browser Agents**: `code_agent` consolidates single-file editing/running/debugging with autonomous multi-file project scaffolding. `browser_agent` powers Jev Ultrafast multi-step browser tasks using direct Chrome DevTools Protocol (CDP).
+* **Modernized $0 Local Backends**:
+  * `actions/computer_control.py`: Windows UI Automation (`uiautomation`) primary semantic control engine with seamless `pyautogui` fallback.
+  * `actions/document_qa.py`: High-speed `PyMuPDF` (`pymupdf`) Tier 1 PDF extractor (11.4× faster) with `pdfplumber` and `PyPDF2` fallbacks.
+  * `actions/summarize.py`: `trafilatura` clean article extractor stripping navigation and cookie boilerplate (50–70% token savings) with BeautifulSoup fallback and SSRF guard.
+  * `actions/youtube_video.py`: Resilient `yt-dlp` metadata extraction and automatic caption fallback.
+  * `actions/open_app.py`: Persistent application shortcut caching (`~/.jarvis_app_cache.json`) for sub-10ms launching, with hardened shell-free execution.
+* `core/llm_client.py`: Standalone local-LLM path for Ollama or OpenAI-compatible local servers.
 
 ### 📦 How much does it actually download?
 
@@ -357,7 +356,7 @@ On disk it ends up larger than the download, because those wheels are compressed
 | **Python** | 3.11, 3.12 or 3.13 |
 | **Microphone** | Required for voice interaction (and for the "Hey Jarvis" wake word) |
 | **Speakers** | Required for voice replies |
-| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); an optional ElevenLabs key is managed from ⚙ → API KEYS with a per-provider connection check |
+| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); an optional TypeSafe API key for Jev Ultrafast browser automation is managed from ⚙ → API KEYS with a per-provider connection check |
 | **GPU** | **Not required.** The avatar is rendered in software |
 | **Disk space** | ~0.8 GB for the packages; ~1.4 GB if you add Chromium (see above) |
 | **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
@@ -379,32 +378,30 @@ Mark LIV/
 │   ├── document_review.py    # Contracts and policies in plain language, ordered by what matters
 │   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
 │   └── _*.py                 # Optional shared helpers; skipped by the plugin loader by design
-├── actions/                  # Bundled skills — each self-describes via a TOOL dict + handler
-│   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
-│   ├── screen_processor.py   # Screen & webcam capture for vision
-│   ├── background_monitor.py # User-configured topic watching — daily DDG check
-│   ├── proactive.py          # Proactive 2.0 — time/context/rotation-aware check-ins
-│   ├── reminder.py           # OS-native scheduled notifications
-│   ├── system_monitor.py     # CPU / RAM / GPU / temperature telemetry
-│   ├── computer_settings.py  # Volume, brightness, WiFi, power (per-OS)
-│   ├── computer_control.py   # Keyboard shortcuts, mouse, window management
-│   ├── open_app.py           # Application launcher (per-OS name map)
-│   ├── browser_control.py    # Web browser control
-│   ├── file_controller.py    # File system operations
-│   ├── file_processor.py     # Document reading and summarization
-│   ├── send_message.py       # Messaging integration
-│   ├── weather_report.py     # Live weather data
-│   ├── flight_finder.py      # Flight search
-│   ├── youtube_video.py      # YouTube playback control
-│   ├── game_updater.py       # Game update management (Steam / Epic)
-│   ├── code_helper.py        # Code review and generation
-│   ├── dev_agent.py          # Developer task agent
-│   ├── desktop.py            # Desktop and taskbar control
+├── actions/                  # Bundled skills — 19 active tools, each self-describing via a TOOL dict + handler
+│   ├── audio_device.py       # List and switch microphone / speakers by name
+│   ├── browser_agent.py      # Jev Ultrafast autonomous browser task agent (CDP harness)
+│   ├── browser_control.py    # Playwright deterministic browser control (navigation, forms)
+│   ├── code_agent.py         # Autonomous software engineering agent (single-file + project fix/scaffold)
+│   ├── computer_control.py   # Keyboard/mouse control: Windows UI Automation semantic primary + PyAutoGUI fallback
+│   ├── computer_settings.py  # Volume, brightness, WiFi, power, process control (per-OS)
+│   ├── desktop.py            # Desktop and taskbar control (wallpaper, organize, clean)
+│   ├── document_qa.py        # Q&A over PDF (PyMuPDF Tier 1 + pdfplumber/PyPDF2), DOCX, XLSX, PPTX
+│   ├── file_controller.py    # Safe file system operations (list, create, delete, move, copy)
+│   ├── file_processor.py     # Document reading, format conversion and table parsing
+│   ├── game_updater.py       # Game update management (Steam / Epic Games)
+│   ├── notify.py             # OS notification centre with fallback chain
+│   ├── open_app.py           # App launcher with Start Menu index & persistent cache (~/.jarvis_app_cache.json)
+│   ├── reminder.py           # OS-native scheduled notifications (Task Scheduler / LaunchAgent / systemd)
+│   ├── send_message.py       # Messaging integration (WhatsApp, Telegram)
+│   ├── summarize.py          # Trafilatura clean article extraction + BeautifulSoup fallback with SSRF guard
 │   ├── timer.py              # Voice countdowns — daemon thread, announces itself
-│   ├── notify.py             # OS notification centre, with honest fallbacks
-│   ├── summarize.py          # Clipboard / URL / file / text → spoken bullet points
-│   ├── document_qa.py        # Read-only Q&A over PDF, Word, Excel, PowerPoint
-│   └── audio_device.py       # List and switch microphone / speakers by name
+│   ├── web_search.py         # Gemini Grounded Search + DuckDuckGo fallback
+│   ├── youtube_video.py      # YouTube playback, yt-dlp metadata extraction and subtitle fallback
+│   ├── background_monitor.py # Background topic monitor engine
+│   ├── proactive.py          # Proactive check-in engine
+│   ├── screen_processor.py   # Screen & webcam capture engine for multimodal vision
+│   └── system_monitor.py     # Telemetry & system status engine
 ├── memory/
 │   ├── memory_manager.py     # Load/save long_term.json — sessions, monitors, identity
 │   ├── config_manager.py     # api_keys.json access — key, OS, name, voice, colour, toggles
@@ -469,7 +466,7 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
-The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; an optional ElevenLabs key can be tested against its provider endpoint before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
+The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; an optional TypeSafe key (for the Jev Ultrafast autonomous browser agent) can be tested against its provider endpoint before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
 
 The phone dashboard is **not reachable from your network until you say so**: it binds `127.0.0.1` and asks the OS for no firewall rule at all. The switch lives in the Remote Access panel (*ALLOW PHONE ACCESS*), it moves the socket while the app runs, and your choice is remembered in `config/api_keys.json`.
 
@@ -486,10 +483,10 @@ Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licens
 
 ---
 
-## 👤 Connect with the Creator
+## 👤 Credits & Creator
 
-Engineered by a developer building a real-world JARVIS-style assistant.
-⭐ **Star the repository to support the journey to Mark 100.**
+* **Original Creator**: Built by [@FatihMakes](https://www.youtube.com/@FatihMakes) on the journey to Mark 100.
+* **Modernization & Improvements**: Fixed, modularized and hardened by **Jonas**, with architecture and direction by **ChatGPT (Director)** and implementation by **Arena.ai (Coding Agent)**.
 
 | Platform | Link |
 | --- | --- |

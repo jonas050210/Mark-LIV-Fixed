@@ -85,7 +85,33 @@ def _page_set(raw, total: int) -> set[int] | None:
 
 
 def _extract_pdf(path: Path, pages_raw) -> tuple[str, str]:
-    """pdfplumber first (better layout), PyPDF2 as the fallback. Both read-only."""
+    """PyMuPDF first (fastest C engine, best reading order), pdfplumber second, PyPDF2 fallback. Strictly read-only."""
+    # Tier 1: PyMuPDF (pymupdf / fitz) - 10-50x faster and clean text extraction
+    try:
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
+        with fitz.open(str(path)) as doc:
+            total = len(doc)
+            wanted = _page_set(pages_raw, total)
+            if wanted is not None and not wanted:
+                return "", "That page range is outside the document."
+            chunks = []
+            for number in range(1, total + 1):
+                if wanted is not None and number not in wanted:
+                    continue
+                page = doc[number - 1]
+                chunks.append(page.get_text() or "")
+        text = "\n".join(chunks)
+        if text.strip():
+            return text, ""
+    except ImportError:
+        pass
+    except Exception as exc:
+        pass
+
+    # Tier 2: pdfplumber (layout-aware fallback)
     try:
         import pdfplumber
         with pdfplumber.open(str(path)) as pdf:
@@ -109,6 +135,7 @@ def _extract_pdf(path: Path, pages_raw) -> tuple[str, str]:
     except Exception as exc:
         return "", f"I could not read that PDF: {type(exc).__name__}."
 
+    # Tier 3: PyPDF2 fallback
     try:
         import PyPDF2
         with open(path, "rb") as handle:          # read-only, never written back

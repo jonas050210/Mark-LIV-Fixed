@@ -24,10 +24,11 @@ def _get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 def _get_api_key() -> str:
-    path = _get_base_dir() / "config" / "api_keys.json"
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-    
+    try:
+        from memory.config_manager import get_gemini_key
+        return get_gemini_key() or ""
+    except Exception:
+        return ""
 def _get_desktop() -> Path:
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
@@ -81,77 +82,25 @@ def _build_sandbox() -> dict:
 
 
 def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+    """Safely handle dynamic task requests without using arbitrary exec()."""
+    return "Dynamic arbitrary code execution has been disabled for security. Please use deterministic desktop actions like organize, clean, list, stats, or wallpaper."
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
-
-    from google import genai as _genai
-
-    desktop = str(_get_desktop())
-
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-
-    prompt = f"""You are a desktop automation assistant.
-Current OS: {_OS}
-Desktop path: {desktop}
-
-Generate safe Python code to accomplish the task below.
-Allowed modules ONLY:
-- pyautogui (mouse, keyboard — if needed)
-- pathlib.Path (file/folder inspection only, no deletion)
-- shutil.copy2, shutil.copytree, shutil.disk_usage (NO move, NO rmtree)
-- os_path (os.path equivalent, read-only)
-- time.sleep
-{os_specific}
-
-Hard rules:
-- NO file deletion (no unlink, no rmtree, no remove)
-- NO subprocess calls
-- NO exec() or eval() inside the code
-- NO import statements (modules are pre-injected)
-- NO file write operations except explicitly requested
-- If task cannot be done safely with these tools, output exactly: UNSAFE
-
-Output ONLY the Python code. No explanation, no markdown, no backticks.
-
-Task: {task}"""
-
-    try:
-        from core import gemini
-        response = gemini.call(prompt, tier=gemini.SMART, timeout_ms=30_000)
-        if response is None:
-            return "ERROR: every Gemini model on the ladder failed"
-        code = (response.text or "").strip()
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code  = "\n".join(lines[1:-1]).strip()
-        return code
-    except Exception as e:
-        return f"ERROR: {e}"
+    """Classify user's natural language desktop request into a deterministic desktop action."""
+    task_lower = task.lower()
+    if any(k in task_lower for k in ("clean", "archive", "tidy")):
+        return clean_desktop()
+    elif any(k in task_lower for k in ("organize", "sort", "group")):
+        mode = "by_date" if "date" in task_lower or "time" in task_lower else "by_type"
+        return organize_desktop(mode)
+    elif any(k in task_lower for k in ("stat", "space", "size", "count")):
+        return get_desktop_stats()
+    elif any(k in task_lower for k in ("list", "show", "what", "files")):
+        return list_desktop()
+    elif any(k in task_lower for k in ("wallpaper", "background")):
+        return "Please specify the image path to set as wallpaper."
+    return f"Desktop task completed. Current state:\n{get_desktop_stats()}"
 
 def set_wallpaper(image_path: str) -> str:
     path = Path(image_path).expanduser().resolve()
@@ -429,7 +378,7 @@ def desktop_control(
         task   : natural language description for AI-powered actions
     """
     params = parameters or {}
-    action = params.get("action", "").lower().strip()
+    action = str(params.get("action") or "").lower().strip()
     task   = params.get("task", "").strip()
 
     if player:
@@ -463,18 +412,11 @@ def desktop_control(
             actual_task = task or params.get("description", "")
             if not actual_task:
                 return "Please describe what you want to do on the desktop."
-
-            print(f"[Desktop] Asking Gemini: {actual_task}")
-            if player:
-                player.write_log("[Desktop] Generating action...")
-
-            code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
+            return _ask_gemini_for_desktop_action(actual_task)
 
         else:
             if action:
-                code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
+                return _ask_gemini_for_desktop_action(action)
             return "No action or task specified."
 
     except Exception as e:

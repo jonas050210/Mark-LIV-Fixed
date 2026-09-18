@@ -652,7 +652,7 @@ def file_controller(
     session_memory=None,
 ) -> str:
     params = parameters or {}
-    action = params.get("action", "").lower().strip()
+    action = str(params.get("action") or "").lower().strip()
     path   = params.get("path", "desktop")
     name   = params.get("name", "")
 

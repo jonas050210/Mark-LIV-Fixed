@@ -1519,14 +1519,14 @@ class ApiKeysOverlay(QWidget):
         {
             "key": "gemini_api_key",
             "title": "GEMINI API KEY  ·  DEFAULT LIVE PROVIDER",
-            "description": "Required for the normal Gemini Live audio session.",
+            "description": "Required for the normal Gemini Live audio session and text models.",
             "placeholder": "AIza…  (leave blank to keep the stored key)",
         },
         {
-            "key": "elevenlabs_api_key",
-            "title": "ELEVENLABS API KEY  ·  OPTIONAL TTS",
-            "description": "Optional cloud TTS credential. It is not required for the default Gemini setup.",
-            "placeholder": "Paste the ElevenLabs key  (leave blank to keep)",
+            "key": "typesafe_api_key",
+            "title": "TYPESAFE API KEY  ·  JEV ULTRAFAST BROWSER AGENT",
+            "description": "Required for the Jev Ultrafast autonomous browser agent.",
+            "placeholder": "ts_…  (leave blank to keep the stored key)",
         },
     )
 
@@ -1706,12 +1706,13 @@ class ApiKeysOverlay(QWidget):
                     headers={"x-goog-api-key": value}, timeout=15,
                 )
                 service = "Gemini"
-            elif key == "elevenlabs_api_key":
+            elif key == "typesafe_api_key":
+                # Validate TypeSafe API Key without performing heavy mutations
                 response = requests.get(
-                    "https://api.elevenlabs.io/v1/user",
-                    headers={"xi-api-key": value}, timeout=15,
+                    "https://api.typesafe.ai/v1/models",
+                    headers={"Authorization": f"Bearer {value}"}, timeout=15,
                 )
-                service = "ElevenLabs"
+                service = "TypeSafe"
             else:
                 return False, "Unknown provider."
 
@@ -4915,7 +4916,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
+        lay.addWidget(_fl("Original by FaithMakes · Fixed & improved by Jonas, with the help of ChatGPT (Director) & Arena.ai (Coding Agent)", C.PRI_DIM))
         return w
 
     def _on_file_selected(self, path: str):
