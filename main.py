@@ -92,6 +92,20 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
+from core.reconnect            import (
+    ReconnectSignal as _ReconnectSignal,
+    is_reconnect_signal as _is_reconnect_signal,
+    keep_context_of as _keep_context_of,
+    only_cancelled as _only_cancelled,
+    has_exit_request as _has_exit_request,
+    is_transient_error as _is_transient_error,
+    reconnect_delay as _reconnect_delay,
+    leaf_summary as _leaf_summary,
+    PendingCommands,
+)
+from core.session_memory       import SessionMemory
+from core.dispatcher           import get_dispatcher
+from core.speech               import get_speech_router
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -168,6 +182,30 @@ def _pcm_level(samples) -> float:
 # Extra time beyond the device's reported output latency before the microphone
 # is trusted again: covers room decay and the speaker's own settling.
 _TAIL_MARGIN = 0.25
+
+# ── Connection watchdog ─────────────────────────────────────────────────────
+# A Live socket can die without raising (NAT timeout, dropped route): the
+# receive iterator then simply never yields again. The watchdog warns after
+# _STALE_WARN_AFTER seconds of server silence and forces a voluntary,
+# context-keeping reconnect after _STALE_AFTER — but ONLY while we recently
+# sent something (mic/text). A fully idle session never triggers: silence with
+# nothing expected is not a failure.
+_STALE_WARN_AFTER = 120.0
+_STALE_AFTER      = 300.0
+
+# ── Playback start cushion ──────────────────────────────────────────────────
+# Bytes (~120 ms at 24 kHz / 16-bit mono) the player accumulates before an
+# utterance starts, so the device never begins on a single 50 ms slice while
+# network jitter decides when the next one arrives. Bounded wait: a stalled
+# network still starts talking within _PRIME_WAIT_MAX seconds.
+_START_PREBUFFER = 5760
+_PRIME_WAIT_MAX  = 0.30
+
+# ── Reconnect carry-over ────────────────────────────────────────────────────
+# Unsent mic frames kept across a session rebuild (the first thing said during
+# an outage still reaches the new session). ~64 frames ≈ 2 s of audio; older
+# than that is stale breath, not speech worth replaying late.
+_MIC_CARRYOVER_MAX = 64
 
 _VIS_WIN = 1024        # ~43 ms analysis window at 24 kHz: enough for formants
 _VIS_HOP = 480         # 20 ms between frames, i.e. 50 shapes a second
@@ -531,42 +569,9 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-class _ReconnectSignal(Exception):
-    """Raised inside the session TaskGroup to force a clean, voluntary reconnect
-    (e.g. the user picked a new voice — the voice is fixed at connect time, so
-    the session must be rebuilt).
-
-    Carries `keep_context`: True for an ordinary rebuild, where the stored
-    resumption handle is replayed and the conversation continues; False when the
-    new session must genuinely start clean (see the voice-change note in
-    _on_voice_change)."""
-
-    def __init__(self, keep_context: bool = True):
-        super().__init__()
-        self.keep_context = keep_context
-
-
-def _is_reconnect_signal(exc: BaseException) -> bool:
-    """True if `exc` is a _ReconnectSignal, or a(n) (Base)ExceptionGroup that
-    wraps one — TaskGroup bundles child exceptions into a group."""
-    if isinstance(exc, _ReconnectSignal):
-        return True
-    if isinstance(exc, BaseExceptionGroup):
-        return any(_is_reconnect_signal(sub) for sub in exc.exceptions)
-    return False
-
-
-def _keep_context_of(exc: BaseException) -> bool:
-    """Read `keep_context` off a reconnect signal, unwrapping the group the
-    TaskGroup put it in. Defaults to True: an unexpected shape must not silently
-    wipe the conversation."""
-    if isinstance(exc, _ReconnectSignal):
-        return getattr(exc, "keep_context", True)
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            if _is_reconnect_signal(sub):
-                return _keep_context_of(sub)
-    return True
+# Reconnect signalling lives in core/reconnect.py (stdlib-only, unit-tested);
+# the underscore aliases are imported at the top, so every use site below —
+# _ReconnectSignal, _is_reconnect_signal, _keep_context_of — is untouched.
 
 
 # Live models documented NOT to accept the `proactivity` setup field. Sending
@@ -687,12 +692,30 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        # ── Session vs. persistent memory ────────────────────────────────────
+        # _session_memory (core/session_memory.py) is the RAM-only turns of THIS
+        # run; the persistent store (identity/preferences/notes/...) lives in
+        # memory/memory_manager.py. The turn list is created exactly once,
+        # right here, and the session object adopts it - so do the summary
+        # below (which holds it BY REFERENCE and empties it in place) and
+        # every existing reader/writer.
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._session_memory = SessionMemory(self._session_log)
         # Keeps those turns until a summary is actually on disk (see
-        # core/session_summary.py for the loss this prevents). It holds the list
-        # above BY REFERENCE and empties it in place, so every existing reader of
-        # _session_log keeps seeing the same object.
+        # core/session_summary.py for the loss this prevents).
         self._summary = SessionSummary(self._session_log, self._write_session_summary)
+        # User text that arrives with no Live session (reconnect window,
+        # startup): queued, then flushed into the next session in order —
+        # never dropped.
+        self._pending_commands = PendingCommands()
+        # Connection watchdog timestamps (monotonic; None until first use).
+        self._last_recv_at: float | None = None
+        self._last_send_at: float | None = None
+        self._stale_warned = False
+        # Dropped-pipe reconnect streak (transient fast path resets on success).
+        self._transient_tries = 0
+        # Mic input overflows counted in the audio callback (driver diagnosis).
+        self._mic_overflows = 0
 
         self._enhanced_live = True  # v1alpha + proactive audio; shed if setup is rejected
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -726,6 +749,27 @@ class JarvisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+
+        # ── Shared tool dispatcher (multi-step agent) ────────────────────────
+        # One sync entry point for running any tool by name. Inline tools that
+        # need the Live session or the event loop are NOT offered through it —
+        # the runner below says so honestly instead of half-working.
+        get_dispatcher().bind(
+            action_registry=self._action_registry,
+            plugin_registry=self._plugin_registry,
+            inline_runner=self._run_inline_tool,
+        )
+
+        # ── Decoupled voice output (core/speech.py) ──────────────────────────
+        # Announcements (timers, …) speak through Live when connected and fall
+        # back to the offline OS voice when not. The router only ever calls
+        # these two closures; unbinding is never needed (process lifetime).
+        _router = get_speech_router()
+        _router.set_live_provider(
+            is_connected=lambda: self.session is not None,
+            speak=lambda text: self.speak(text),
+        )
+        _router.set_log(self.ui.write_log)
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -1020,25 +1064,135 @@ class JarvisLive:
         return enabled
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            print(f"[JARVIS] Dropped typed command (no session): {text}")
-            try:
-                self.ui.write_log("SYS: Command could not be sent yet — no Live session is connected.")
-            except Exception:
-                pass
-            return
         # A typed command is deliberate control, just like the phone dashboard:
         # privacy still gates the microphone while asleep, but text the user
         # explicitly submitted should wake JARVIS and then be sent.
         if self._wake_enabled and not self._awake:
             self.wake(reason="typed command")
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        self._queue_or_send(text, source="typed")
+
+    def _queue_or_send(self, text: str, source: str = "text") -> None:
+        """Deliver user text now, or queue it for the next Live session.
+
+        Typed and dashboard commands used to be dropped silently whenever no
+        session existed — exactly the reconnect window when the user is most
+        likely to type. Queued commands flush in order right after the next
+        connect (and periodically while connected, for re-queued ones).
+        Thread-safe: called from the Qt thread.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if self._loop is not None and self.session is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.session.send_client_content(
+                        turns={"role": "user", "parts": [{"text": text}]},
+                        turn_complete=True
+                    ),
+                    self._loop
+                )
+            except Exception as e:
+                print(f"[JARVIS] Send failed, queueing ({source}): {e}")
+            else:
+                # The session can die between the check above and the send. A
+                # failed future re-queues instead of losing the command; the
+                # watchdog's flush pump delivers it without a reconnect.
+                def _requeue(f, _text=text, _source=source):
+                    try:
+                        f.result()
+                    except Exception:
+                        self._pending_commands.put(_text, source=_source)
+                try:
+                    fut.add_done_callback(_requeue)
+                except Exception:
+                    pass
+                try:
+                    self._last_send_at = time.monotonic()
+                except Exception:
+                    pass
+                return
+        queued = self._pending_commands.put(text, source=source)
+        if queued:
+            print(f"[JARVIS] Queued {source} command (no session): {text[:80]}")
+            try:
+                self.ui.write_log("SYS: Not connected — your message is queued "
+                                  "and will be sent on reconnect.")
+            except Exception:
+                pass
+        else:
+            try:
+                self.ui.write_log("SYS: Not connected and the message queue is "
+                                  "full — oldest message dropped.")
+            except Exception:
+                pass
+
+    async def _flush_pending_commands(self) -> None:
+        """Send queued user text, oldest first. Runs after every connect and
+        periodically from the connection watchdog."""
+        items = self._pending_commands.drain()
+        for i, item in enumerate(items):
+            if self.session is None:
+                # Session dropped mid-flush — put the rest back, in order.
+                for rest in items[i:]:
+                    self._pending_commands.put(rest["text"],
+                                               source=rest.get("source", "text"))
+                return
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": item["text"]}]},
+                    turn_complete=True,
+                )
+                self.ui.write_log(f"[Queued]: {item['text'][:80]}")
+                self._last_send_at = time.monotonic()
+            except Exception as e:
+                print(f"[JARVIS] Queued send failed: {e}")
+                for rest in items[i:]:
+                    self._pending_commands.put(rest["text"],
+                                               source=rest.get("source", "text"))
+                return
+
+    async def _watch_connection(self):
+        """Session-scoped watchdog: force a context-keeping reconnect when the
+        server goes silent while we keep sending (NAT timeout, dropped route),
+        and pump the pending-command queue while connected."""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                if self.session is not None and len(self._pending_commands):
+                    await self._flush_pending_commands()
+                last_recv = self._last_recv_at
+                last_send = self._last_send_at
+                if self.session is None or last_recv is None or last_send is None:
+                    continue
+                # Only while WE recently sent something: fully-idle silence
+                # with nothing expected is not a failure (see _STALE_AFTER).
+                now = time.monotonic()
+                if last_send < now - _STALE_AFTER:
+                    continue
+                if last_recv >= last_send:
+                    self._stale_warned = False
+                    continue
+                silent = now - last_recv
+                if silent > _STALE_AFTER:
+                    kept = self._resume_handle is not None
+                    self.ui.write_log(
+                        "NET: Server silent for "
+                        f"{silent:.0f}s while sending — reconnecting"
+                        + (" (conversation kept)." if kept
+                           else " (no resume handle — starting fresh).")
+                    )
+                    raise _ReconnectSignal(keep_context=True)
+                if silent > _STALE_WARN_AFTER and not self._stale_warned:
+                    self._stale_warned = True
+                    self.ui.write_log(
+                        f"NET: No server data for {silent:.0f}s — watching.")
+            except _ReconnectSignal:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[JARVIS] Watchdog: {e}")
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
@@ -1134,20 +1288,32 @@ class JarvisLive:
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
+        self._play_primed = False   # next utterance re-accumulates its cushion
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
 
-    def speak(self, text: str):
+    def speak(self, text: str) -> bool:
+        """Queue `text` to be spoken by the Live session.
+
+        Returns True when the line was handed to the session, False when there
+        is no session to speak through — callers with something that MUST be
+        heard (timers) use the answer to fall back to the offline voice
+        instead of losing the announcement silently.
+        """
         if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": text}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+        except Exception:
+            return False
+        return True
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
@@ -1165,6 +1331,7 @@ class JarvisLive:
         except Exception:
             self._asst_name = "JARVIS"
             _user_name = ""
+        self._session_memory.assistant_name = self._asst_name or "JARVIS"
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -1325,6 +1492,52 @@ class JarvisLive:
 
         return out
 
+    def _run_inline_tool(self, name: str, params: dict, ctx: dict):
+        """Sync runner for inline tools, used by the shared tool dispatcher.
+
+        Returns the result string, or None when `name` is not an inline tool
+        (the dispatcher then tries actions and plugins). Inline tools that
+        need the Live session or the event loop are owned here but refused
+        honestly — a half-working screen_process inside a plan is worse than
+        none.
+        """
+        if name == "recall_memory":
+            try:
+                return search_memory(params.get("query", ""), limit=8)
+            except Exception as e:
+                return f"Memory search failed: {e}"
+        if name == "save_memory":
+            category = params.get("category", "notes")
+            key = params.get("key", "")
+            value = params.get("value", "")
+            if not (key and value):
+                return "save_memory needs both a key and a value."
+            try:
+                update_memory({category: {key: {"value": value}}})
+                return "Saved."
+            except Exception as e:
+                return f"Could not save: {e}"
+        if name == "system_status":
+            try:
+                return str(get_system_status())
+            except Exception as e:
+                return f"System status unavailable: {e}"
+        if name == "undo":
+            if str(params.get("action", "")).lower().strip() == "list":
+                items = undo_stack.history()
+                return ("Things I can undo, most recent first:\n"
+                        + "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+                        ) if items else "I have not changed anything I can undo yet."
+            try:
+                return undo_stack.undo_last()
+            except Exception as e:
+                return f"Nothing to undo ({e})."
+        if name in ("screen_process", "close_camera", "manage_monitor",
+                    "shutdown_jarvis"):
+            return (f"'{name}' needs the live voice session and cannot run "
+                    "inside a background plan.")
+        return None
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
@@ -1472,7 +1685,8 @@ class JarvisLive:
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": self._session_memory,
+                        "dispatcher": get_dispatcher()}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -1488,7 +1702,10 @@ class JarvisLive:
                 if self._plugin_registry.has(name):
                     r = await loop.run_in_executor(
                         None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                        lambda: self._plugin_registry.run(
+                            name, args, player=self.ui,
+                            session_memory=self._session_memory,
+                            dispatcher=get_dispatcher())
                     )
                     result = r or "Done."
                 else:
@@ -1536,12 +1753,25 @@ class JarvisLive:
                     mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                 )
             )
+            # Connection watchdog: coarse "we are sending" heartbeat (1 s
+            # resolution is plenty; per-block would be two syscalls per block).
+            _now = time.monotonic()
+            if _now - (self._last_send_at or 0.0) > 1.0:
+                self._last_send_at = _now
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            # Driver-side input overflow: the callback ran too late and the
+            # device dropped blocks before we ever saw them. Counted, not
+            # logged per event — this fires on the realtime audio thread.
+            if status:
+                self._mic_overflows += 1
+                if self._mic_overflows % 200 == 1:
+                    print(f"[JARVIS] 🎤 Mic overflows so far: {self._mic_overflows} "
+                          "(driver dropped input blocks — CPU or USB contention)")
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1662,10 +1892,42 @@ class JarvisLive:
                 )
                 _mic_stream = _open_mic(None)
 
-            with _mic_stream:
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
+            # Mid-session mic failure (unplugged headset, driver reset, USB
+            # re-enumeration) reopens the stream instead of killing the
+            # session: wait with a capped backoff, retry the chosen device,
+            # then the system default. Only a device that stays gone unwinds
+            # to a full reconnect.
+            _mic_failures = 0
+            while True:
+                try:
+                    with _mic_stream:
+                        print("[JARVIS] 🎤 Mic stream open")
+                        _mic_failures = 0
+                        while True:
+                            await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _me:
+                    _mic_failures += 1
+                    print(f"[JARVIS] ⚠️  Mic stream failed ({_me}) - "
+                          f"reopening ({_mic_failures})")
+                    try:
+                        _mic_stream.close()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(min(2 ** _mic_failures, 10))
+                    try:
+                        _mic_stream = _open_mic(
+                            audio_devices.resolve(_mic_name, "input"))
+                    except Exception:
+                        try:
+                            _mic_stream = _open_mic(None)
+                        except Exception:
+                            if _mic_failures >= 5:
+                                print(f"[JARVIS] ❌ Mic: {_me}")
+                                raise
+                            continue
+                    self.ui.write_log("SYS: Microphone recovered.")
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
@@ -1720,6 +1982,9 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
+                    # Connection watchdog: ANY yield - audio, transcript, or a
+                    # bare resumption update - proves the pipe is alive.
+                    self._last_recv_at = time.monotonic()
 
                     # ── Session resumption ───────────────────────────────────
                     # The server sends this periodically. `resumable` goes false
@@ -1829,7 +2094,7 @@ class JarvisLive:
                             if full_in:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
-                                self._session_log.append(f"User: {full_in}")
+                                self._session_memory.add_user(full_in)
                                 if self._dashboard:
                                     _spawn(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1848,7 +2113,7 @@ class JarvisLive:
                             if full_out:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
-                                self._session_log.append(f"{self._asst_name}: {full_out}")
+                                self._session_memory.add_assistant(full_out, self._asst_name)
                                 if self._dashboard:
                                     _spawn(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1871,6 +2136,41 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
             raise
+
+    def _reopen_output_stream(self, old, preferred_dev):
+        """Best-effort output recovery after a failed write. Returns a fresh,
+        started stream — preferred device first, system default second — or
+        None when no output can be opened at all. Never raises."""
+        try:
+            old.abort()
+        except Exception:
+            pass
+        try:
+            old.close()
+        except Exception:
+            pass
+        for _dev in (preferred_dev, None):
+            try:
+                st = sd.RawOutputStream(
+                    samplerate=RECEIVE_SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="int16",
+                    blocksize=CHUNK_SIZE,
+                    device=_dev,
+                )
+                st.start()
+                try:
+                    lat = float(getattr(st, "latency", 0.0) or 0.0)
+                    if 0.0 < lat < 1.0:
+                        self._out_latency = lat
+                except Exception:
+                    pass
+                print("[JARVIS] 🔊 Output stream recovered "
+                      f"({'default' if _dev is None else 'chosen device'})")
+                return st
+            except Exception:
+                continue
+        return None
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
@@ -1916,6 +2216,8 @@ class JarvisLive:
         except Exception:
             pass
 
+        self._play_primed = False  # utterance-start cushion accumulated
+        _write_failures = 0     # consecutive output-write failures
         try:
             while True:
                 try:
@@ -1931,6 +2233,7 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                        self._play_primed = False
                     # A wait_for timeout expiring while the task is being
                     # cancelled converts the CancelledError into TimeoutError
                     # (asyncio.timeout semantics): the cancel is consumed and
@@ -1942,6 +2245,27 @@ class JarvisLive:
                     if _play_task is not None and _play_task.cancelling():
                         break
                     continue
+
+                if not self._play_primed:
+                    # Utterance start: let ~120 ms accumulate (bounded wait) so
+                    # the device never starts on a single 50 ms slice while
+                    # network jitter decides when the next one arrives - that
+                    # race is the crackle at the start of replies. A stalled
+                    # network still starts talking within _PRIME_WAIT_MAX.
+                    _probe = bytearray(chunk)
+                    _waited = 0.0
+                    while len(_probe) < _START_PREBUFFER and _waited < _PRIME_WAIT_MAX:
+                        await asyncio.sleep(0.02)
+                        _waited += 0.02
+                        try:
+                            while True:
+                                _probe.extend(self.audio_in_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            pass
+                        except Exception:
+                            break
+                    chunk = bytes(_probe)
+                    self._play_primed = True
 
                 self.set_speaking(True)
 
@@ -2014,8 +2338,22 @@ class JarvisLive:
 
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
+                    _write_failures = 0
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
+                except Exception as _we:
+                    # A failed write (device unplugged mid-reply, driver
+                    # hiccup) must not kill the session: drop the batch, try
+                    # to reopen the stream, and only unwind when the device is
+                    # truly gone — or failing persistently.
+                    _write_failures += 1
+                    print(f"[JARVIS] ⚠️  Play write failed ({_we}) — "
+                          "reopening output")
+                    stream = self._reopen_output_stream(stream, _spk_dev)
+                    if stream is None or _write_failures > 5:
+                        raise
+                    self.ui.write_log("SYS: Speaker recovered.")
+                    continue
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
@@ -2032,11 +2370,13 @@ class JarvisLive:
             except Exception:
                 pass
             try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
                 stream.close()
             except Exception:
                 pass
-            stream.stop()
-            stream.close()
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -2323,7 +2663,7 @@ class JarvisLive:
             try:
                 memory       = await asyncio.to_thread(load_memory)
                 monitors     = await asyncio.to_thread(list_monitors)
-                recent_turns = self._session_log[-8:] if self._session_log else []
+                recent_turns = self._session_memory.recent(8)
                 prompt = self._proactive.build_prompt(
                     memory       = memory,
                     monitors     = monitors or None,
@@ -2383,18 +2723,23 @@ class JarvisLive:
                     if self.session:
                         break
                     await asyncio.sleep(0.1)
+                # A remote command is deliberate control and the phone user
+                # has no desktop WAKE button — so it wakes JARVIS if asleep.
+                if self._wake_enabled and not self._awake:
+                    self.wake(reason="remote command")
                 if self.session:
-                    # A remote command is deliberate control and the phone user
-                    # has no desktop WAKE button — so it wakes JARVIS if asleep.
-                    if self._wake_enabled and not self._awake:
-                        self.wake(reason="remote command")
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
                     )
                     self.ui.write_log(f"[Web]: {text}")
+                    self._last_send_at = time.monotonic()
                 else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                    # No session (reconnect window): queue it instead of
+                    # dropping it — it flushes into the next session in order.
+                    self._pending_commands.put(text, source="dashboard")
+                    print(f"[Dashboard] Queued command (no session): {text[:80]}")
+                    self.ui.write_log("SYS: Remote command queued — will send on reconnect.")
             except asyncio.TimeoutError:
                 # Same wait_for/cancel race as _play_audio: without this the
                 # loop swallows TaskGroup shutdown (see _play_audio comment).
@@ -2407,6 +2752,26 @@ class JarvisLive:
                 await asyncio.sleep(0.5)
 
     # ── main loop ───────────────────────────────────────────────────────────
+
+    def _reuse_mic_queue(self) -> asyncio.Queue:
+        """Carry unsent mic frames across a reconnect (bounded).
+
+        The queue used to be recreated per session, so frames the mic captured
+        while the old session was dying were dropped with it — the first thing
+        the user said during an outage never reached the new session. Reuse
+        keeps up to ~2 s of recent audio; anything older is stale breath, not
+        speech worth replaying late.
+        """
+        q = self.out_queue
+        if q is None:
+            return asyncio.Queue(maxsize=200)
+        try:
+            excess = q.qsize() - _MIC_CARRYOVER_MAX
+            for _ in range(max(0, excess)):
+                q.get_nowait()
+        except Exception:
+            pass
+        return q
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
@@ -2501,7 +2866,7 @@ class JarvisLive:
                     # stuck player grows memory by seconds of audio, not
                     # unbounded — the queue drops rather than hoards.
                     self.audio_in_queue   = asyncio.Queue(maxsize=400)
-                    self.out_queue        = asyncio.Queue(maxsize=200)
+                    self.out_queue        = self._reuse_mic_queue()
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
@@ -2513,6 +2878,13 @@ class JarvisLive:
                     self._interrupted          = False
 
                     print("[JARVIS] Connected.")
+                    # A fresh connection resets the failure streaks: backoff
+                    # and transient counters describe CONSECUTIVE failures.
+                    self._conn_backoff = 0
+                    self._transient_tries = 0
+                    self._last_recv_at = None
+                    self._last_send_at = None
+                    self._stale_warned = False
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
                         # and "it reconnected and still knows what we were doing"
@@ -2555,7 +2927,11 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     self._reconnect_event.clear()  # ignore requests from before this session
+                    # Commands queued while disconnected go first: they are the
+                    # reason the user is still here.
+                    await self._flush_pending_commands()
                     tg.create_task(self._watch_reconnect())
+                    tg.create_task(self._watch_connection())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
@@ -2595,6 +2971,18 @@ class JarvisLive:
                 # loop instead of ending it.
                 if _contains_cancel(e):
                     raise
+                # A deliberate exit raised from inside a task (SystemExit /
+                # KeyboardInterrupt, possibly grouped) ends the process — it
+                # must never start a reconnect loop.
+                if _has_exit_request(e):
+                    raise
+                # A group of pure cancellations (teardown racing child tasks)
+                # unwound cleanly: rebuild quietly, keeping the conversation.
+                # A bare CancelledError was already re-raised above.
+                if _only_cancelled(e):
+                    print("[JARVIS] Session tasks ended — rebuilding quietly.")
+                    self._conn_backoff = 0
+                    continue
                 # Voluntary reconnect (voice change) — not an error. Rebuild the
                 # session immediately with no backoff and no scary logs.
                 if _is_reconnect_signal(e):
@@ -2710,8 +3098,24 @@ class JarvisLive:
                 else:
                     # ── MID-SESSION failure: the handshake worked, so this is
                     # neither the key nor the setup — just reconnect with backoff.
-                    is_net_err = any(k in err_str for k in _NET_TOKENS)
-                    if is_net_err:
+                    if _is_transient_error(e):
+                        # Dropped pipe (1006/1011/1012, reset, keepalive): the
+                        # server-side session usually survives, so reconnect
+                        # FAST with the resumption handle instead of burning
+                        # through the slow generic backoff. Features are never
+                        # shed here - the setup already held once.
+                        _delay = _reconnect_delay(self._transient_tries,
+                                                  transient=True)
+                        self._transient_tries += 1
+                        self._conn_backoff = _delay
+                        print(f"[JARVIS] 🔌 Connection dropped "
+                              f"({_leaf_summary(e)}) - reconnecting in "
+                              f"{_delay:.0f}s, conversation kept.")
+                        self.ui.write_log(
+                            "NET: Connection dropped - reconnecting, "
+                            "conversation kept.")
+                        self._stale_warned = False
+                    elif any(k in err_str for k in _NET_TOKENS):
                         _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                         self._conn_backoff = _conn_backoff
                         self.ui.write_log(

@@ -394,8 +394,19 @@ def save_output_device(name: str) -> bool:
 
 
 def get_plugin_enabled(plugin_name: str) -> bool:
-    """Plugins are enabled by default the moment they're discovered (opt-out model)."""
-    return load_api_keys().get("plugins_enabled", {}).get(plugin_name, True)
+    """Plugins are enabled by default the moment they're discovered (opt-out model).
+
+    A hand-edited config may hold a non-dict `plugins_enabled` (or the read
+    may fail outright) - neither must disable, let alone crash: only an
+    explicit per-plugin False opts out.
+    """
+    try:
+        flags = load_api_keys().get("plugins_enabled", {})
+    except Exception:
+        return True
+    if not isinstance(flags, dict):
+        return True
+    return bool(flags.get(plugin_name, True))
 
 
 # ── Per-plugin settings ("tokens" / connection details) ───────────────────────
@@ -449,3 +460,61 @@ def save_plugin_enabled(plugin_name: str, enabled: bool) -> bool:
         data["plugins_enabled"] = plugins_cfg
         _write_config_unlocked(data)
         return True
+
+
+# ── Optional local AI fallback (Ollama) ───────────────────────────────────────
+# Used only as a fallback for intent/planning (core/local_ai.py). Everything
+# works without it: when the server is unreachable the callers degrade to
+# their rule-based paths.
+
+def get_local_ai_enabled() -> bool:
+    """Whether the local model may be tried as a fallback (default True)."""
+    try:
+        return bool(load_api_keys().get("local_ai_enabled", True))
+    except Exception:
+        return True
+
+
+def save_local_ai_enabled(enabled: bool) -> bool:
+    return _patch_config(local_ai_enabled=bool(enabled))
+
+
+# ── Voice output routing (core/speech.py) ─────────────────────────────────────
+# "auto" (default) = Live session when connected, else the offline OS voice,
+# else the activity log. "live" / "local" pin one engine, "silent" logs only.
+
+_VOICE_ENGINES = ("auto", "live", "local", "silent")
+
+
+def get_voice_engine() -> str:
+    """Voice output mode for announcements (default "auto")."""
+    try:
+        mode = str(load_api_keys().get("voice_engine", "auto") or "auto")
+    except Exception:
+        return "auto"
+    mode = mode.strip().lower()
+    return mode if mode in _VOICE_ENGINES else "auto"
+
+
+def save_voice_engine(mode: str) -> bool:
+    mode = (mode or "auto").strip().lower()
+    if mode not in _VOICE_ENGINES:
+        mode = "auto"
+    return _patch_config(voice_engine=mode)
+
+
+def get_local_tts_voice() -> str:
+    """Preferred offline voice id/name ('' for the OS default).
+
+    Reserved for the future local JARVIS voice: custom providers plugged into
+    core/speech.py read their selection from here, so no caller changes when
+    one arrives.
+    """
+    try:
+        return (load_api_keys().get("local_tts_voice", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def save_local_tts_voice(name: str) -> bool:
+    return _patch_config(local_tts_voice=(name or "").strip())

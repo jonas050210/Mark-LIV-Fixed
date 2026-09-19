@@ -274,13 +274,39 @@ def brightness_down():
         except Exception as e:
             print(f"[Settings] Brightness down failed on Windows: {e}")
 
-def close_app():
-    if _OS == "Darwin": pyautogui.hotkey("command", "q")
-    else:               pyautogui.hotkey("alt", "f4")
+# NOTE: there is deliberately no keystroke-based close here anymore. Alt+F4 /
+# Ctrl+W / Cmd+Q hit whatever window happens to be focused - the wrong app, a
+# save dialog, anything. Named closes are handled in the computer_settings()
+# dispatcher via the unified app controller (core/app_controller.py);
+# unnamed closes are refused with a message naming the app to close.
 
-def close_window():
-    if _OS == "Darwin": pyautogui.hotkey("command", "w")
-    else:               pyautogui.hotkey("ctrl", "w")
+_CLOSE_VERB_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:bitte\s+)?"
+    r"(?:close|quit|exit|kill|beende\w*|schlie[\u00dfs]e\w*|mach\w*\s+\w+\s+zu)\s+"
+    r"(?:the\s+|this\s+|die\s+|der\s+|das\s+)?(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+_NO_TARGET_WORDS = frozenset({
+    "it", "this", "that", "this window", "window", "fenster", "dieses fenster",
+    "es", "das", "das fenster", "tab", "den tab", "alles", "everything",
+})
+
+
+def _close_target_from_text(text: str) -> str:
+    """App name out of a 'close X' sentence, or '' when there is none.
+
+    Only strips a leading close-verb - it never guesses WHICH app. 'close
+    it' / 'close this window' yield '' so the caller asks for the name
+    instead of aiming blind.
+    """
+    m = _CLOSE_VERB_RE.match(text or "")
+    if not m:
+        return ""
+    cand = m.group(1).strip().rstrip(".")
+    if not cand or cand.lower() in _NO_TARGET_WORDS:
+        return ""
+    return cand
 
 def full_screen():
     if _OS == "Darwin": pyautogui.hotkey("ctrl", "command", "f")
@@ -695,8 +721,6 @@ ACTION_MAP: dict[str, callable] = {
     "screen_off":          sleep_display,
     "pause_video":         pause_video,
     "play_pause":          pause_video,
-    "close_app":           close_app,
-    "close_window":        close_window,
     "full_screen":         full_screen,
     "fullscreen":          full_screen,
     "minimize":            minimize_window,
@@ -967,6 +991,26 @@ def computer_settings(
         scroll_down(int(value or 500))
         return "Scrolled down."
 
+    if action in ("close_app", "close_window", "quit_app", "quit"):
+        # Named closes go through the unified app controller — the SAME
+        # resolver open_app uses — so "close Spotify" can only ever close
+        # Spotify. A bare "close it" with no name is refused: there is nothing
+        # safe to aim at, and Alt+F4 at the focused window is not an option.
+        target = str(value or params.get("app_name") or params.get("app")
+                     or params.get("target") or "").strip()
+        if not target and description:
+            target = _close_target_from_text(description)
+        if not target:
+            return ("Tell me which app to close — for example 'close Spotify'. "
+                    "I will not guess: closing the wrong window could lose work.")
+        try:
+            from core import app_controller as _ac
+            _ok, _msg = _ac.close(target)
+            return _msg
+        except Exception as e:
+            print(f"[Settings] Safe close failed ({target}): {e}")
+            return f"Could not close {target}: {type(e).__name__}."
+
     func = ACTION_MAP.get(action)
     if not func:
         return _suggest(raw_action or description)
@@ -1008,7 +1052,7 @@ def computer_settings(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_settings",
-    "description": "Controls the computer: volume, brightness, window management, keyboard shortcuts, typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. Use for ANY single computer control command. restart, shutdown and toggle_wifi put a confirmation on the user's screen and do NOT happen until they press it — never claim they are done. Volume, brightness and dark mode can be reversed with the `undo` tool.",
+    "description": "Controls the computer: volume, brightness, window management, keyboard shortcuts, typing text on screen, fullscreen, dark mode, WiFi, restart, shutdown, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. Use for ANY single computer control command. This tool never closes apps: to close one, call the close_app tool with its name. restart, shutdown and toggle_wifi put a confirmation on the user's screen and do NOT happen until they press it — never claim they are done. Volume, brightness and dark mode can be reversed with the `undo` tool.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -1028,7 +1072,7 @@ TOOL = {
                     "The exact action. Prefer this over `description` — pick one of: "
                     "volume_up | volume_down | volume_set | mute | "
                     "brightness_up | brightness_down | sleep_display | "
-                    "pause_video | close_app | close_window | full_screen | "
+                    "pause_video | full_screen | "
                     "minimize | maximize | snap_left | snap_right | "
                     "switch_window | show_desktop | task_manager | focus_search | "
                     "refresh_page | close_tab | new_tab | next_tab | prev_tab | "

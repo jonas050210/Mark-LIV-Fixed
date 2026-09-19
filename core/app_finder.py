@@ -666,21 +666,40 @@ def _uninstall_entries() -> list[dict]:
     return out
 
 
+def _find_roblox_exe(studio: bool = False) -> str | None:
+    """Installed Roblox exe (player or studio), newest Versions dir first.
+
+    Both live in the same %LOCALAPPDATA%\\Roblox\\Versions tree - the scan is
+    shared, only the file name differs. No shortcut fallback: this is the
+    direct-exe check that resolve() prefers over any launcher stub.
+    """
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not (_IS_WIN and local):
+        return None
+    versions = Path(local) / "Roblox" / "Versions"
+    if not versions.is_dir():
+        return None
+    try:
+        dirs = sorted((d for d in versions.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+    except Exception:
+        return None
+    want = "RobloxStudioBeta.exe" if studio else "RobloxPlayerBeta.exe"
+    for d in dirs:
+        exe = d / want
+        try:
+            if exe.exists():
+                return str(exe)
+        except OSError:
+            continue
+    return None
+
+
 def _find_roblox() -> str | None:
     """Installed RobloxPlayerBeta.exe, newest Versions dir first. None if absent."""
-    local = os.environ.get("LOCALAPPDATA", "")
-    if _IS_WIN and local:
-        versions = Path(local) / "Roblox" / "Versions"
-        if versions.is_dir():
-            try:
-                dirs = sorted((d for d in versions.iterdir() if d.is_dir()),
-                              key=lambda d: d.stat().st_mtime, reverse=True)
-            except Exception:
-                dirs = []
-            for d in dirs:
-                exe = d / "RobloxPlayerBeta.exe"
-                if exe.exists():
-                    return str(exe)
+    rb = _find_roblox_exe(studio=False)
+    if rb:
+        return rb
     # non-default installs still leave a Start Menu shortcut
     m = _match_shortcut("Roblox Player")
     if m:
@@ -813,6 +832,22 @@ def resolve(raw: str) -> LaunchTarget | None:
             if ap:
                 return _found(LaunchTarget(kind="exe", display=canon, target=ap, source="App Paths"))
 
+        # 5b) Roblox (player + studio): the installed exe beats any shortcut.
+        # The Start Menu entry is a launcher stub whose handoff fails
+        # silently-ish (WinError 1223 on a dismissed UAC prompt, stale stub
+        # after an update) — resolving the real exe first removes that layer.
+        # The shortcut fallback stays at step 10 for non-default installs.
+        if key in ("roblox player", "roblox"):
+            _rb = _find_roblox_exe(studio=False)
+            if _rb:
+                return _found(LaunchTarget(kind="roblox", display="Roblox Player",
+                                           target=_rb, source="Roblox install"))
+        if key == "roblox studio":
+            _rbs = _find_roblox_exe(studio=True)
+            if _rbs:
+                return _found(LaunchTarget(kind="roblox", display="Roblox Studio",
+                                           target=_rbs, source="Roblox install"))
+
         # 6) Start Menu shortcuts
         m = _match_shortcut(canon)
         if m:
@@ -924,6 +959,58 @@ def suggest(raw: str, limit: int = 3) -> list[str]:
 
 # ── Launching (all non-blocking, no shell) ────────────────────────────────────
 
+#: Windows launch failures worth translating: the raw "[WinError 1223]" tells
+#: the user nothing, but the cause is usually one specific, fixable thing.
+_WINDOWS_LAUNCH_DIAGNOSIS = {
+    1223: ("The launch was cancelled — the Windows permission prompt (UAC) was "
+           "dismissed or answered with 'No'. Approve it and try again."),
+    740: ("This program needs administrator rights. I will not relaunch it "
+          "elevated myself — right-click it and choose 'Run as administrator' "
+          "if you trust it."),
+    5: ("Access denied. The file may be blocked by Windows (right-click → "
+        "Properties → Unblock), or antivirus is preventing the start."),
+    2: ("The file is no longer where it was expected (moved, renamed, or "
+        "uninstalled since)."),
+    3: "The folder path no longer exists.",
+    193: ("Not a valid Windows application — wrong architecture or a "
+          "corrupted download."),
+    1155: "No program is associated with this file or link type.",
+    1156: "The shortcut target is unavailable.",
+}
+
+
+def diagnose_launch_error(exc: BaseException, tgt=None) -> str:
+    """Plain-language diagnosis for a failed launch. Never raises.
+
+    Translates Windows error codes (WinError 1223 et al.) and common POSIX
+    errnos into one actionable sentence. Empty string when nothing useful can
+    be said — callers fall back to the raw error text.
+    """
+    try:
+        code = getattr(exc, "winerror", None)
+        if code is None and isinstance(exc, OSError):
+            code = exc.errno
+        if isinstance(code, int):
+            hit = _WINDOWS_LAUNCH_DIAGNOSIS.get(code)
+            if hit:
+                return hit
+            if code == 13:
+                return "Permission denied — the file or folder is not accessible."
+            if code in (8,):
+                return "Not enough memory to start the program."
+        text = str(exc or "").strip()
+        if tgt is not None:
+            target = str(getattr(tgt, "target", "") or "")
+            if target and "roblox" in target.lower() and "player" in text.lower():
+                return ("Roblox's launcher stub failed its handoff to the player. "
+                        "If this repeats, start Roblox once by hand so it can update itself.")
+        if len(text) > 220:
+            text = text[:220] + "…"
+        return text
+    except Exception:
+        return ""
+
+
 def launch(tgt: LaunchTarget) -> tuple[bool, str]:
     """Start the target and return immediately. (ok, human message)."""
     try:
@@ -991,6 +1078,9 @@ def launch(tgt: LaunchTarget) -> tuple[bool, str]:
         return False, f"I could not find {tgt.display} anymore."
     except Exception as e:
         print(f"[AppFinder] launch({tgt.kind}:{tgt.display}) failed: {e}")
+        diag = diagnose_launch_error(e, tgt)
+        if diag:
+            return False, f"{tgt.display} did not start ({type(e).__name__}): {diag}"
         return False, f"{tgt.display} did not start ({type(e).__name__})."
     return False, f"Cannot launch {tgt.display} on {_SYSTEM}."
 

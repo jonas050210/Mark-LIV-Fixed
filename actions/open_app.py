@@ -169,12 +169,36 @@ def open_app(
     print(f"[open_app] Launching: '{app_name}' ({_SYSTEM})")
 
     try:
+        from core import app_controller as _ac
+    except Exception:
+        _ac = None
+
+    # NEVER install / update / repair / download / uninstall - no matter how
+    # the request is phrased ("mach was du willst" included). There is no code
+    # path from here to any installer, package manager, or download.
+    if _ac is not None and _ac.INSTALL_INTENT_RE.search(app_name):
+        return ("I do not install, update, repair, or download software - "
+                f"'{app_name[:80]}' sounds like one of those jobs. Install it "
+                "yourself and I will gladly open it for you.")
+
+    try:
         target = _af.resolve(app_name)
     except Exception as e:
         print(f"[open_app] resolve failed: {e}")
         return f"I could not look up {app_name} ({type(e).__name__})."
 
     if target is not None:
+        # Launch through the unified controller: same resolver, plus a
+        # process-level check that the app actually appeared - installed
+        # means nothing if it crashed on startup.
+        if _ac is not None:
+            try:
+                ok, message = _ac.open(app_name)
+            except Exception as e:
+                print(f"[open_app] controller failed: {e}")
+                return f"Failed to open {app_name}: {type(e).__name__}."
+            print(f"[open_app] → {target.kind}:{target.display} ok={ok}")
+            return message
         try:
             ok, message = _af.launch(target)
         except Exception as e:
@@ -200,6 +224,20 @@ def open_app(
     verified = _verified_shortcut_name(app_name)
     if verified and _start_menu_type_verified(verified):
         print(f"[open_app] Start Menu fallback typed verified name '{verified}'")
+        # The keystrokes only *asked* Windows to start it — check the process
+        # table before claiming success (short wait: Start-menu launches lag).
+        if _ac is not None:
+            try:
+                time.sleep(2.5)
+                running = _ac.is_running(verified)
+            except Exception:
+                running = None
+            if running is True:
+                return f"Opened {verified}."
+            if running is False:
+                return (f"I asked Windows to start {verified}, but it does not "
+                        "appear to be running. Try clicking it in the Start menu "
+                        "yourself — it may need a confirmation I cannot give.")
         return f"Opened {verified}."
 
     if suggestions:
@@ -217,8 +255,11 @@ TOOL = {
         "natural names and aliases ('GD' → Geometry Dash, 'KSP2' → Kerbal Space "
         "Program 2, 'Roblox' → Roblox Player, 'Chrome', 'Spotify', 'Steam' games "
         "by name) and full http(s) URLs. Always call this tool — never just say "
-        "you opened it. If the app is not installed it says so and never "
-        "downloads anything."
+        "you opened it. Verifies the app is actually running before reporting "
+        "success. NEVER installs, updates, repairs, downloads, or uninstalls "
+        "anything: if the app is not installed it says so, suggests close "
+        "matches, and stops. No phrasing ('do whatever it takes', 'mach was du "
+        "willst') overrides this."
     ),
     "parameters": {
         "type": "OBJECT",

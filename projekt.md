@@ -28,7 +28,7 @@ Mark LIV (54) ist ein plattformübergreifender, echtzeitfähiger persönlicher K
                                                ▼
                                ┌───────────────────────────────┐
                                │ Action Loader & Tool Registry │
-                               │   (20 Aktive Bundled Skills)  │
+                               │   (22 Aktive Bundled Skills)  │
                                └───────────────┬───────────────┘
                                                │
                ┌───────────────────────────────┴───────────────────────────────┐
@@ -41,14 +41,16 @@ Mark LIV (54) ist ein plattformübergreifender, echtzeitfähiger persönlicher K
 │ • code_agent (Scaffold/Fix) │ │ • file_controller           │ │ • audio_device / settings   │
 │ • desktop_control / notify  │ │ • screen_vision (Find/Read) │ │ • timer / reminder          │
 │ • app_inventory (Index)     │ │                             │ │                             │
+│ • close_app (Prozess-Close) │ │                             │ │                             │
+│ • agent_task (Multi-Step)   │ │                             │ │                             │
 └─────────────────────────────┘ └─────────────────────────────┘ └─────────────────────────────┘
 ```
 
 ---
 
-## 3. Die 20 aktiven Aktionen (`actions/`)
+## 3. Die 22 aktiven Aktionen (`actions/`)
 
-Alle 20 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur Laufzeit von `core/action_loader.py` automatisch geladen:
+Alle 22 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur Laufzeit von `core/action_loader.py` automatisch geladen:
 
 1. `app_inventory`: Beantwortet „Was ist installiert / wo liegt X / ist Y ein Spiel und wie startet es" aus dem gemeinsamen App-Index. Rein lesend.
 2. `audio_device`: Verwaltet und wechselt Ein- und Ausgabegeräte (Mikrofon/Lautsprecher) namentlich und prüft deren Hardware-Verfügbarkeit.
@@ -70,6 +72,8 @@ Alle 20 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur L
 18. `timer`: Gesprochene Countdown-Timer in Hintergrund-Daemon-Threads mit Sprachansage.
 19. `web_search`: Parallele Websuche über Gemini Grounded Search und DuckDuckGo (ddgs).
 20. `youtube_video`: Wiedergabe, Metadatenabruf und Transkript-Zusammenfassungen. Nutzt `yt-dlp` für robuste Video-Infos und automatischen Untertitel-Fallback.
+21. `close_app`: Schließt Apps über ihre eigenen Prozesse (terminate → wait → kill, mit Nachprüfung) — niemals per Alt+F4/Ctrl+W oder globalen Shortcuts. Schließt niemals JARVIS selbst, eigene Geschwisterprozesse oder Systemprozesse.
+22. `agent_task`: Multi-Step-Agent — führt ein Ziel („öffne Spotify und suche Jazz“) als Schrittfolge über den zentralen Tool-Dispatcher aus (Plan → Execute → Verify); stoppt ehrlich beim ersten unverifizierten Schritt.
 
 ---
 
@@ -92,6 +96,8 @@ Alle 20 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur L
 - **URL-Schemata (`actions/browser_control.py`)**: Nur `http(s)` wird geöffnet; `file:`-, `javascript:`-, `data:`- und andere Schemata werden abgewiesen, damit keine lokalen Dateien ins Modellkontext gelesen und kein Seiten-JavaScript ausgeführt werden kann.
 - **Home-Sandbox für Dateien**: `file_controller`, `file_processor`, `document_qa`, `summarize` und `code_agent` lösen Pfade über Symlinks auf und verweigern alles außerhalb des Home-Verzeichnisses (plus Temp-Verzeichnis für Leseaktionen). Archive werden Zip-Slip-geprüft entpackt, Ausgabeformate validiert.
 - **Skript-Injektion**: Modelltexte, die in PowerShell/AppleScript-Quelltext interpoliert werden (Fensterfokus, Wallpaper, macOS-Benachrichtigungen), werden bei Anführungszeichen abgewiesen bzw. entschärft; Scheduler-XML wird escaped, `at`-Kommandos gequotet.
+- **open_app installiert niemals**: Installer-/Update-/Repair-Absichten (DE+EN, inkl. „mach was du willst“) sowie Installer-ähnliche Ziele werden verweigert; der Start wird per Prozesstabelle verifiziert, Windows-Fehlercodes (z. B. WinError 1223) werden in eine Diagnose übersetzt.
+- **Schließen nur über Prozesse**: `close_app`/`computer_settings` nutzen denselben Resolver wie `open_app`; Tastenkürzel-Schließungen (Alt+F4/Ctrl+W), Raten bei unbenanntem Ziel und das Schließen von JARVIS selbst, System- oder Shell-Prozessen sind ausgeschlossen; geteilte Runtimes (java/python/…) werden nie terminiert.
 - **Kein Shell-Start**: Kein modelgesteuerter String erreicht je eine Shell (`shell=True` kommt nur noch in Kommentaren vor); alle Subprozesse laufen als Argumentvektoren.
 - **Dashboard LAN-Schutz (`dashboard/server.py`)**: Das Web-Dashboard lauscht standardmäßig ausschließlich auf `127.0.0.1`. Die Freigabe ins lokale Netzwerk erfordert ein explizites Opt-in im Einstellungsmenü.
 
@@ -105,6 +111,6 @@ Alle 20 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur L
 ---
 
 ## 7. Teststatus & Validierung
-- **Vollständige Validierung**: `python3 test_overall.py` $\to$ **8 Passed, 0 Failed, 1 Skipped** (`wake_word` optional), 267 Checks grün.
-- **Unit-Tests**: `pytest tests/` $\to$ **12/12 PASS** (`test_bug_fixes` 3/3, `test_modern_backends` 5/5, `test_fallbacks_verification` 4/4).
-- **Aktions-Discovery**: 20/20 `TOOL`-Deklarationen aktiv, 0 zurückgewiesen, alle Schema-Namen valide.
+- **Vollständige Validierung**: `python3 test_overall.py` $\to$ **7 Passed, 1 Failed, 1 Skipped** in Minimal-Umgebungen (`wake_isolation` braucht `numpy`/`openwakeword`; mit installierten Deps 8/0/1), 206+ Checks grün.
+- **Unit-Tests**: `pytest tests/` $\to$ Alttests wie zuvor (12/12 mit allen optionalen Deps); NEU und ohne Drittabhängigkeiten lauffähig: **89/89 PASS** (`test_agent` 27, `test_voice_local` 12, `test_reconnect` 12, `test_session_memory` 9, `test_app_lifecycle` 29).
+- **Aktions-Discovery**: 22/22 `TOOL`-Deklarationen aktiv, 0 zurückgewiesen, alle Schema-Namen valide.

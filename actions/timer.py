@@ -132,11 +132,27 @@ def _countdown(timer_id: str, seconds: int, label: str, speak, player) -> None:
 
     message = f"Timer {label} is up." if label else "Your timer is up."
     _log(player, f"TIMER: {message}")
-    if speak is None:
-        return
-    try:
-        speak(message)
-    except Exception:
+    # Announce through the Live voice first; when there is no session (or the
+    # call fails), fall back to the decoupled voice router — a timer that
+    # fires during a reconnect must still be heard, via the offline OS voice.
+    # Providers that report (main.speak returns True/False) unlock the
+    # fallback; a None return means "unknown" and is trusted — speaking the
+    # line twice (Live + local voice at once) would be worse than trusting it.
+    announced = None
+    if speak is not None:
+        try:
+            announced = speak(message)
+        except Exception:
+            announced = False
+    if announced is False or speak is None:
+        try:
+            from core.speech import get_speech_router
+
+            get_speech_router().announce(message)
+            announced = True
+        except Exception:
+            pass
+    if not announced:
         # A dropped announcement must never take the session down with it; the
         # log line above already recorded that the timer fired.
         pass
