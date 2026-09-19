@@ -5,20 +5,15 @@ Installs the Python dependencies for THIS operating system only: the OS-specific
 packages in requirements.txt carry `sys_platform` markers, so a macOS or Linux
 user never pulls Windows-only libraries (and vice-versa).
 
-It then offers the Playwright browsers needed for web automation. Those are the
-single biggest thing setup ever downloads — each browser engine is a full build
-of a real browser, ~225 MB for Chromium and ~86 MB for Firefox — so they are
-asked for instead of pulled silently:
+Setup is fully automatic: it skips satisfied Python requirements, installs
+Chromium, Firefox and WebKit using Playwright's platform-specific builds, and
+verifies packages and browser launches before reporting READY. No stdin is read.
 
-    py setup.py                    ask interactively (recommended: Chromium only)
-    py setup.py --yes              non-interactive, take the recommended default
+    py setup.py                    automatic packages + all browser engines
+    py setup.py --yes              compatibility alias for the default
     py setup.py --minimal          Python packages only, no browser binaries
-    py setup.py --browsers firefox pick one of: none, chromium, firefox,
-                                   chromium-firefox
-
-Nothing here is mandatory for the app to start: without a browser engine
-everything works except browser automation, and it can be added later with
-`python -m playwright install chromium`.
+    py setup.py --browsers firefox explicitly select a subset
+    py setup.py --dry-run          show the plan without installing anything
 
 Two things it deliberately does NOT install:
   * the optional local wake word ("Hey Jarvis") — one-click, opt-in, from
@@ -28,12 +23,13 @@ Two things it deliberately does NOT install:
 """
 import argparse
 import importlib.metadata as importlib_metadata
-import importlib.util
 import os
 import platform
 import subprocess
 import sys
 from pathlib import Path
+
+from core.command_runner import run_live
 
 OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 HERE = Path(__file__).resolve().parent
@@ -42,63 +38,35 @@ MIN_PY = (3, 11)        # hard floor: below this the syntax used here won't pars
 MAX_PY = (3, 13)        # highest version this is actually tested on
 
 
-# ── Playwright browser selection ──────────────────────────────────────────────
-# A browser engine is a big download and most people only ever need one, so the
-# choice is explicit and explained rather than a silent ~300 MB surprise.
-BROWSER_CHOICES = ("none", "chromium", "firefox", "chromium-firefox")
-DEFAULT_BROWSERS = "chromium"   # covers Chrome, Edge, Brave, Vivaldi, Opera
-ENV_BROWSERS = "MARK_LIV_BROWSERS"  # non-interactive override for scripts/CI
-
-# What each choice hands to `python -m playwright install`. Empty means skip.
+# ── Non-interactive browser selection ────────────────────────────────────────
+DEFAULT_BROWSERS = "all"
+ENV_BROWSERS = "MARK_LIV_BROWSERS"
 PLAYWRIGHT_ARGS = {
     "none": [],
     "chromium": ["chromium"],
     "firefox": ["firefox"],
+    "webkit": ["webkit"],
     "chromium-firefox": ["chromium", "firefox"],
+    "all": ["chromium", "firefox", "webkit"],
 }
-
-# Approximate, current-OS download size — enough to make the question answerable.
-# Every entry also pulls a small shared ffmpeg build (a few MB).
-SHORT_SIZES = {
-    "none": "0 MB",
-    "chromium": "~225 MB",
-    "firefox": "~86 MB",
-    "chromium-firefox": "~311 MB",
-}
-
-# Long form, for the one place the size really needs justifying: right before
-# several hundred megabytes start arriving.
-SIZE_NOTES = {
-    "none": "nothing is downloaded",
-    "chromium": "~225 MB (Chromium ~136 MB + headless shell ~88 MB, plus a small ffmpeg)",
-    "firefox": "~86 MB (Firefox, plus a small ffmpeg)",
-    "chromium-firefox": "~311 MB (Chromium + Firefox, plus a small ffmpeg)",
-}
-
-# Menu order shown in an interactive terminal: most useful first.
-_MENU = (
-    ("1", "chromium", "Chromium only",
-     "covers Chrome, Edge, Brave, Vivaldi, Opera — what browser automation needs"),
-    ("2", "chromium-firefox", "Chromium + Firefox",
-     "adds the real Gecko engine for Firefox-specific sites"),
-    ("3", "firefox", "Firefox only",
-     "only if you exclusively automate Firefox"),
-    ("4", "none", "No browsers (minimal)",
-     "browser automation stays unavailable until you install one later"),
-)
+BROWSER_CHOICES = tuple(PLAYWRIGHT_ARGS)
 
 _ALIASES = {
     "no": "none", "skip": "none", "minimal": "none", "0": "none",
     "chrome": "chromium", "cr": "chromium",
     "ff": "firefox",
-    "both": "chromium-firefox", "all": "chromium-firefox",
+    "both": "chromium-firefox",
+    "chromium-firefox-webkit": "all",
     "firefox-chromium": "chromium-firefox",
 }
 
 
 def _run(label: str, args: list[str]) -> None:
-    print(f"\n▶ {label}")
-    subprocess.run(args, check=True)
+    print(f"\n▶ {label}", flush=True)
+    result = run_live(args, label=label, timeout=1200, heartbeat=5)
+    if result.timed_out or result.returncode:
+        raise subprocess.CalledProcessError(result.returncode or 1, args)
+    print(f"  Done: {label} ({result.seconds:.1f}s)", flush=True)
 
 
 def _check_python() -> None:
@@ -168,66 +136,13 @@ def browser_retry_command(choice: str) -> str:
     return f"{Path(sys.executable).name or 'python'} -m playwright install " + " ".join(args)
 
 
-def _stdin_is_interactive() -> bool:
-    try:
-        return bool(sys.stdin) and sys.stdin.isatty()
-    except Exception:      # stdin closed, redirected, or a non-standard object
-        return False
-
-
-def _print_browser_menu() -> None:
-    print("\n── Playwright browsers " + "─" * 50)
-    print("Browser automation needs a real browser engine downloaded from the")
-    print("Playwright CDN. These are large, so pick what you actually want:")
-    for key, choice, label, why in _MENU:
-        marker = " (recommended)" if choice == DEFAULT_BROWSERS else ""
-        print(f"   {key}) {label:<22} {SHORT_SIZES[choice]:>8}")
-        print(f"      {why}{marker}")
-    print("   Approximate download size for this OS; each also pulls a small ffmpeg.")
-    print("   (Safari/WebKit is separate: python -m playwright install webkit)")
-
-
-def prompt_browsers() -> str:
-    """Ask in an interactive terminal. Never blocks a non-interactive run."""
-    _print_browser_menu()
-    by_key = {key: choice for key, choice, _label, _why in _MENU}
-    try:
-        for _attempt in range(3):
-            raw = input("\n  Install which browsers? [1/2/3/4] (default: 1) ").strip()
-            if not raw:
-                return DEFAULT_BROWSERS
-            if raw in by_key:
-                return by_key[raw]
-            choice = normalize_browsers(raw)
-            if choice:
-                return choice
-            print(f"  ! '{raw}' is not one of 1, 2, 3, 4 — or type a name like 'chromium'.")
-        print(f"  ! Too many invalid answers — using the recommended default "
-              f"({DEFAULT_BROWSERS}).")
-        return DEFAULT_BROWSERS
-    except EOFError:
-        # stdin ended under us (piped input, closed console): do not hang, and
-        # do not abort an otherwise working install over a cosmetic question.
-        print(f"\n  No input available — using the recommended default "
-              f"({DEFAULT_BROWSERS}).")
-        return DEFAULT_BROWSERS
-    except KeyboardInterrupt:
-        print("\n\nAborted — nothing was installed.")
-        print(f"    Continue without browsers:  py setup.py --minimal")
-        raise SystemExit(130)
-
-
 def resolve_browsers(args, interactive: bool | None = None, environ=None) -> str:
-    """Turn CLI flags + environment + (maybe) a prompt into one concrete choice.
+    """Resolve skip flags > --browsers > environment > all engines.
 
-    Precedence: explicit "skip" flags > --browsers > $MARK_LIV_BROWSERS >
-    interactive prompt > recommended default. A non-interactive run therefore
-    never waits for input, and always ends up with a defined answer.
+    ``interactive`` remains accepted for callers of the old API, but is ignored.
+    Setup never reads stdin, including in a terminal and during dry runs.
     """
     environ = os.environ if environ is None else environ
-    if interactive is None:
-        interactive = _stdin_is_interactive()
-
     skip = bool(getattr(args, "minimal", False) or getattr(args, "skip_browsers", False))
     explicit = normalize_browsers(getattr(args, "browsers", None))
 
@@ -248,15 +163,6 @@ def resolve_browsers(args, interactive: bool | None = None, environ=None) -> str
         print(f"  ! Ignoring {ENV_BROWSERS}={raw_env!r} — expected one of: "
               f"{', '.join(BROWSER_CHOICES)}.")
 
-    if interactive and not getattr(args, "yes", False):
-        return prompt_browsers()
-
-    # Non-interactive (piped output, CI, scheduled task): no question is
-    # possible, so take the documented recommended default instead of hanging.
-    if not getattr(args, "yes", False):
-        print(f"  No terminal attached — using the recommended default "
-              f"({DEFAULT_BROWSERS}, {SHORT_SIZES[DEFAULT_BROWSERS]}). "
-              f"Use --minimal to skip it.")
     return DEFAULT_BROWSERS
 
 
@@ -264,7 +170,7 @@ def _describe_plan(choice: str) -> str:
     args = playwright_install_args(choice)
     if not args:
         return "no browser binaries (minimal — browser automation can be added later)"
-    return " + ".join(args) + f"  ({SHORT_SIZES[choice]})"
+    return " + ".join(args)
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -272,28 +178,9 @@ def _describe_plan(choice: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="setup.py",
-        description="MARK LIV one-time setup: Python dependencies plus the "
-                    "Playwright browsers you choose.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "browser selection:\n"
-            "  none               install no browser binaries\n"
-            "  chromium           Chromium only   (~225 MB) — recommended\n"
-            "  firefox            Firefox only    (~86 MB)\n"
-            "  chromium-firefox   both engines    (~311 MB)\n"
-            "\n"
-            "examples:\n"
-            "  py setup.py                        ask which browsers to fetch\n"
-            "  py setup.py --yes                  no questions, Chromium only\n"
-            "  py setup.py --minimal              packages only, no browsers\n"
-            "  py setup.py --browsers firefox     Firefox only, no questions\n"
-            "  py setup.py --dry-run              print the plan, change nothing\n"
-            "\n"
-            "Non-interactive runs never wait for input: they take the\n"
-            f"recommended default ({DEFAULT_BROWSERS}) unless told otherwise.\n"
-            f"Environment override for scripts: {ENV_BROWSERS}=none|chromium|"
-            "firefox|chromium-firefox\n"
-        ),
+        description="MARK LIV automatic setup: Python dependencies and all "
+                    "supported Playwright browser engines. No prompts.",
+        epilog=f"Environment override: {ENV_BROWSERS}=" + "|".join(BROWSER_CHOICES),
     )
     parser.add_argument("--minimal", action="store_true",
                         help="install Python packages only — no Playwright browsers")
@@ -304,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="which browser binaries to download "
                              f"({', '.join(BROWSER_CHOICES)})")
     parser.add_argument("--yes", "-y", action="store_true",
-                        help=f"non-interactive: take the recommended default "
+                        help=f"compatibility flag: setup is always non-interactive "
                              f"({DEFAULT_BROWSERS})")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be installed, then exit")
@@ -398,11 +285,11 @@ def _install_requirements(missing, req_path):
         pretty = line if len(line) <= 64 else line[:61] + "..."
         print(f"    \u2022 {pretty}")
     cmd = [sys.executable, "-m", "pip", "install",
-           "--upgrade-strategy", "only-if-needed", *missing]
+           "--no-input", "--upgrade-strategy", "only-if-needed", *missing]
     if any(line.startswith("-") for line in missing):
-        cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_path)]
+        cmd = [sys.executable, "-m", "pip", "install", "--no-input", "-r", str(req_path)]
     try:
-        subprocess.run(cmd, check=True)
+        _run("Installing missing Python packages", cmd)
         return True
     except subprocess.CalledProcessError as e:
         print(f"\n\u26a0\ufe0f  pip exited with status {e.returncode}.")
@@ -440,14 +327,70 @@ def _auto_install(req_path_str: str) -> bool:
     return _install_requirements(missing, req_path) and _verify_requirements(req_path)
 
 
+def _browser_locations(browser: str) -> list[Path]:
+    """Ask the installed Playwright version for its exact platform/revision paths.
+
+    Includes Chromium's headless shell and shared tools; no guessed cache path
+    or stale browser revision can accidentally satisfy this check.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "--dry-run", browser],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=True, timeout=30,
+    )
+    paths = [Path(line.split(":", 1)[1].strip())
+             for line in result.stdout.splitlines()
+             if line.strip().lower().startswith("install location:")]
+    if not paths:
+        raise RuntimeError(f"Playwright did not report install locations for {browser}")
+    return paths
+
+
+def _install_browsers(browsers: list[str]) -> bool:
+    """Skip complete downloads, then verify every selected engine can launch."""
+    ok = True
+    for index, browser in enumerate(browsers, 1):
+        print(f"\n[{index}/{len(browsers)}] Playwright {browser}: checking installation...",
+              flush=True)
+        try:
+            locations = _browser_locations(browser)
+            if all((path / "INSTALLATION_COMPLETE").is_file() for path in locations):
+                print(f"  {browser}: already installed — skipping download.", flush=True)
+            else:
+                _run(f"Installing Playwright {browser}",
+                     [sys.executable, "-m", "playwright", "install", browser])
+            if not all(path.is_dir() for path in locations):
+                raise RuntimeError("browser installation directories are missing")
+            # Launch checks also detect missing native host libraries or damaged
+            # binaries. Run out of process so even a broken driver is bounded.
+            script = (
+                "import sys\nfrom playwright.sync_api import sync_playwright\n"
+                "with sync_playwright() as p:\n"
+                "    b = getattr(p, sys.argv[1]).launch(headless=True, timeout=15000)\n"
+                "    b.close()\n"
+                "print('Browser launch verified')\n"
+            )
+            print(f"  Verifying {browser} headless launch...", flush=True)
+            result = run_live([sys.executable, "-u", "-c", script, browser],
+                              label=f"Verify {browser}", timeout=45)
+            if result.timed_out or result.returncode:
+                raise RuntimeError("headless launch failed (see output above)")
+            print(f"  {browser}: verified.", flush=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            ok = False
+            print(f"  FAILED: {browser}: {exc}\n"
+                  f"  Retry: {browser_retry_command(browser)}\n"
+                  "  If native host libraries are missing, install the libraries "
+                  "listed above (Linux: python -m playwright install-deps).", flush=True)
+    return ok
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     print(f"⚙  MARK LIV setup — detected OS: {OS or 'unknown'}, "
           f"Python {sys.version_info[0]}.{sys.version_info[1]}")
     _check_python()
 
-    # Ask before pip runs: the dependency install can take minutes, and nobody
-    # should come back to a prompt that has been waiting the whole time.
     choice = resolve_browsers(args)
     browser_args = playwright_install_args(choice)
     print(f"\nPlan: Python packages from {args.requirements}")
@@ -488,36 +431,25 @@ def main(argv: list[str] | None = None) -> int:
         print("\n  --force-full-install set: reinstalling every package in " +
               f"{args.requirements}")
         _run("Installing Python dependencies (full reinstall)…",
-             [sys.executable, "-m", "pip", "install", "--upgrade",
+             [sys.executable, "-m", "pip", "install", "--no-input", "--upgrade",
               "-r", args.requirements])
         if not _verify_requirements(Path(args.requirements)):
             return 1
     else:
         if not _auto_install(args.requirements):
+            print("\nNOT READY — Python package installation/verification failed.", flush=True)
             return 1
 
     if browser_args:
-        # Chromium covers Chrome/Edge/Opera/Brave/Vivaldi; Firefox for Firefox.
-        # (Safari automation additionally needs: python -m playwright install webkit)
-        # Not fatal: these are a few hundred megabytes from a CDN that a corporate
-        # network or a flaky connection can refuse, and everything except browser
-        # automation works without them. Failing the whole install there would send
-        # a user away from a working app.
-        try:
-            _run(f"Installing Playwright browsers ({' + '.join(browser_args)}) — "
-                 f"{SIZE_NOTES[choice]}; this is the big download…",
-                 [sys.executable, "-m", "playwright", "install", *browser_args])
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"\n⚠️  Playwright browsers were not installed ({e}).")
-            print("    Everything except browser automation works. Retry later with:")
-            print(f"    {browser_retry_command(choice)}")
-            if importlib.util.find_spec("playwright") is None:
-                print("    (playwright itself is not importable — if pip could not "
-                      "install it, run the line above after fixing pip.)")
+        if not _install_browsers(browser_args):
+            print("\nNOT READY — browser installation/verification failed.", flush=True)
+            return 1
     else:
-        print("\n⏭  Skipping Playwright browsers (minimal install).")
-        print("    Everything except browser automation works. Add them later with:")
-        print(f"    {browser_retry_command('chromium')}")
+        print("\nSkipping Playwright browsers (explicit minimal install).")
+
+    # Recheck after all installation steps; do not claim readiness on failure.
+    if not _verify_requirements(Path(args.requirements)):
+        return 1
 
     _check_assets()
 
@@ -545,11 +477,12 @@ def main(argv: list[str] | None = None) -> int:
     elif OS == "Darwin":
         print(
             "\nℹ️  macOS note — volume, brightness and reminders use the built-in "
-            "'osascript' / LaunchAgents, so no extra tools are required.\n"
-            "    For Safari automation only: python -m playwright install webkit"
+            "'osascript' / LaunchAgents, so no extra tools are required."
         )
 
-    print("\n✅ Setup complete!")
+    print("\nREADY — Setup complete!" +
+          (" (Python packages only; browsers explicitly skipped.)" if not browser_args else
+           " Python packages and selected browsers verified."), flush=True)
     print("   1) Launch it:  python main.py")
     print("   2) Paste your free Gemini API key when the setup screen appears.")
     print("   3) (Optional) Enable 'Hey Jarvis' from ⚙ → WAKE WORD.")
@@ -557,4 +490,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    try:
+        raise SystemExit(main())
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"\nNOT READY — {exc}", flush=True)
+        raise SystemExit(1)

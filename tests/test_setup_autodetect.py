@@ -11,6 +11,7 @@ The test never actually installs anything \u2014 the auto-detect logic is
 pure Python; installation checks use distribution metadata without imports.
 """
 import contextlib
+import importlib.util
 import io
 import sys
 import tempfile
@@ -82,13 +83,13 @@ def test_is_installed_handles_aliases():
     names = ("Pillow", "google-genai", "beautifulsoup4", "pywin32", "data-only")
     with patch.object(S.importlib_metadata, "distribution",
                       return_value=SimpleNamespace(version="2.0")) as lookup, \
-         patch.object(S.importlib.util, "find_spec", side_effect=AssertionError("must not guess imports")):
+         patch.object(importlib.util, "find_spec", side_effect=AssertionError("must not guess imports")):
         for name in names:
             assert S._is_installed(name)
             lookup.assert_called_with(name)
     with patch.object(S.importlib_metadata, "distribution",
                       side_effect=S.importlib_metadata.PackageNotFoundError), \
-         patch.object(S.importlib.util, "find_spec", return_value=object()):
+         patch.object(importlib.util, "find_spec", return_value=object()):
         assert not S._is_installed("missing-distribution"), "an unrelated module is not an install"
     print("[PASS] distribution/import name mismatches and missing distributions")
     return True
@@ -140,9 +141,9 @@ def test_verification_is_strict_and_platform_aware():
              contextlib.redirect_stdout(io.StringIO()) as out:
             assert S.main(["--minimal"]) == 1
             assert "Setup complete" not in out.getvalue()
-        with patch.object(S.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(S, "_run") as run, contextlib.redirect_stdout(io.StringIO()):
             assert S._install_requirements(["different-name>=2,<3"], req)
-            assert run.call_args.args[0][-1] == "different-name>=2,<3"
+            assert run.call_args.args[1][-1] == "different-name>=2,<3"
         with contextlib.redirect_stdout(io.StringIO()):
             assert not S._verify_requirements(Path(td) / "absent.txt")
     print("[PASS] strict verification, platform markers, missing-only pip and failure propagation")
@@ -185,11 +186,13 @@ def test_dry_run_with_autodetect():
     """The dry-run path must include the auto-detect plan, not just the old
     full-reinstall line. We suppress stdout so the test output stays clean."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), \
+         patch("builtins.input", side_effect=AssertionError("setup must not read stdin")):
         try:
-            rc = S.main(["--dry-run"])
+            rc = S.main(["--dry-run", "--yes"])
         except SystemExit as e:
             rc = e.code
+    assert rc == 0
     out = buf.getvalue()
     # the auto-detect plan must be present
     assert "Auto-detect" in out or "would install" in out, \
@@ -200,11 +203,13 @@ def test_dry_run_with_autodetect():
 
 def test_dry_run_with_force_full_install():
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), \
+         patch("builtins.input", side_effect=AssertionError("setup must not read stdin")):
         try:
-            rc = S.main(["--dry-run", "--force-full-install"])
+            rc = S.main(["--dry-run", "--yes", "--force-full-install"])
         except SystemExit as e:
             rc = e.code
+    assert rc == 0
     out = buf.getvalue()
     assert "--force-full-install" in out, \
         f"dry-run output missing force-full-install label:\n{out}"

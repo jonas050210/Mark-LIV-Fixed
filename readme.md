@@ -292,24 +292,26 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 ```bash
 git clone https://github.com/FatihMakes/Mark-LIV.git
 cd Mark-LIV
-python setup.py        # installs deps for YOUR OS, then asks about browser binaries
+python setup.py        # automatic OS-specific packages + Chromium, Firefox and WebKit
 python main.py
 ```
 
 `setup.py` only ever installs what your operating system needs — the Windows-only libraries are skipped automatically on macOS and Linux, and vice-versa. It also checks your Python version up front, so a wrong interpreter fails with a sentence instead of a wall of pip output. Prefer to do it by hand? `pip install -r requirements.txt` works too.
 
-**Browser binaries are optional, and setup asks before fetching them.** Web automation drives a real browser engine from Playwright, and those are the biggest thing setup can download: Chromium ≈ 225 MB, Firefox ≈ 86 MB. So `setup.py` explains the sizes and offers a choice — Chromium only (recommended, covers Chrome/Edge/Brave/Vivaldi/Opera), both engines, Firefox only, or none. Nothing except browser automation needs them, and a skipped browser can always be added later.
+**Setup is fully automatic and never asks for input.** It installs missing Python packages and all three Playwright browser engines (Chromium, Firefox and WebKit, using the builds for your platform). Satisfied packages and complete browser downloads are skipped. Installation output is live, with elapsed-time heartbeats during quiet periods. Setup verifies package versions and headless browser launches before printing **READY**.
 
 | Command | What it does |
 | --- | --- |
-| `python setup.py` | packages, then asks which browsers to download |
-| `python setup.py --yes` | packages + Chromium — recommended, no questions |
-| `python setup.py --minimal` | packages only, no browser binaries |
-| `python setup.py --browsers chromium\|firefox\|chromium-firefox\|none` | packages + exactly those browsers |
-| `python setup.py --dry-run` | prints the plan, changes nothing |
+| `python setup.py` | packages + Chromium, Firefox and WebKit; no questions |
+| `python setup.py --yes` | compatibility alias for the same automatic default |
+| `python setup.py --minimal` | packages only, explicitly skip browser binaries |
+| `python setup.py --browsers chromium\|firefox\|webkit\|chromium-firefox\|all\|none` | packages + the selected browser engines |
+| `python setup.py --dry-run` | prints the plan without installing or prompting |
 | `python -m playwright install chromium` | add a browser engine later |
 
-A failed or skipped browser download is never fatal — MARK LIV starts and works, only browser automation stays unavailable. Non-interactive runs (piped output, CI, scheduled tasks) never wait for input; they take the recommended default unless a flag or `MARK_LIV_BROWSERS=none` says otherwise.
+`--skip-browsers`, `--auto`, `--force-full-install`, `--requirements` and the `MARK_LIV_BROWSERS` environment override remain available. A failed download or verification exits nonzero instead of claiming readiness; already installed packages are retained for the next attempt. On Linux, missing native browser libraries are reported with a `python -m playwright install-deps` hint (system package installation may require administrator privileges). Explicitly skipping browsers does not prevent launching MARK LIV, but browser automation remains unavailable until an engine is installed.
+
+**Validation:** `python test_overall.py` streams each suite's stdout/stderr immediately, announces its test count when known, and prints elapsed-time heartbeats and an immediate result. Per-suite deadlines range from 15 to 90 seconds; a hung suite is terminated, marked **TIMEOUT**, and the report continues. Use `--suite setup_autodetect` to run just setup detection, or `--timeout 30` to override each selected suite's deadline. `--verbose` remains accepted; output is always live. The final summary is written to `_logs/test_overall_report.txt` (override with `--report`).
 
 ### 🧩 Five new skills
 
@@ -380,7 +382,7 @@ Mark LIV/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, viseme extraction, tool dispatch
 ├── ui.py                     # PyQt6 HUD — avatar canvas, waveform, log panel, settings drawer, camera feed
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
-├── test_overall.py           # One-command validation report: PASS / FAIL / SKIPPED
+├── test_overall.py           # Live validation report: PASS / FAIL / TIMEOUT / SKIPPED
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
 │   ├── telegram_remote.py    # Control JARVIS from Telegram; optional extras need _telegram_ops.py
