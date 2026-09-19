@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core import tasks
 from core.verify import Verification, verify
 
 
@@ -276,6 +277,65 @@ def plan(goal: str, tool_names: list[str] | None = None) -> list[dict]:
 
 # ── Plan → Execute → Verify ──────────────────────────────────────────────────
 
+#: The obvious next step after a step fails *verifiably* (a ground-truth
+#: re-check said the effect is not there). Keyed by the failing tool; the
+#: builder returns a fallback step, or None when there is nothing sensible to
+#: try. This is what "continue automatically" means here: the agent does the
+#: obvious thing itself instead of stopping and asking the user to retype it.
+def _recover_open_app(params: dict, failed_tool: str) -> dict | None:
+    name = str(params.get("app_name") or params.get("name") or "").strip()
+    if not name:
+        return None
+    # It did not start - find out whether it exists at all before saying more.
+    return {"tool": "app_inventory", "params": {"action": "where", "query": name},
+            "why": f"'{name}' would not start — looking it up in the app inventory"}
+
+
+def _recover_web_search(params: dict, failed_tool: str) -> dict | None:
+    query = str(params.get("query") or "").strip()
+    words = query.split()
+    if len(words) < 3:
+        return None
+    shorter = " ".join(words[:3])
+    return {"tool": "web_search", "params": {**params, "query": shorter},
+            "why": f"the search failed — retrying it as '{shorter}'"}
+
+
+_RECOVERY = {
+    "open_app": _recover_open_app,
+    "web_search": _recover_web_search,
+    "search": _recover_web_search,
+}
+
+#: Tools later steps usually stand on. When one of these fails, the remaining
+#: steps are only attempted if they do not act on the same target.
+_PREREQUISITE_TOOLS = ("open_app", "close_app", "browser_control")
+
+#: Parameter names that name *what* a step acts on.
+_TARGET_KEYS = ("app_name", "name", "query", "path", "file_path", "source",
+                "url", "urls", "title", "text", "target", "device")
+
+
+def _step_target(step: dict) -> set[str]:
+    """Normalised values a step acts on, for spotting dependent steps."""
+    values: set[str] = set()
+    params = step.get("params") or {}
+    if not isinstance(params, dict):
+        return values
+    for key in _TARGET_KEYS:
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            values.add(re.sub(r"[^a-z0-9]+", " ", value.lower()).strip())
+    return {v for v in values if v}
+
+
+def _depends_on(later: dict, failed: dict) -> bool:
+    """True when `later` looks like it needs the step that just failed."""
+    failed_tool = str(failed.get("tool", "")).lower()
+    if failed_tool not in _PREREQUISITE_TOOLS:
+        return False
+    return bool(_step_target(later) & _step_target(failed))
+
 
 def run_plan(
     goal: str,
@@ -285,13 +345,23 @@ def run_plan(
     tool_names: list[str] | None = None,
     verify_steps: bool = True,
     max_steps: int = 6,
+    task=None,
 ) -> str:
     """Execute `goal` step by step. Returns the spoken-style summary.
 
+    Behaviour, in order:
+
     - one step → run directly, verify, report (no planning ceremony);
-    - several → run in order, verify each, STOP at the first unverified step
-      and say which one failed and what was already done;
+    - several → run in order and verify each;
+    - a step that fails a *ground-truth* check gets one bounded recovery
+      attempt (see :data:`_RECOVERY`) — the agent keeps going on its own;
+    - after that, the remaining steps are still run unless they depend on the
+      failed one; a failed step is never reported as success, and the summary
+      names exactly what did not work;
     - no plan → say so and name what *was* understood, if anything.
+
+    The whole run reports into the central activity registry (``core/tasks``),
+    so the HUD shows progress and can ask it to stop between steps.
     """
     ctx = dict(ctx or {})
     if dispatcher is None:
@@ -305,37 +375,130 @@ def run_plan(
             "Try a single direct command instead."
         )
 
-    done: list[str] = []
-    last_result = ""
-    for i, step in enumerate(steps):
+    total = len(steps)
+    if task is None:
+        title = goal.strip()[:60] or "Multi-step task"
+        task = tasks.start(tasks.KIND_AGENT, title,
+                           detail=f"0/{total} steps planned")
+
+    def _cancelled() -> bool:
+        try:
+            return bool(task.cancel_requested)
+        except Exception:
+            return False
+
+    def _run_step(step: dict) -> tuple[str, Verification]:
         tool, params = step["tool"], step.get("params", {})
         try:
             result = dispatcher.run(tool, params, ctx) or "Done."
         except Exception as e:  # noqa: BLE001 — dispatcher already stringifies;
             result = f"Tool '{tool}' failed: {e}"  # this is the last-resort net
-        last_result = result
         if verify_steps:
-            verdict: Verification = verify(tool, params, result, dispatcher)
+            verdict = verify(tool, params, result, dispatcher)
         else:
             verdict = Verification(True, "verification skipped", method="none")
-        if verdict.ok:
-            done.append(f"{tool}: {verdict.detail}" if verdict.detail else tool)
-            continue
-        # ── stop: never build on an unverified step ──
-        progress = (
-            f"Finished {len(done)} of {len(steps)} steps. "
-            if len(steps) > 1 else ""
-        ) + (f"Done: {'; '.join(done)}. " if done else "")
-        return (
-            f"{progress}Step {i + 1} ('{tool}') did not succeed: "
-            f"{verdict.detail or result[:200]} I stopped there instead of "
-            "continuing on a step that failed."
-        )
+        return result, verdict
 
-    if len(steps) == 1:
-        # A single step is a direct command: report the tool's own words.
-        return last_result or "Done."
-    return f"All {len(steps)} steps done: " + "; ".join(done) + "."
+    done: list[str] = []
+    failed_steps: list[tuple[dict, str, str]] = []   # step, detail, recovery note
+    ran_after_failure: list[str] = []                # steps run despite a failure
+    last_result = ""
+
+    for i, step in enumerate(steps):
+        tool = step["tool"]
+        if _cancelled():
+            task.cancel("Stopped at your request.")
+            progress = (f"Finished {len(done)} of {total} steps. " if done else "")
+            return (f"{progress}Stopped at your request before step {i + 1} "
+                    f"('{tool}'). Nothing else was run.")
+        task.update(detail=f"step {i + 1}/{total}: {tool}", progress=i / total)
+
+        result, verdict = _run_step(step)
+        last_result = result
+        if verdict.ok:
+            entry = f"{tool}: {verdict.detail}" if verdict.detail else tool
+            (ran_after_failure if failed_steps else done).append(entry)
+            continue
+
+        detail = verdict.detail or result[:200]
+        recovery_note = ""
+        # A verified failure (a re-check measured the missing effect, rather
+        # than the tool merely sounding unhappy) is worth one obvious fallback
+        # before the plan gives up on that step.
+        builder = _RECOVERY.get(str(tool).lower()) if verdict.method == "recheck" else None
+        if builder is not None:
+            try:
+                fallback = builder(step.get("params") or {}, tool)
+            except Exception:
+                fallback = None
+            if fallback and str(fallback.get("tool", "")).lower() in available:
+                task.update(detail=f"step {i + 1}/{total}: {fallback['tool']} "
+                                   f"(recovery after {tool} failed)")
+                _, rverdict = _run_step(fallback)
+                # The fallback is *investigation*, not one of the goal's steps:
+                # it is reported in the note and never counted as progress.
+                detail_text = str(rverdict.detail or fallback["tool"]).rstrip(".")
+                if rverdict.ok:
+                    recovery_note = f" I checked further: {detail_text}."
+                else:
+                    recovery_note = (f" I tried {fallback['tool']} as well: "
+                                     f"{detail_text or 'no result'}.")
+        failed_steps.append((step, detail, recovery_note))
+
+        # Do not abandon independent work just because one step failed, and do
+        # not run a step that stands on the failed one (e.g. "close X" after
+        # "open X" failed). Either way the failure is reported as a failure.
+        remaining = steps[i + 1:]
+        if any(_depends_on(later, step) for later in remaining):
+            task.fail(error=f"step {i + 1} ('{tool}') failed",
+                      detail=detail[:160])
+            progress = (
+                f"Finished {len(done)} of {total} steps. "
+                if total > 1 else ""
+            ) + (f"Done: {'; '.join(done)}. " if done else "")
+            return (
+                f"{progress}Step {i + 1} ('{tool}') did not succeed: {detail}"
+                f"{recovery_note} The remaining step(s) need it, so I stopped "
+                f"there instead of pretending the rest could work."
+            )
+
+    if not failed_steps:
+        if total == 1:
+            # A single step is a direct command: report the tool's own words.
+            task.finish(detail="done")
+            return last_result or "Done."
+        task.finish(detail=f"all {total} steps done")
+        return f"All {total} steps done: " + "; ".join(done) + "."
+
+    worked = len(done) + len(ran_after_failure)
+    first_step, first_detail, first_note = failed_steps[0]
+    first_index = steps.index(first_step) + 1
+    names = ", ".join(str(s[0].get("tool")) for s in failed_steps)
+    task.fail(error=f"{len(failed_steps)} step(s) failed: {names}",
+              detail=str(first_detail)[:160])
+
+    if total == 1:
+        return (f"Step 1 ('{first_step['tool']}') did not succeed: {first_detail}"
+                f"{first_note} Nothing else was run.")
+
+    progress = f"Finished {len(done)} of {total} steps. "
+    if not ran_after_failure:
+        # The failure was on the last step (or nothing may be built on it), so
+        # the plan did stop there — same honest wording as before.
+        return (
+            f"{progress}{'Done: ' + '; '.join(done) + '. ' if done else ''}"
+            f"Step {first_index} ('{first_step['tool']}') did not succeed: "
+            f"{first_detail}{first_note} I stopped there instead of continuing "
+            f"on a step that failed."
+        )
+    # Steps that did not depend on the failed one were carried on with, so the
+    # user gets both halves: what worked anyway, and what still needs them.
+    return (
+        f"{worked} of {total} steps worked. Step {first_index} "
+        f"('{first_step['tool']}') did not succeed: {first_detail}{first_note} "
+        f"Carried on with: {'; '.join(ran_after_failure)}. "
+        f"The steps still open: {names}."
+    )
 
 
 def _available(dispatcher) -> list[str]:

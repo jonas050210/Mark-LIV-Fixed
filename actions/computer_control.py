@@ -270,66 +270,17 @@ def _clear_field() -> str:
     return "Field cleared"
 
 def _focus_window(title: str) -> str:
-    os_name = _get_os()
+    """Bring a titled window to the front.
 
-    # The title is interpolated into PowerShell/AppleScript source below: a
-    # quote in it would break out of the string and execute. Reject instead
-    # of escaping — a window title with a quote can be matched by substring
-    # without it, or the user can rephrase.
-    if '"' in title:
-        return "focus_window: title contains an unsupported character"
-
-    if os_name == "windows":
-        try:
-            script = f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")'
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, timeout=5, **_WIN_HIDE,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except Exception as e:
-            return f"focus_window (Windows) failed: {e}"
-
-    if os_name == "mac":
-        script = (
-            f'tell application "System Events" to '
-            f'set frontmost of (first process whose name contains "{title}") to true'
-        )
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except Exception as e:
-            return f"focus_window (macOS) failed: {e}"
-
-    if os_name == "linux":
-        try:
-            result = subprocess.run(
-                ["wmctrl", "-a", title],
-                capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                time.sleep(0.3)
-                return f"Focused window: {title}"
-        except FileNotFoundError:
-            pass
-        try:
-            result = subprocess.run(
-                ["xdotool", "search", "--name", title, "windowactivate"],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except FileNotFoundError:
-            return "focus_window (Linux) requires wmctrl or xdotool"
-        except Exception as e:
-            return f"focus_window (Linux) failed: {e}"
-
-    return f"focus_window: unknown OS '{os_name}'"
+    One implementation, in core/app_controller: the same code serves the
+    window_control tool, so a fix or a refusal here cannot drift from the tool's.
+    """
+    try:
+        from core import app_controller as _ac
+    except Exception as e:
+        return f"focus_window unavailable ({type(e).__name__})."
+    ok, message = _ac.window_action("focus", title=title)
+    return message if ok else f"focus_window failed: {message}"
 
 
 # ── UI Automation semantic helpers (Windows) ──────────────────────────────────

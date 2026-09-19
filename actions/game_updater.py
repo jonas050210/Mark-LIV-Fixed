@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 
 from core import confirm
+from core import install_safety, tasks
 
 from config import get_os, is_windows, is_mac, is_linux
 
@@ -165,18 +166,189 @@ def _get_steam_games(steam_path: Path) -> list[dict]:
                 name     = re.search(r'"name"\s+"([^"]+)"',     content)
                 state    = re.search(r'"StateFlags"\s+"(\d+)"', content)
                 size     = re.search(r'"SizeOnDisk"\s+"(\d+)"', content)
+                # Steam writes these two while it downloads. They are the only
+                # progress numbers anyone outside Steam can see, so the panel
+                # shows them instead of guessing.
+                got      = re.search(r'"BytesDownloaded"\s+"(\d+)"', content)
+                want     = re.search(r'"BytesToDownload"\s+"(\d+)"', content)
                 if app_id and name:
                     games.append({
                         "id":    app_id.group(1),
                         "name":  name.group(1),
                         "state": int(state.group(1)) if state else 0,
                         "size":  int(size.group(1))  if size  else 0,
+                        "downloaded": int(got.group(1))  if got  else 0,
+                        "to_download": int(want.group(1)) if want else 0,
                         "lib":   str(lib),
                         "acf":   str(acf),
                     })
             except Exception:
                 continue
     return games
+
+# ── shared plumbing for every action that changes installed games ─────────────
+# Steam never tells us "done" — the only ground truth is the app manifest on
+# disk, so every claim this module makes is read back out of `_get_steam_games`
+# after the request. The glosses below are only the values this file already
+# acts on; an unknown flag is reported verbatim instead of guessed at.
+_STEAM_STATES = {
+    4: "up to date",
+    6: "update pending",
+    516: "update pending",
+    1026: "downloading",
+}
+
+
+def _steam_state_text(state) -> str:
+    try:
+        return _STEAM_STATES.get(int(state), f"state {state}")
+    except (TypeError, ValueError):
+        return "state unknown"
+
+
+def _steam_entry(steam_path: Path, app_id: str) -> dict | None:
+    """The manifest entry for one AppID, or None when Steam has no such app."""
+    wanted = str(app_id or "").strip()
+    if not wanted:
+        return None
+    try:
+        for game in _get_steam_games(steam_path):
+            if str(game.get("id")) == wanted:
+                return game
+    except Exception:
+        return None
+    return None
+
+
+def _await_steam_state(steam_path: Path, app_id: str, wanted: set[int],
+                       *, timeout: float, task=None,
+                       title: str = "") -> tuple[bool, dict | None, str]:
+    """Poll Steam's manifest until the app reaches one of ``wanted`` states.
+
+    Returns ``(verified, entry, detail)``. Verification is the whole point: a
+    ``steam://`` URL only *asks* Steam to do something, and a launcher that
+    silently declines must not turn into a cheerful "Update started".
+    """
+    seen: dict = {}
+
+    def _probe() -> bool:
+        entry = _steam_entry(steam_path, app_id)
+        if entry is None:
+            if task is not None:
+                task.update(detail=f"waiting for Steam to register {title or app_id}")
+            return False
+        seen.update(entry)
+        if task is not None:
+            task.update(detail=f"{title or app_id}: {_steam_state_text(entry['state'])}")
+        return int(entry.get("state", 0)) in wanted
+
+    ok, why = install_safety.verify(_probe, timeout=timeout, interval=2.0)
+    return ok, (seen or None), why
+
+
+def _steam_bytes(entry: dict) -> tuple[int, int] | None:
+    """(downloaded, total) from Steam's own manifest, or None when absent.
+
+    Old Steam builds and apps that have never downloaded anything do not carry
+    these keys; the caller then reports state without numbers, which is the
+    honest answer rather than a fabricated bar.
+    """
+    try:
+        done = int(entry.get("downloaded") or 0)
+        total = int(entry.get("to_download") or 0)
+    except (TypeError, ValueError):
+        return None
+    if done <= 0 or total <= 0:
+        return None
+    return done, total
+
+
+def _watch_steam_download(steam_path: Path, app_id: str, title: str, task,
+                          *, poll: float = 5.0, timeout_hours: float = 12.0) -> None:
+    """Follow a Steam download to its end, reporting Steam's own numbers.
+
+    The tool returns as soon as Steam has the download queued; the *download*
+    outlives that answer. This runs on its own daemon thread, reads the app
+    manifest every few seconds, and closes the row when Steam itself says the
+    app is up to date — so the panel shows a real percentage, a real speed and
+    a real ETA for as long as the transfer lasts, and never claims it finished
+    early. Nothing here talks to Steam except through the files it writes.
+    """
+    last_t = time.monotonic()
+    last_b: int | None = None
+    last_growth = last_t
+    deadline = last_t + max(0.25, timeout_hours) * 3600
+    while True:
+        try:
+            entry = _steam_entry(steam_path, app_id)
+        except Exception as e:
+            task.fail(error=f"{type(e).__name__}: {e}"[:160],
+                      detail="Steam's manifest became unreadable")
+            return
+        if entry is None:
+            task.fail(error="the app left Steam's library",
+                      detail="it is no longer in the manifests")
+            return
+
+        state = int(entry.get("state", 0) or 0)
+        now = time.monotonic()
+        update: dict = {"detail": f"Steam: downloading {title}"}
+        measured = _steam_bytes(entry)
+        if measured is not None:
+            done, total = measured
+            if last_b is not None and done > last_b:
+                # Speed only from real growth: a manifest that has not moved yet
+                # is not a download running at 0 B/s, it is a sample with no news.
+                update["speed_bps"] = (done - last_b) / max(0.001, now - last_t)
+                last_t, last_b, last_growth = now, done, now
+            elif last_b is None:
+                last_b, last_growth = done, now
+            elif now - last_growth > 30:
+                update["speed_bps"] = 0.0        # genuinely stalled
+            update["done_bytes"] = done
+            update["total_bytes"] = total
+        task.update(**update)
+
+        if state == 4:
+            task.finish(detail="Steam reports the download finished")
+            return
+        if state not in (6, 516, 1026):
+            task.fail(error=f"Steam reports state {state}",
+                      detail="the download stopped")
+            return
+        if time.monotonic() >= deadline:
+            task.fail(error="the download did not finish in time",
+                      detail=f"gave up after {timeout_hours:.0f} h")
+            return
+        time.sleep(poll)
+
+
+def _track_steam_download(task, steam_path: Path, app_id: str, title: str) -> None:
+    """Hand `task` to the download watcher. The row now closes itself."""
+    if task is None or not app_id:
+        return
+    threading.Thread(
+        target=_watch_steam_download,
+        args=(steam_path, str(app_id), title or str(app_id), task),
+        name=f"steam-download-{app_id}",
+        daemon=True,
+    ).start()
+
+
+def _announce(speak, message: str) -> str:
+    """Speak a final sentence once and hand it back.
+
+    The install/update gate runs this on a worker thread after the user pressed
+    CONFIRM, so this is the only place the outcome can still reach them out
+    loud — `main.speak` is built for exactly that (see actions/timer.py).
+    """
+    if speak and message:
+        try:
+            speak(message)
+        except Exception:
+            pass
+    return message
+
 
 def _is_steam_running() -> bool:
     try:
@@ -520,60 +692,17 @@ def _search_steam_appid(game_name: str) -> tuple[str | None, str | None]:
 
     return None, None
 
-def _update_steam_games(steam_path: Path, game_name: str = None) -> str:
-    if not _ensure_steam_running(steam_path):
-        return "Could not start Steam."
-
-    exe   = _steam_exe(steam_path)
-    games = _get_steam_games(steam_path)
-    if not games:
-        return "No Steam games found."
-
-    if game_name:
-        name_lower = game_name.lower()
-        targets    = [g for g in games if name_lower in g["name"].lower()]
-        if not targets:
-            available = ", ".join(g["name"] for g in games[:5])
-            return f"Game '{game_name}' not found. Installed: {available}..."
-    else:
-        targets = games
-
-    already_updated, already_running, update_started, errors = [], [], [], []
-
-    for game in targets:
-        state = game["state"]
-        name  = game["name"]
-        if state == 4:
-            already_updated.append(name)
-        elif state == 1026:
-            already_running.append(name)
-        else:
-            try:
-                _launch_steam_url(exe, f"steam://update/{game['id']}")
-                update_started.append(name)
-                time.sleep(0.3)
-            except Exception as e:
-                errors.append(f"{name}: {e}")
-
-    parts = []
-    if update_started:
-        names  = ", ".join(update_started[:3])
-        suffix = f" and {len(update_started) - 3} more" if len(update_started) > 3 else ""
-        parts.append(f"Update started for: {names}{suffix}.")
-    if already_running:
-        parts.append(f"Already updating: {', '.join(already_running)}.")
-    if already_updated:
-        parts.append(
-            f"{already_updated[0]} is already up to date."
-            if game_name else
-            f"{len(already_updated)} game(s) already up to date."
-        )
-    if errors:
-        parts.append(f"Errors: {'; '.join(errors)}.")
-    return " ".join(parts) if parts else "No games to update."
-
 def _install_steam_game(steam_path: Path, game_name: str = None,
-                        app_id: str = None) -> str:
+                        app_id: str = None, speak=None,
+                        wait_seconds: float = 30.0) -> str:
+    """Ask Steam to install a game and *verify* that Steam picked it up.
+
+    The launch below is only a request: Steam can still open a "where should
+    this go?" dialog that a human has to answer, or ignore the URL entirely.
+    The manifest file is the ground truth, so success is only claimed once the
+    AppID shows up in it — otherwise the honest "could not verify" sentence is
+    returned instead (the caller has already taken the user's confirmation).
+    """
     if not _ensure_steam_running(steam_path):
         return "Could not start Steam."
 
@@ -609,8 +738,14 @@ def _install_steam_game(steam_path: Path, game_name: str = None,
                     f"Try providing the AppID directly.")
         app_id    = found_id
         game_name = found_name or game_name
-        print(f"[GameUpdater] 🔍 Kuruluyor: {game_name} (AppID: {app_id})")
+        print(f"[GameUpdater] install request: {game_name} (AppID: {app_id})")
 
+    task = tasks.start(
+        tasks.KIND_INSTALL,
+        f"Install {game_name or app_id}",
+        detail="asking Steam to open the install dialog",
+        app_id=str(app_id),
+    )
     try:
         _launch_steam_url(exe, f"steam://install/{app_id}")
 
@@ -620,9 +755,138 @@ def _install_steam_game(steam_path: Path, game_name: str = None,
                 args=(game_name or str(app_id),),
                 daemon=True
             ).start()
-        return f"Install started for '{game_name}'. Steam will open the download dialog."
+
+        # A queued download appears in the manifest within seconds; a dialog
+        # that nobody answers never does, and that must be said out loud.
+        ok, entry, why = _await_steam_state(
+            steam_path, app_id, {4, 6, 516, 1026},
+            timeout=wait_seconds, task=task, title=game_name or str(app_id),
+        )
+        if ok and entry is not None:
+            state = int(entry.get("state", 0))
+            name = entry.get("name") or game_name or app_id
+            if state == 1026:
+                # The tool is done; the download is not. The row stays open and
+                # follows Steam's manifest to the end (see _watch_steam_download).
+                _track_steam_download(task, steam_path, app_id, name)
+                return f"Steam is downloading '{name}' now."
+            if state == 4:
+                sentence = f"'{name}' is installed and up to date."
+            else:
+                sentence = (f"Steam has '{name}' queued "
+                            f"({_steam_state_text(state)}).")
+            task.finish(detail=f"{name}: {_steam_state_text(state)}")
+            return sentence
+
+        task.fail(error="Steam did not start the download",
+                  detail=f"no manifest entry for AppID {app_id} appeared")
+        return install_safety.unverified(
+            "install", game_name or str(app_id),
+            "Steam accepted my request") + (
+            " (If a Steam window is asking where to install it, answering that "
+            "window is what starts the download.)")
     except Exception as e:
+        task.fail(error=f"{type(e).__name__}: {e}")
         return f"Install failed: {e}"
+
+
+def _update_steam_games(steam_path: Path, game_name: str = None,
+                        wait_seconds: float = 15.0) -> str:
+    """Trigger Steam updates and report only what the manifests confirm."""
+    if not _ensure_steam_running(steam_path):
+        return "Could not start Steam."
+
+    exe   = _steam_exe(steam_path)
+    games = _get_steam_games(steam_path)
+    if not games:
+        return "No Steam games found."
+
+    if game_name:
+        name_lower = game_name.lower()
+        targets    = [g for g in games if name_lower in g["name"].lower()]
+        if not targets:
+            available = ", ".join(g["name"] for g in games[:5])
+            return f"Game '{game_name}' not found. Installed: {available}..."
+    else:
+        targets = games
+
+    task = tasks.start(
+        tasks.KIND_UPDATE,
+        f"Update {game_name}" if game_name else f"Update {len(targets)} Steam game(s)",
+        detail="checking Steam for updates",
+        games=len(targets),
+    )
+
+    already_updated, already_running = [], []
+    verified, unverified, errors = [], [], []
+    watching = False          # one download is followed by the watcher thread
+
+    for index, game in enumerate(targets, start=1):
+        state = game["state"]
+        name  = game["name"]
+        task.update(progress=(index - 1) / max(1, len(targets)),
+                    detail=f"checking {name} ({index}/{len(targets)})")
+        if state == 4:
+            already_updated.append(name)
+            continue
+        if state == 1026:
+            already_running.append(name)
+            if len(targets) == 1:
+                # A single game was asked for: report its own numbers until
+                # Steam says it is done, instead of closing the row now.
+                _track_steam_download(task, steam_path, game["id"], name)
+                watching = True
+            continue
+        try:
+            _launch_steam_url(exe, f"steam://update/{game['id']}")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            continue
+        # `steam://update/…` is a request, not a result. The manifest decides:
+        # 1026 means Steam is downloading it now, 4 means it is finished (or
+        # was already current). Anything else stays unverified on purpose.
+        ok, entry, _why = _await_steam_state(
+            steam_path, game["id"], {4, 1026},
+            timeout=wait_seconds, task=task, title=name,
+        )
+        if ok and entry is not None:
+            verified.append(f"{name} ({_steam_state_text(entry.get('state'))})")
+            if int(entry.get("state", 0) or 0) == 1026 and len(targets) == 1:
+                _track_steam_download(task, steam_path, game["id"], name)
+                watching = True
+        else:
+            unverified.append(name)
+
+    parts = []
+    if verified:
+        names  = ", ".join(verified[:3])
+        suffix = f" and {len(verified) - 3} more" if len(verified) > 3 else ""
+        parts.append(f"Steam confirmed updates for: {names}{suffix}.")
+    if already_running:
+        parts.append(f"Already updating: {', '.join(already_running)}.")
+    if already_updated:
+        parts.append(
+            f"{already_updated[0]} is already up to date."
+            if game_name else
+            f"{len(already_updated)} game(s) already up to date."
+        )
+    if unverified:
+        names = ", ".join(unverified[:3])
+        suffix = f" (+{len(unverified) - 3} more)" if len(unverified) > 3 else ""
+        parts.append(install_safety.unverified(
+            "update", f"{names}{suffix}", "Steam accepted my request"))
+    if errors:
+        parts.append(f"Errors: {'; '.join(errors)}.")
+
+    if unverified or errors:
+        task.fail(error=f"{len(unverified)} update(s) could not be verified",
+                  detail="; ".join(unverified[:3]) or "launch error")
+    elif watching:
+        # The download watcher owns this row; it closes when Steam says done.
+        pass
+    else:
+        task.finish(detail=f"{len(verified)} update(s) confirmed by Steam")
+    return " ".join(parts) if parts else "No games to update."
 
 def _get_download_status(steam_path: Path) -> str:
     games   = _get_steam_games(steam_path)
@@ -679,29 +943,56 @@ def _arm_auto_shutdown(steam_path: Path, speak=None) -> str:
 
 def _watch_and_shutdown(steam_path: Path, speak=None,
                         check_interval: int = 30, timeout_hours: int = 12):
-    print("[GameUpdater]...")
+    """Power the machine off once Steam reports no download left.
+
+    The watcher reports itself in the activity panel for its whole lifetime —
+    an armed auto-shutdown the user cannot see is a nasty surprise. Every exit
+    path says out loud what happened, including "the download never started",
+    which used to return silently and leave a person waiting for a shutdown
+    that was never going to come.
+    """
+    print("[GameUpdater] watch-and-shutdown armed")
+    task = tasks.start(tasks.KIND_TASK, "Shut down after the download",
+                       detail="watching Steam for the download to start")
     deadline = time.time() + timeout_hours * 3600
+
+    def _downloading() -> list[dict]:
+        try:
+            return [g for g in _get_steam_games(steam_path) if g["state"] == 1026]
+        except Exception:
+            return []
 
     for _ in range(24):
         time.sleep(5)
-        active = [g for g in _get_steam_games(steam_path) if g["state"] == 1026]
+        active = _downloading()
         if active:
             names = ", ".join(g["name"] for g in active)
+            task.update(detail=f"downloading {names}", progress=None)
             if speak:
                 speak(f"Download started for {names}. I'll shut down when done.")
             break
     else:
-        return  
+        task.fail(error="no download started",
+                  detail="nothing was downloading after two minutes")
+        if speak:
+            speak("Nothing started downloading, so the computer stays on — "
+                  "the auto-shutdown was cancelled.")
+        return
 
     while time.time() < deadline:
         time.sleep(check_interval)
-        if not any(g["state"] == 1026 for g in _get_steam_games(steam_path)):
+        active = _downloading()
+        if not active:
             if speak:
                 speak("Download complete. Shutting down now.")
+            task.finish(detail="download finished — shutting down")
             time.sleep(5)
             _system_shutdown()
             return
+        task.update(detail="downloading " + ", ".join(g["name"] for g in active))
 
+    task.fail(error="download did not finish in time",
+              detail=f"gave up after {timeout_hours} h")
     if speak:
         speak("Download taking too long. Cancelling auto-shutdown.")
 
@@ -832,7 +1123,13 @@ def _update_epic_games(epic_exe: Path, game_name: str = None) -> str:
                         subprocess.Popen([str(epic_exe),
                             f"com.epicgames.launcher://apps/{g['id']}?action=launch&silent=true"])
                         time.sleep(0.5)
-                    return f"Triggered update check for {len(games)} Epic game(s)."
+                    # Epic exposes no per-game download state to other programs,
+                    # so "triggered update for N games" would be a claim nobody
+                    # can check. Say what was actually done instead.
+                    return (f"Asked the Epic Games Launcher to open {len(games)} "
+                            f"game(s); Epic does not report download state to "
+                            f"other apps, so I cannot confirm any of them "
+                            f"started. Check the launcher's Downloads page.")
                 else:
                     subprocess.Popen([str(epic_exe)])
             count = len(games)
@@ -1036,59 +1333,84 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
         return " ".join(results)
 
     if action in ("install", "update"):
-        if platform in ("steam", "both"):
-            steam_path = _find_steam_path()
-            if not steam_path:
-                results.append("Steam: Not installed.")
-            else:
-                if game_name:
-                    installed  = _get_steam_games(steam_path)
-                    name_lower = game_name.lower()
-                    is_installed = any(
-                        name_lower in g["name"].lower() for g in installed
-                    )
-                    if not is_installed:
-                        msg = _install_steam_game(
-                            steam_path, game_name=game_name, app_id=app_id
-                        )
-                        if shutdown:
-                            msg += " " + _arm_auto_shutdown(steam_path, speak=speak)
-                        if player: player.write_log(f"[GameUpdater] {msg[:100]}")
-                        if speak:  speak(msg)
-                        return msg
-                    else:
-                        results.append(
-                            f"Steam: {_update_steam_games(steam_path, game_name=game_name)}"
-                        )
-                else:
-                    if action == "install":
-                        results.append("Steam: Please specify a game name to install.")
-                    else:
-                        results.append(f"Steam: {_update_steam_games(steam_path)}")
+        if action == "install" and not (game_name or app_id):
+            return "Steam: Please specify a game name to install."
 
-                if shutdown:
-                    results.append(_arm_auto_shutdown(steam_path, speak=speak))
-
-        if platform in ("epic", "both"):
-            if is_linux():
-                results.append(
-                    "Epic: Not natively supported on Linux. Use Heroic Launcher."
-                )
-            else:
-                epic_exe = _find_epic_exe()
-                if epic_exe:
-                    results.append(
-                        f"Epic: {_update_epic_games(epic_exe, game_name=game_name)}"
-                    )
-                else:
-                    results.append("Epic: Not installed.")
-
-        output = " | ".join(results) or "Nothing to do."
-        if player: player.write_log(f"[GameUpdater] {output[:100]}")
-        if speak:  speak(output)
-        return output
+        # Installing or updating a game writes to disk and pulls hundreds of
+        # megabytes, so it goes through the same gate as every other install in
+        # the app (core/install_safety.py): the human presses CONFIRM on the
+        # HUD, the work then runs on the confirmation worker and reports its
+        # verified outcome out loud. `steam://` URLs are a request to Steam,
+        # never a result — core/install_safety.verify() reads the manifests.
+        request = install_safety.InstallRequest(
+            kind=(install_safety.KIND_INSTALL if action == "install"
+                  else install_safety.KIND_UPDATE),
+            target=game_name or app_id or f"{platform} game libraries",
+            detail=(f"Steam/Epic will download or update "
+                    f"{game_name or app_id or 'all installed games'} on this "
+                    f"machine."),
+            source="user",
+            origin="game_updater",
+        )
+        return install_safety.guard(
+            request,
+            run=lambda: _announce(speak, _perform_install_or_update(
+                action, platform, game_name, app_id, shutdown, speak, player)),
+            key=f"game_{action}",
+        )
 
     return f"Unknown action: '{action}'."
+
+
+def _perform_install_or_update(action: str, platform: str, game_name: str | None,
+                               app_id: str | None, shutdown: bool,
+                               speak=None, player=None) -> str:
+    """The confirmed half of install/update: do it, then report what happened."""
+    results = []
+
+    if platform in ("steam", "both"):
+        steam_path = _find_steam_path()
+        if not steam_path:
+            results.append("Steam: Not installed.")
+        else:
+            if game_name:
+                installed  = _get_steam_games(steam_path)
+                name_lower = game_name.lower()
+                is_installed = any(
+                    name_lower in g["name"].lower() for g in installed
+                )
+                if not is_installed:
+                    msg = _install_steam_game(
+                        steam_path, game_name=game_name, app_id=app_id
+                    )
+                    if shutdown:
+                        msg += " " + _arm_auto_shutdown(steam_path, speak=speak)
+                    if player: player.write_log(f"[GameUpdater] {msg[:100]}")
+                    return msg
+                results.append(_update_steam_games(steam_path, game_name=game_name))
+            else:
+                results.append(_update_steam_games(steam_path))
+
+            if shutdown:
+                results.append(_arm_auto_shutdown(steam_path, speak=speak))
+
+    if platform in ("epic", "both"):
+        if is_linux():
+            results.append(
+                "Epic: Not natively supported on Linux. Use Heroic Launcher."
+            )
+        else:
+            epic_exe = _find_epic_exe()
+            if epic_exe:
+                results.append(
+                    f"Epic: {_update_epic_games(epic_exe, game_name=game_name)}"
+                )
+            else:
+                results.append("Epic: Not installed.")
+
+    output = " | ".join(results) or "Nothing to do."
+    if player: player.write_log(f"[GameUpdater] {output[:100]}")
+    return output
 
 
 if __name__ == "__main__":

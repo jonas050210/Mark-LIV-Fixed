@@ -282,9 +282,14 @@ _EXE_HINTS: dict[str, list[str]] = {
     "gimp": ["gimp"], "handbrake": ["handbrake"],
 }
 
+#: URI schemes the Roblox website itself uses to start the player. Only ever
+#: handed to the launcher for an already-resolved Roblox target (see
+#: launch_alternatives) — never taken from model text.
+_ROBLOX_PROTOCOLS = ("roblox-player:", "roblox:")
+
 # Bare protocols the model may name. Anchored single-token schemes only — no
-# "://", no payload — so nothing can be smuggled after the colon.
-_PROTOCOL_ALLOWLIST = frozenset({"ms-settings:"})
+# "://", no payload, no ticket — so nothing can be smuggled after the colon.
+_PROTOCOL_ALLOWLIST = frozenset({"ms-settings:", *_ROBLOX_PROTOCOLS})
 
 # Strict shapes for launcher URLs we CONSTRUCT ourselves (never from model text).
 _STEAM_URL_RE = re.compile(r"^steam://rungameid/(\d{1,12})$")
@@ -657,8 +662,24 @@ def _uninstall_entries() -> list[dict]:
                                 ver, _ = winreg.QueryValueEx(appk, "DisplayVersion")
                             except OSError:
                                 ver = ""
+                            uninstall = ""
+                            for value in ("QuietUninstallString",
+                                          "UninstallString"):
+                                try:
+                                    raw, _ = winreg.QueryValueEx(appk, value)
+                                except OSError:
+                                    continue
+                                if raw:
+                                    uninstall = str(raw)
+                                    break
+                            try:
+                                pub, _ = winreg.QueryValueEx(appk, "Publisher")
+                            except OSError:
+                                pub = ""
                             out.append({"name": str(name), "location": str(loc or ""),
-                                        "version": str(ver or "")})
+                                        "version": str(ver or ""),
+                                        "uninstall": uninstall,
+                                        "publisher": str(pub or "")})
                     except OSError:
                         continue
         except OSError:
@@ -666,26 +687,325 @@ def _uninstall_entries() -> list[dict]:
     return out
 
 
+# ── Uninstallers ──────────────────────────────────────────────────────────────
+# "Remove X" may only ever run a *vendor-registered* uninstaller: the command
+# comes out of the Windows Uninstall registry (the same source the Control Panel
+# uses), out of an .app bundle on macOS, or — when neither exists — nothing
+# happens and the refusal says so. The parsed command is shown to the user in
+# the confirmation banner before anything runs, because the one thing that must
+# not happen here is a silent "remove()" against a path a human never saw.
+
+#: Generic interpreters/DLL hosts. A registry entry pointing at one of these is
+#: not a real uninstaller, and running it would hand arbitrary strings to a
+#: shell — refuse instead (quietly honest: "I found no reliable uninstaller").
+_SHELL_HOSTS = frozenset({
+    "cmd.exe", "command.com", "powershell.exe", "pwsh.exe", "wscript.exe",
+    "cscript.exe", "mshta.exe", "rundll32.exe", "reg.exe", "regedit.exe",
+    "sc.exe", "net.exe", "netsh.exe", "taskkill.exe", "wmic.exe", "curl.exe",
+    "bitsadmin.exe", "certutil.exe", "forfiles.exe", "ieexec.exe",
+    "bash", "sh", "zsh", "ksh", "csh", "fish", "sudo", "su",
+    "python", "python3", "python.exe", "py.exe", "perl", "ruby",
+    "osascript", "open", "env", "xargs", "find", "awk", "sed",
+})
+
+#: Windows binaries that must be looked up in %SystemRoot%\System32 rather
+#: than trusted from the string as-is.
+_SYSTEM_UNINSTALLERS = frozenset({"msiexec.exe"})
+
+
+@dataclass
+class UninstallPlan:
+    """One resolvable way to remove an app, with where it came from."""
+
+    name: str                  # app name as the vendor registered it
+    exe: str                   # absolute path of the uninstaller
+    args: tuple = ()           # arguments registered next to it (argv, no shell)
+    source: str = ""           # which local source produced this
+    location: str = ""         # install location, when the vendor recorded one
+    detail: str = ""
+
+    def command_line(self) -> str:
+        parts = [f'"{self.exe}"' if " " in self.exe else self.exe]
+        parts.extend(self.args)
+        return " ".join(parts)
+
+
+def split_command(command: str) -> tuple[str, tuple[str, ...]] | None:
+    """Split a registered command line into ``(exe, args)``, quote-aware.
+
+    Windows registries store these as one string; ``shlex`` (posix=False) keeps
+    the quotes out of the tokens while still honouring quoted paths with spaces.
+    Returns None when nothing usable is in there.
+    """
+    text = str(command or "").strip()
+    if not text:
+        return None
+    try:
+        parts = shlex.split(text, posix=False)
+    except ValueError:
+        return None
+    parts = [p.strip().strip('"') for p in parts if p and p.strip()]
+    if not parts:
+        return None
+    return parts[0], tuple(parts[1:])
+
+
+def parse_uninstall_command(command: str) -> tuple[str, tuple[str, ...]] | None:
+    """``(exe, args)`` for a registry uninstall command, or None when unusable.
+
+    Accepted: an existing executable that is either a Windows installer service
+    (``msiexec.exe``) or visibly an uninstall/repair program — its own name
+    matches the installer/updater pattern, or the command mentions uninstall.
+    Refused: shell/interpreter hosts, relative paths, and files that are not
+    there. Pure string handling plus ``Path.exists``, so it is testable off
+    Windows.
+    """
+    parsed = split_command(command)
+    if parsed is None:
+        return None
+    exe, args = parsed
+    base = Path(exe).name.lower()
+    if base in _SHELL_HOSTS:
+        return None
+
+    resolved = exe
+    if base in _SYSTEM_UNINSTALLERS and not Path(exe).is_absolute():
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        cand = Path(system_root) / "System32" / base
+        resolved = str(cand)
+    elif not Path(exe).is_absolute() and _IS_WIN and base in _SYSTEM_UNINSTALLERS:
+        return None
+    if not Path(resolved).exists():
+        return None
+
+    joined = " ".join((base,) + args).lower()
+    if base in _SYSTEM_UNINSTALLERS:
+        # msiexec must be told to remove (/x or /uninstall) — never to run a
+        # script (/s) or a DLL, which is what a poisoned entry would use.
+        if not any(a.lower().startswith(("/x", "/uninstall")) for a in args):
+            return None
+        return resolved, args
+    if base == "steam.exe" or "steam://uninstall/" in joined:
+        # Steam games uninstall through Steam itself (protocol or --uninstall).
+        return resolved, args
+    from core.install_safety import is_installer_target
+
+    if is_installer_target(base) or "uninstall" in joined or "unins" in joined:
+        return resolved, args
+    return None
+
+
+def _match_uninstall_entry(name: str, entries: list[dict]) -> dict | None:
+    """Best DisplayName match: exact, then word-prefix, then containment."""
+    want = re.sub(r"\s+", " ", str(name or "").strip()).casefold()
+    if not want:
+        return None
+    def _has_uninstaller(entry: dict) -> bool:
+        return bool(entry.get("uninstall"))
+
+    exact = [e for e in entries if str(e.get("name", "")).casefold() == want]
+    for entry in exact:
+        if _has_uninstaller(entry):
+            return entry
+    for entry in entries:
+        if not _has_uninstaller(entry):
+            continue
+        got = str(entry.get("name", "")).casefold()
+        if got.startswith(want) or want.startswith(got):
+            return entry
+    for entry in entries:
+        if not _has_uninstaller(entry):
+            continue
+        got = str(entry.get("name", "")).casefold()
+        if want in got or got in want:
+            return entry
+    return None
+
+
+def find_uninstaller(name: str, target=None) -> UninstallPlan | None:
+    """The vendor's own way to remove `name`, or None when there is none.
+
+    None is a real answer and the callers say so: an unpacked folder, a portable
+    build or a store app has no uninstaller this code can run safely, and
+    guessing (deleting the install directory) is not an uninstall.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+
+    if _IS_WIN:
+        entries = _uninstall_entries()
+        if not entries:
+            return None
+        entry = _match_uninstall_entry(raw, entries)
+        if entry is None and target is not None:
+            # Fall back to the install location: the entry whose folder contains
+            # the resolved executable is the app's own, whatever its DisplayName.
+            try:
+                tpath = Path(str(getattr(target, "target", "") or "")).resolve()
+            except Exception:
+                tpath = None
+            if tpath is not None:
+                for candidate in entries:
+                    loc = str(candidate.get("location") or "").strip()
+                    if not loc or not candidate.get("uninstall"):
+                        continue
+                    try:
+                        Path(loc).resolve()
+                        if tpath.is_relative_to(Path(loc).resolve()):
+                            entry = candidate
+                            break
+                    except Exception:
+                        continue
+        if entry is None:
+            return None
+        parsed = parse_uninstall_command(str(entry.get("uninstall") or ""))
+        if parsed is None:
+            return None
+        exe, args = parsed
+        return UninstallPlan(
+            name=str(entry.get("name") or raw),
+            exe=exe, args=args, source="Windows uninstall registry",
+            location=str(entry.get("location") or ""),
+            detail=f"uninstaller registered by {entry.get('publisher') or 'the vendor'}",
+        )
+
+    if _IS_MAC:
+        apps = _mac_apps()
+        want = str(raw).strip().casefold()
+        for app_name, path in apps.items():
+            got = str(app_name).strip().casefold()
+            if got == want or want in got or got in want:
+                bundle = Path(path)
+                if bundle.exists() and bundle.suffix == ".app":
+                    # Moving a bundle to the Trash is the documented user-level
+                    # uninstall on macOS, and it is reversible by the user.
+                    return UninstallPlan(
+                        name=str(app_name), exe=str(bundle), args=(),
+                        source="macOS application bundle",
+                        location=str(bundle.parent),
+                        detail="moved to the Trash (its files under ~/Library stay)",
+                    )
+        return None
+
+    # Linux: package-managed installs need root and a distribution-specific
+    # command, and there is no user-level uninstaller to run. Rather than
+    # deleting directories and calling it uninstalled, say so (the tool does).
+    return None
+
+
+# ── Roblox ────────────────────────────────────────────────────────────────────
+# Roblox keeps several installed builds side by side under
+# %LOCALAPPDATA%\Roblox\Versions, and *only one of them is the live one*. The
+# registry records which: the roblox-player protocol handler points at the
+# currently deployed player, and the Environments key names the version folder.
+# Picking the newest directory by mtime instead (the old behaviour) can launch a
+# half-updated or superseded build, which exits immediately — the "Roblox starts
+# and vanishes" failure. So: registry first, directory scan as the fallback.
+
+_ROBLOX_PLAYER_EXE = "RobloxPlayerBeta.exe"
+_ROBLOX_STUDIO_EXE = "RobloxStudioBeta.exe"
+_ROBLOX_LAUNCHER = "RobloxPlayerLauncher.exe"
+
+
+def parse_registered_command(command: str) -> str | None:
+    """Executable path out of a registry command line, or None.
+
+    Windows stores protocol handlers as ``"C:\\...\\RobloxPlayerBeta.exe" -protocol "%1"``.
+    Only the quoted (or first-token) executable is returned — the arguments are
+    deliberately dropped, because nothing here should ever execute them.
+    Pure string handling, so it is testable off Windows.
+    """
+    text = str(command or "").strip()
+    if not text:
+        return None
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end > 1:
+            return text[1:end]
+        return None
+    first = text.split(" ", 1)[0]
+    return first or None
+
+
+def _winreg_value(hive_name: str, key_path: str, value: str = "") -> str | None:
+    """Read one registry value (string), or None. Windows-only, never raises."""
+    if not _IS_WIN:
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    hive = getattr(winreg, hive_name, None)
+    if hive is None:
+        return None
+    try:
+        with winreg.OpenKey(hive, key_path) as key:
+            data, _kind = winreg.QueryValueEx(key, value)
+        return str(data or "").strip() or None
+    except Exception:
+        return None
+
+
+def _roblox_registered_exe(studio: bool = False) -> str | None:
+    """The build Windows currently has registered for Roblox, or None.
+
+    Two independent records are consulted; either is enough. Both are validated
+    against the expected exe name and the file actually existing, so a stale
+    registry entry cannot send the launch somewhere wrong.
+    """
+    want = _ROBLOX_STUDIO_EXE if studio else _ROBLOX_PLAYER_EXE
+    protocol = "roblox-studio" if studio else "roblox-player"
+
+    command = _winreg_value("HKEY_CLASSES_ROOT",
+                            rf"{protocol}\shell\open\command")
+    exe = parse_registered_command(command or "")
+    if exe and Path(exe).name.lower() == want.lower() and Path(exe).exists():
+        return exe
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    version = _winreg_value(
+        "HKEY_CURRENT_USER",
+        rf"SOFTWARE\Roblox Corporation\Environments\{protocol}",
+        "Version",
+    )
+    if local and version:
+        candidate = Path(local) / "Roblox" / "Versions" / version / want
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            return None
+    return None
+
+
+def _roblox_version_dirs() -> list[Path]:
+    """Installed Roblox version directories, newest first (may be empty)."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not (_IS_WIN and local):
+        return []
+    versions = Path(local) / "Roblox" / "Versions"
+    if not versions.is_dir():
+        return []
+    try:
+        return sorted((d for d in versions.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+
+
 def _find_roblox_exe(studio: bool = False) -> str | None:
-    """Installed Roblox exe (player or studio), newest Versions dir first.
+    """Installed Roblox exe (player or studio), registered build first.
 
     Both live in the same %LOCALAPPDATA%\\Roblox\\Versions tree - the scan is
     shared, only the file name differs. No shortcut fallback: this is the
     direct-exe check that resolve() prefers over any launcher stub.
     """
-    local = os.environ.get("LOCALAPPDATA", "")
-    if not (_IS_WIN and local):
-        return None
-    versions = Path(local) / "Roblox" / "Versions"
-    if not versions.is_dir():
-        return None
-    try:
-        dirs = sorted((d for d in versions.iterdir() if d.is_dir()),
-                      key=lambda d: d.stat().st_mtime, reverse=True)
-    except Exception:
-        return None
-    want = "RobloxStudioBeta.exe" if studio else "RobloxPlayerBeta.exe"
-    for d in dirs:
+    want = _ROBLOX_STUDIO_EXE if studio else _ROBLOX_PLAYER_EXE
+    registered = _roblox_registered_exe(studio=studio)
+    if registered:
+        return registered
+    for d in _roblox_version_dirs():
         exe = d / want
         try:
             if exe.exists():
@@ -693,6 +1013,82 @@ def _find_roblox_exe(studio: bool = False) -> str | None:
         except OSError:
             continue
     return None
+
+
+def launch_alternatives(tgt) -> list["LaunchTarget"]:
+    """Fallback launch strategies for a target, best first (may be empty).
+
+    Only Roblox defines them today, and for a concrete reason: the player can
+    be started three legitimate ways (deployed exe, the launcher stub beside
+    it, the registered protocol handler) and which one works depends on the
+    state of its self-updater. Trying them in order — each verified by the
+    caller before the next — turns a dead end into a diagnosis.
+    """
+    out: list[LaunchTarget] = []
+    try:
+        target = str(getattr(tgt, "target", "") or "")
+        display = str(getattr(tgt, "display", "") or "")
+        studio = "studio" in display.lower() or _ROBLOX_STUDIO_EXE.lower() in target.lower()
+        if "roblox" not in target.lower() and "roblox" not in display.lower():
+            return out
+        if studio:
+            return out      # Studio has one exe and no launcher stub to fall back to
+
+        current = Path(target).name.lower() if target else ""
+        player = _find_roblox_exe(studio=False)
+
+        # 1) The launcher stub next to the player: it syncs the install first,
+        #    then hands off to the player — the path Roblox's own website uses.
+        if current != _ROBLOX_LAUNCHER.lower() and target and Path(target).parent:
+            stub = Path(target).parent / _ROBLOX_LAUNCHER
+            try:
+                if stub.exists():
+                    out.append(LaunchTarget(kind="roblox", display=display or "Roblox Player",
+                                            target=str(stub), source="Roblox launcher"))
+            except OSError:
+                pass
+
+        # 2) The deployed player, when we were pointed at a shortcut or stub.
+        if player and Path(player).name.lower() != current:
+            out.append(LaunchTarget(kind="roblox", display=display or "Roblox Player",
+                                    target=player, source="Roblox install"))
+
+        # 3) The registered protocol handler — a last resort that also works
+        #    when the exe layout changed under us.
+        for protocol in _ROBLOX_PROTOCOLS:
+            if _is_protocol_registered(protocol):
+                out.append(LaunchTarget(kind="protocol", display=display or "Roblox Player",
+                                        target=protocol, source="protocol"))
+                break
+    except Exception:
+        return out[:2]
+    return out[:3]
+
+
+def _is_protocol_registered(protocol: str) -> bool:
+    """True when Windows has a handler for this URI scheme."""
+    if not _IS_WIN:
+        return False
+    return bool(_winreg_value("HKEY_CLASSES_ROOT", rf"{protocol}\shell\open\command"))
+
+
+def launch_hint(tgt, vanished: bool = False) -> str:
+    """One actionable sentence about *why* a launch did not stick."""
+    try:
+        target = str(getattr(tgt, "target", "") or "").lower()
+        display = str(getattr(tgt, "display", "") or "")
+    except Exception:
+        return ""
+    if "roblox" not in target and "roblox" not in display.lower():
+        return ""
+    if vanished:
+        return ("Roblox started and exited immediately. That usually means the "
+                "build it launched is stale or superseded — Roblox only accepts "
+                "its currently deployed version. Start Roblox once by hand (or "
+                "from roblox.com) so it can update itself, then I can open it again.")
+    return ("Roblox did not stay running. Check Task Manager for a hidden "
+            "RobloxPlayerBeta.exe from an earlier attempt, and start Roblox once "
+            "by hand so its updater can finish.")
 
 
 def _find_roblox() -> str | None:
@@ -1004,6 +1400,10 @@ def diagnose_launch_error(exc: BaseException, tgt=None) -> str:
             if target and "roblox" in target.lower() and "player" in text.lower():
                 return ("Roblox's launcher stub failed its handoff to the player. "
                         "If this repeats, start Roblox once by hand so it can update itself.")
+            hint = launch_hint(tgt)
+            if hint and ("roblox" in target.lower()
+                         or "roblox" in str(getattr(tgt, "display", "")).lower()):
+                return hint
         if len(text) > 220:
             text = text[:220] + "…"
         return text
@@ -1023,7 +1423,9 @@ def launch(tgt: LaunchTarget) -> tuple[bool, str]:
         if tgt.kind == "protocol":
             if tgt.target not in _PROTOCOL_ALLOWLIST:
                 return False, "That system shortcut is not allowed."
-            os.startfile(tgt.target)  # noqa: Windows-only branch, guarded below
+            if not _IS_WIN:
+                return False, f"{tgt.display} needs its Windows handler."
+            os.startfile(tgt.target)  # noqa: S606 — allowlisted scheme, Windows only
             return True, f"Opened {tgt.display}."
 
         if tgt.kind in ("steam", "epic", "uwp"):
@@ -1050,6 +1452,13 @@ def launch(tgt: LaunchTarget) -> tuple[bool, str]:
             flags: dict = {}
             if _IS_WIN:
                 flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                # Roblox resolves its own DLLs and update files relative to the
+                # build directory, so it must be started WITH that directory as
+                # the working directory. Handing it the assistant's cwd is one
+                # of the documented causes of "the player starts and vanishes".
+                parent = Path(tgt.target).parent
+                if "roblox" in Path(tgt.target).name.lower() and parent.is_dir():
+                    flags["cwd"] = str(parent)
             subprocess.Popen([tgt.target, *tgt.args], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL, **flags)

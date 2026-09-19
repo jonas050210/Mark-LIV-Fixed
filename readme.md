@@ -149,6 +149,11 @@ The **limits** half is the important one: it knows its sight is a single frame o
 All prompt wording lives in `core/prompt.txt` with `{tokens}` the app fills in — so you can rewrite the personality without touching Python, and a stray brace in your own wording can't break startup.
 
 ### 🩹 Fixes
+* **Every install path now runs through one gate, and every claim is verified.** `game_updater` (install/update) and the new `uninstall_app` park their work behind the HUD's CONFIRM banner like shutdown already did; a refused target (Windows itself, drivers, runtimes) is refused before the banner appears, and completion is read back from the world — Steam's own app manifests, or the resolver no longer knowing the app — never from an exit code or a cheerfully phrased log line.
+* **Forget a download told you what it was doing.** The HUD has a **TASKS** panel: downloads and installs with real bytes, speed, ETA and state; timers counting down; agent runs stepping through their plan. The Playwright browser download — the one several-hundred-megabyte download in the app — is measured from its cache on disk while it runs instead of showing an empty bar.
+* **Window handling had four implementations and one of them could close things.** Focus now goes through `core/app_controller.window_action` everywhere (the `window_control` tool and `computer_control` alike), a bogus verb is refused as a bogus verb, and nothing in this path sends Alt+F4 to whatever happens to be focused.
+* **Roblox Player could start and vanish** because it was launched from the assistant's own working directory; it now starts with its build directory as the working directory, prefers the exe the `roblox-player` protocol handler points at over any stale version folder, and when it dies anyway the answer explains what that usually means instead of reporting a launch that did not stick.
+
 * Answers were sometimes **logged and spoken twice** — the Live API re-sends the tail of a transcript across the several turn-completes a tool call produces. Now de-duplicated at both the chunk and the flush level.
 * Asking JARVIS to look at the screen produced **two different answers** — the flow made it speak once *before* the image arrived, so it improvised, and again after. The frame is now attached to the same exchange as its tool result: one turn, one answer, one fewer round trip.
 * Screen captures were **unlabelled**, so a screenshot of this app — which has a face in the middle of it — could be read as a photo of the user. Images now carry their source.
@@ -445,11 +450,18 @@ Mark LIV/
 
 Plugins are discovered only from `plugins/*.py`. Files whose name starts with
 `_` are helper modules, not tools; this is how a plugin can ship shared code
+
+Discovery reads a plugin without running it where it can: a body made of imports,
+definitions and assignments is described from its source and imported on first
+use, so a slow or half-broken plugin cannot delay startup (and one that raises on
+import is still reported at launch, not on your first click). A parked plugin
+(`PARKED_PLUGINS` in `core/plugin_loader.py`) is discovered and listed but never
+offered, launched or run.
 without the loader showing the helper as a separate skill.
 
 | Plugin | What it does | Setup / safety notes |
 | --- | --- | --- |
-| `telegram_remote` | Starts a Telegram long-poll bridge so approved private chats can send typed or voice-note commands to this JARVIS session from anywhere. It opens no inbound port; all traffic is outbound HTTPS to Telegram. | Configure the bot token, pairing code and approved chat IDs in ⚙ → PLUGIN SETTINGS. It is off until you start it, unless you deliberately enable **Start listening when JARVIS launches**. Screenshot, camera and hardware-readout extras require `plugins/_telegram_ops.py` next to the plugin; without that helper the core remote still loads and works, but `/screen` and `/sys` are unavailable. |
+| `telegram_remote` **(parked)** | Starts a Telegram long-poll bridge — **temporarily disabled in this build**: the file is still discovered and listed in 🧩 PLUGINS, but it is not offered as a tool, its launch hook does not run, and calling it says so. Nothing was deleted; the plugin is parked until its bridge ships again. | Original notes:  so approved private chats can send typed or voice-note commands to this JARVIS session from anywhere. It opens no inbound port; all traffic is outbound HTTPS to Telegram. | Configure the bot token, pairing code and approved chat IDs in ⚙ → PLUGIN SETTINGS. It is off until you start it, unless you deliberately enable **Start listening when JARVIS launches**. Screenshot, camera and hardware-readout extras require `plugins/_telegram_ops.py` next to the plugin; without that helper the core remote still loads and works, but `/screen` and `/sys` are unavailable. |
 | `chat_takeover` | Watches the messaging conversation currently visible on screen and replies in the user's texting style until stopped. It can use its own Gemini Live session and falls back to REST if Live is unavailable. | Before starting, click into the message input box yourself. The plugin pastes into the currently focused chat window and uses a focus guard to stop if focus moves, but it still controls the real keyboard/clipboard, so do not start it while another app is focused. |
 | `document_review` | Presents a structured, readable review of a document: summary, serious/caution/note findings, quotes, suggestions and unclear points. | No setup and no legal rulebook inside the plugin. JARVIS must first read the document text from an upload, screen or camera; the plugin only lays out what the model found, in the user's language. |
 

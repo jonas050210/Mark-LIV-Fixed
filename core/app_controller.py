@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -37,26 +39,15 @@ from pathlib import Path
 
 
 # ── refusal patterns: open() NEVER installs / repairs / updates ──────────────
+# The patterns themselves live in core/install_safety.py — the one module every
+# install/download path consults — and are re-exported here so the launcher side
+# and the safety side can never disagree about what an install request is.
 
-#: Verbs that turn a request into an install/repair/update job (EN + DE).
-#: Matched case-insensitively against the *requested name*. "mach was du
-#: willst" does not override this: there is no code path from here to any
-#: installer, package manager, or download.
-INSTALL_INTENT_RE = re.compile(
-    r"\b(install|installation|installer|setup|update|upgrade|repair|reinstall|"
-    r"download|uninstall|remove-app|deinstallier\w*|installier\w*|"
-    r"aktualisier\w*|updat\w*|reparier\w*|herunterlad\w*|download\w*|"
-    r"einricht\w*|besorg\w*|hol\s+dir)\b",
-    re.IGNORECASE,
-)
-
-#: File-name fragments that mark a *target* as an installer/updater rather
-#: than the app itself. Last line of defense: even a clean request refuses to
-#: launch these.
-INSTALLER_TARGET_RE = re.compile(
-    r"(setup|install|update|upgrade|patch|uninstall|unins\d*|repair|redist|"
-    r"vcredist|dxsetup|oobe|installer)",
-    re.IGNORECASE,
+from core.install_safety import (  # noqa: E402  (kept next to their use)
+    INSTALLER_TARGET_RE,
+    INSTALL_INTENT_RE,
+    classify_intent as _classify_install_intent,
+    is_installer_target as _is_installer_target,
 )
 
 #: Names that mean this assistant itself — close() refuses all of them.
@@ -386,25 +377,68 @@ def status(name: str) -> AppStatus:
     return st
 
 
+def is_self_name(name: str) -> bool:
+    """True when `name` means this assistant itself."""
+    canon = _canon(name)
+    return bool(canon) and (canon in SELF_NAMES or canon.rstrip("s") in SELF_NAMES)
+
+
 def _refuse_install_intent(name: str) -> str | None:
-    if INSTALL_INTENT_RE.search(name or ""):
+    kind = _classify_install_intent(name or "")
+    if not kind:
+        return None
+    if kind == "uninstall":
         return (
-            f"I do not install, update, repair, or download software — "
-            f"'{name.strip()[:80]}' sounds like one of those jobs. "
-            "Please install it yourself (Microsoft Store, Steam, or the "
-            "vendor's site); once it is installed I can open and close it."
+            f"I do not install, update, repair, or download software — and I "
+            f"never remove an app from the open path. '{name.strip()[:80]}' is "
+            "an uninstall request: use the uninstall_app tool, which goes "
+            "looking for the vendor's real uninstaller and asks you to confirm "
+            "on screen first."
         )
-    return None
+    return (
+        f"I do not install, update, repair, or download software — "
+        f"'{name.strip()[:80]}' sounds like one of those jobs. "
+        "Please install it yourself (Microsoft Store, Steam, or the "
+        "vendor's site); once it is installed I can open and close it."
+    )
 
 
 def looks_like_installer(path: str) -> bool:
     """True when `path` smells like an installer/updater, not the app."""
-    base = ""
+    return _is_installer_target(path)
+
+
+def _observe_launch(name: str, tgt, seconds: float) -> dict:
+    """Watch the process table right after a launch.
+
+    Returns ``{"running": bool|None, "appeared": bool, "vanished": bool}``:
+    ``appeared`` means the process existed at least once, ``vanished`` that it
+    then disappeared — which is a crash or a launcher handing off, and deserves
+    a different (honest, actionable) message than "never started".
+    """
+    appeared = False
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        running = is_running(name, tgt)
+        if running is None:
+            return {"running": None, "appeared": appeared, "vanished": False}
+        if running:
+            appeared = True
+        elif appeared:
+            return {"running": False, "appeared": True, "vanished": True}
+        if time.monotonic() >= deadline:
+            return {"running": appeared, "appeared": appeared, "vanished": False}
+        time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+
+
+def _launch_strategies(tgt, _af) -> list:
+    """The target, plus any documented fallbacks (Roblox has some)."""
+    out = [tgt]
     try:
-        base = Path(str(path or "")).name
+        out.extend(_af.launch_alternatives(tgt))
     except Exception:
-        base = str(path or "")
-    return bool(base and INSTALLER_TARGET_RE.search(base))
+        pass
+    return out
 
 
 def open(name: str, verify_seconds: float = 6.0) -> tuple[bool, str]:
@@ -412,7 +446,11 @@ def open(name: str, verify_seconds: float = 6.0) -> tuple[bool, str]:
 
     Refuses installer-intent requests and installer-like targets. Verifies by
     polling the process table for a few seconds; reports honestly when the
-    process never appears (or when process access is unavailable).
+    process never appears, when it appeared and vanished, or when process
+    access is unavailable. A target may declare fallback strategies
+    (:func:`core.app_finder.launch_alternatives`) — each is launched and
+    verified in turn, so an alternative that works is reported as the one that
+    worked instead of a blanket failure.
     """
     from core import app_finder as _af
 
@@ -435,34 +473,437 @@ def open(name: str, verify_seconds: float = 6.0) -> tuple[bool, str]:
             f"I will not launch '{Path(tgt_path).name}': it looks like an "
             "installer or updater, not the app itself.")
     display = _tgt_display(tgt, name)
-    try:
-        ok, msg = _af.launch(tgt)
-    except Exception as e:
-        diag = ""
+
+    last_problem = f"{display} could not be started."
+    for index, attempt in enumerate(_launch_strategies(tgt, _af)):
         try:
-            diag = _af.diagnose_launch_error(e, tgt)
+            ok, msg = _af.launch(attempt)
+        except Exception as e:
+            diag = ""
+            try:
+                diag = _af.diagnose_launch_error(e, attempt)
+            except Exception:
+                pass
+            last_problem = (f"Could not start {display}: {e}"
+                            f"{(' — ' + diag) if diag else ''}")
+            continue
+        if not ok:
+            last_problem = msg or f"Could not start {display}."
+            continue
+
+        # Verify: poll the process table (launchers often return before the
+        # process exists; Roblox's launcher hands off to the player).
+        obs = _observe_launch(name, attempt, max(0.5, verify_seconds))
+        if obs["running"] is None:
+            return True, (f"{display} started ({msg}). I cannot verify it is "
+                          "running — process access is unavailable on this machine.")
+        if obs["running"]:
+            via = "" if index == 0 else f" (via {getattr(attempt, 'source', '') or 'fallback'})"
+            return True, f"{display} is now running{via}."
+        if obs["vanished"]:
+            hint = ""
+            try:
+                hint = _af.launch_hint(attempt, vanished=True)
+            except Exception:
+                pass
+            last_problem = (f"{display} started and then exited immediately"
+                            f"{(' — ' + hint) if hint else ' — it may have crashed on startup.'}")
+        else:
+            last_problem = (f"{display} did not appear to start ({msg}). It may need "
+                            "a click in a launcher window, or it crashed on startup.")
+
+    # Every strategy failed. Say what was tried, then the most useful hint.
+    hint = ""
+    try:
+        hint = _af.launch_hint(tgt)
+    except Exception:
+        pass
+    if hint and "roblox" in str(getattr(tgt, "target", "")).lower():
+        return False, f"{last_problem} {hint}"
+    if len(_launch_strategies(tgt, _af)) > 1:
+        last_problem += " I tried every way of starting it that I know."
+    return False, last_problem
+
+
+# ── windows ──────────────────────────────────────────────────────────────────
+# Window handling lives here for the same reason process handling does: one
+# implementation, one set of refusals. `window_control` (the tool) and the
+# `computer_control` focus_window action both come through this, so they can
+# never disagree about which window is meant.
+#
+# What is deliberately absent: closing windows. Sending Alt+F4/Ctrl+W to
+# whatever happens to be focused is how a save dialog gets dismissed by
+# accident; apps are closed by name through close() instead.
+
+
+def _window_api():
+    """The pygetwindow module, or None when it is not usable here."""
+    try:
+        import pygetwindow as gw  # type: ignore
+
+        return gw
+    except Exception:
+        return None
+
+
+def _shell_safe(title: str) -> bool:
+    """False when a title cannot be put into a command line safely."""
+    text = str(title or "")
+    if not text.strip() or len(text) > 200:
+        return False
+    return not any(ch in text for ch in '"\'\n\r')
+
+
+def _window_titles_from_os(limit: int) -> tuple[list[str] | None, str]:
+    """Platform fallback for listing window titles."""
+    try:
+        if sys.platform == "win32":
+            script = ("Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | "
+                      "Select-Object -ExpandProperty MainWindowTitle")
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=8, **_no_window(),
+            ).stdout
+            return [t.strip() for t in out.splitlines() if t.strip()][:limit], ""
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get name of every process '
+                 'whose background only is false'],
+                capture_output=True, text=True, timeout=8).stdout
+            return [t.strip() for t in out.split(",") if t.strip()][:limit], ""
+        out = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True,
+                             timeout=8).stdout
+        titles = []
+        for line in out.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[3].strip():
+                titles.append(parts[3].strip())
+        if titles:
+            return titles[:limit], ""
+        return None, "no window listing tool found (wmctrl is not installed)"
+    except FileNotFoundError:
+        return None, "no window listing tool found (wmctrl is not installed)"
+    except Exception as e:
+        return None, f"could not list windows ({type(e).__name__})"
+
+
+def _no_window() -> dict:
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def list_windows(limit: int = 40) -> tuple[list[str] | None, str]:
+    """Visible window titles, or ``(None, reason)`` when they cannot be read."""
+    limit = max(1, min(100, int(limit or 40)))
+    gw = _window_api()
+    if gw is not None:
+        try:
+            titles: list[str] = []
+            for win in gw.getAllWindows():
+                title = str(getattr(win, "title", "") or "").strip()
+                if not title:
+                    continue
+                if hasattr(win, "visible") and not win.visible:
+                    continue
+                titles.append(title)
+            if titles:
+                return titles[:limit], ""
         except Exception:
             pass
-        return False, f"Could not start {display}: {e}{(' — ' + diag) if diag else ''}"
-    if not ok:
-        return False, msg or f"Could not start {display}."
+    return _window_titles_from_os(limit)
 
-    # Verify: poll the process table (launchers often return before the
-    # process exists; Roblox's launcher hands off to the player).
-    deadline = time.monotonic() + max(0.5, verify_seconds)
-    running: bool | None = None
-    while time.monotonic() < deadline:
-        running = is_running(name, tgt)
-        if running or running is None:
-            break  # None = no process access: nothing to wait for
-        time.sleep(0.5)
-    if running is None:
-        return True, (f"{display} started ({msg}). I cannot verify it is "
-                      "running — process access is unavailable on this machine.")
-    if running:
-        return True, f"{display} is now running."
-    return False, (f"{display} did not appear to start ({msg}). It may need "
-                   "a click in a launcher window, or it crashed on startup.")
+
+def _matching_windows(query: str, gw):
+    """Window objects whose title contains `query` (case-insensitive)."""
+    want = str(query or "").strip().lower()
+    if not want:
+        return []
+    out = []
+    for win in gw.getAllWindows():
+        title = str(getattr(win, "title", "") or "")
+        if title and want in title.lower():
+            out.append(win)
+    return out
+
+
+def _focus_via_os(title: str) -> tuple[bool, str]:
+    """Platform command that raises a window, used when pygetwindow is absent."""
+    if not _shell_safe(title):
+        return False, "that window title cannot be used safely (quotes or control characters)"
+    try:
+        if sys.platform == "win32":
+            script = (f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")')
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", script], capture_output=True, timeout=8,
+                           **_no_window())
+            return True, f"asked Windows to bring '{title}' to the front"
+        if sys.platform == "darwin":
+            script = (f'tell application "System Events" to set frontmost of '
+                      f'(first process whose name contains "{title}") to true')
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=8)
+            return True, f"asked macOS to bring '{title}' to the front"
+        for cmd in (["wmctrl", "-a", title],
+                    ["xdotool", "search", "--name", title, "windowactivate"]):
+            try:
+                if subprocess.run(cmd, capture_output=True, timeout=8).returncode == 0:
+                    return True, f"brought '{title}' to the front"
+            except FileNotFoundError:
+                continue
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return False, ("focusing windows needs pygetwindow, wmctrl or xdotool on "
+                   "this machine — none of them is usable here")
+
+
+def window_action(action: str, name: str = "", title: str = "",
+                  limit: int = 40) -> tuple[bool, str]:
+    """List, focus, minimize, maximize or restore windows. Never raises.
+
+    ``name`` is an app name (resolved to its own window titles) and ``title`` a
+    literal window title; whichever is given is what gets matched.
+    """
+    act = str(action or "").strip().lower()
+    _KNOWN = ("list", "show", "focus", "activate", "switch", "minimize",
+              "minimise", "maximize", "maximise", "restore", "unminimize",
+              "unminimise")
+    if act not in _KNOWN:
+        return False, (f"Unknown window action '{action}'. Use: list, focus, "
+                       f"minimize, maximize, restore.")
+    if act in ("list", "show"):
+        titles, why = list_windows(limit=limit)
+        if titles is None:
+            return False, f"I cannot read the window list here: {why}."
+        if not titles:
+            return True, "No windows with a title are open."
+        return True, ("Open windows: " + "; ".join(titles)).strip()
+
+    query = str(title or "").strip()
+    if not query and name:
+        query = str(name).strip()
+    if not query:
+        return False, "Which window? Give me an app name or a window title."
+
+    # An app name means "its window(s)" — resolved through the same window-title
+    # lookup the status check uses, so app and window views agree.
+    if not title and name:
+        app_titles = window_titles(name, name)
+        if app_titles:
+            query = app_titles[0]
+
+    gw = _window_api()
+    wins = []
+    if gw is not None:
+        try:
+            wins = _matching_windows(query, gw)
+        except Exception:
+            wins = []
+    win = wins[0] if wins else None
+
+    if act in ("focus", "activate", "switch"):
+        if win is not None:
+            try:
+                if bool(getattr(win, "isMinimized", False)):
+                    win.restore()
+                win.activate()
+                ok = True
+                try:
+                    ok = bool(getattr(win, "isActive", True))
+                except Exception:
+                    ok = True
+                if ok:
+                    return True, (f"'{win.title}' is in front now."
+                                  if getattr(win, "title", "") else "Window focused.")
+                return True, (f"Asked '{query}' to come to the front, but it is "
+                              f"not the active window yet.")
+            except Exception as e:
+                return False, f"Could not focus '{query}': {type(e).__name__}."
+        ok, msg = _focus_via_os(query)
+        return ok, msg if ok else (f"I could not find a window matching "
+                                   f"'{query}': {msg}")
+
+    if act in ("minimize", "minimise"):
+        if win is None:
+            return False, f"I could not find a window matching '{query}'."
+        try:
+            win.minimize()
+        except Exception as e:
+            return False, f"Could not minimize '{query}': {type(e).__name__}."
+        try:
+            done = bool(getattr(win, "isMinimized", True))
+            return True, (f"'{win.title}' is minimized." if done else
+                          f"Asked '{win.title}' to minimize, but it does not "
+                          f"report being minimized.")
+        except Exception:
+            return True, f"Asked '{win.title}' to minimize."
+
+    if act in ("maximize", "maximise"):
+        if win is None:
+            return False, f"I could not find a window matching '{query}'."
+        try:
+            win.maximize()
+        except Exception as e:
+            return False, f"Could not maximize '{query}': {type(e).__name__}."
+        try:
+            done = bool(getattr(win, "isMaximized", True))
+            return True, (f"'{win.title}' is maximized." if done else
+                          f"Asked '{win.title}' to maximize, but it does not "
+                          f"report being maximized.")
+        except Exception:
+            return True, f"Asked '{win.title}' to maximize."
+
+    if act in ("restore", "unminimize", "unminimise"):
+        if win is None:
+            return False, f"I could not find a window matching '{query}'."
+        try:
+            win.restore()
+            return True, f"'{win.title}' is restored."
+        except Exception as e:
+            return False, f"Could not restore '{query}': {type(e).__name__}."
+
+    return False, f"Unknown window action '{action}'."
+
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+# Removal is the one app operation with no undo, so it is split in two: the plan
+# (what would be run, shown to the user before anything happens) and the run
+# itself. Nothing here deletes an install directory — that is not an uninstall,
+# it leaves registry entries and user data behind — and an app with no
+# vendor-registered uninstaller gets an honest refusal instead.
+
+
+def uninstall_plan(name: str) -> tuple[object | None, str]:
+    """``(plan, refusal)`` for removing `name`. Exactly one of them is set.
+
+    The plan is resolved through the same app finder ``open`` uses, so an app
+    that cannot be found cannot be removed either.
+    """
+    from core import app_finder as _af
+    from core.install_safety import protected_target
+
+    raw = (name or "").strip()
+    if not raw:
+        return None, "Which app should I uninstall?"
+    if _canon(raw) in SELF_NAMES or _canon(raw).rstrip("s") in SELF_NAMES:
+        return None, "I will not uninstall myself — say 'shutdown' if you want me to quit."
+    guard = protected_target(raw)
+    if guard:
+        return None, guard
+
+    tgt = _resolve(raw)
+    try:
+        plan = _af.find_uninstaller(raw, tgt)
+    except Exception as e:
+        return None, f"I could not look for an uninstaller for {raw} ({type(e).__name__})."
+    if plan is None:
+        display = _tgt_display(tgt, raw) if tgt is not None else raw
+        return None, (
+            f"I found no reliable uninstaller for '{display}'. Uninstalling "
+            "means running the vendor's own removal program, and this machine "
+            "has none registered for it (portable builds and unpacked folders "
+            "usually have none). I will not delete its folder instead: that "
+            "leaves registry entries and user data behind and is not an "
+            "uninstall. Remove it through Windows' 'Apps & features', the "
+            "Microsoft Store, or the vendor's own page."
+        )
+    return plan, ""
+
+
+def run_uninstall(plan, name: str = "", *, timeout: float = 180.0,
+                  task=None) -> tuple[str, str]:
+    """Run a resolved uninstall plan and say what was actually observed.
+
+    Returns ``(status, message)`` with status one of:
+
+    - ``"removed"`` — the app is gone by the resolver's own account;
+    - ``"running"`` — the uninstaller is still on screen (it usually asks
+      questions), so removal is *not* claimed;
+    - ``"failed"`` — it exited without removing anything, or never started.
+
+    ``task`` is optional and duck-typed: anything with ``update(...)`` (the
+    central activity registry's :class:`core.tasks.Task`) is told what is going
+    on while the uninstaller runs.
+    """
+    from core import app_finder as _af
+
+    def _note(detail: str) -> None:
+        if task is not None:
+            try:
+                task.update(detail=detail)
+            except Exception:
+                pass
+
+    raw = (name or "").strip()
+    source = str(getattr(plan, "source", "") or "uninstaller")
+    location = str(getattr(plan, "location", "") or "")
+
+    # macOS: the bundle goes to the Trash — removable, and nothing to wait for.
+    if source.startswith("macOS"):
+        bundle = str(getattr(plan, "exe", ""))
+        try:
+            try:
+                from send2trash import send2trash  # type: ignore
+
+                send2trash(bundle)
+            except Exception:
+                trash = Path.home() / ".Trash"
+                trash.mkdir(exist_ok=True)
+                shutil.move(bundle, str(trash / Path(bundle).name))
+        except Exception as e:
+            return "failed", f"Could not move '{bundle}' to the Trash: {e}"
+        if not Path(bundle).exists():
+            return "removed", f"'{Path(bundle).name}' is in the Trash."
+        return "failed", f"'{bundle}' is still there after the move."
+
+    exe = str(getattr(plan, "exe", ""))
+    args = list(getattr(plan, "args", ()) or ())
+    if not exe or not Path(exe).exists():
+        return "failed", f"The registered uninstaller is gone: {exe or '(none)'}."
+
+    _note(f"started {Path(exe).name} — answer its window yourself")
+    try:
+        # No shell, no creationflags: an uninstaller is a GUI program that has to
+        # be visible, and argv never passes through a shell.
+        proc = subprocess.Popen([exe, *args], cwd=str(Path(exe).parent))
+    except Exception as e:
+        return "failed", f"Could not start the uninstaller ({type(e).__name__}: {e})."
+
+    deadline = time.monotonic() + max(5.0, timeout)
+    while True:
+        gone = _resolve(raw) is None
+        if gone:
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            return "removed", (
+                f"'{raw}' is uninstalled — the resolver no longer finds it."
+            )
+        if proc.poll() is not None:
+            break
+        _note(f"{Path(exe).name} is still running — it is probably asking you something")
+        if time.monotonic() >= deadline:
+            return "running", (
+                f"The uninstaller for '{raw}' is still running on your screen "
+                f"({Path(exe).name}). I cannot confirm the removal until it "
+                f"finishes — check its window."
+            )
+        time.sleep(1.0)
+
+    code = proc.returncode
+    if _resolve(raw) is None:
+        return "removed", f"'{raw}' is uninstalled."
+    if code == 0:
+        return "failed", (
+            f"The uninstaller finished (exit code 0) but '{raw}' is still "
+            f"installed{(' in ' + location) if location else ''}. It may have "
+            f"asked something that was not answered, or cancelled itself."
+        )
+    return "failed", (
+        f"The uninstaller exited with code {code} and '{raw}' is still "
+        f"installed. Nothing can be claimed from that."
+    )
 
 
 def close(name: str, timeout: float = 10.0) -> tuple[bool, str]:

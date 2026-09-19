@@ -9,6 +9,7 @@ needed); the resolver/launcher are stubbed. Runnable with pytest or directly
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -397,6 +398,272 @@ def test_inventory_status_action():
         out = inv.app_inventory({"action": "status", "query": "Spotify"})
         assert "RUNNING" in out
     assert "which app" in inv.app_inventory({"action": "status"}).lower()
+
+
+# ── restart ──────────────────────────────────────────────────────────────────
+
+
+def test_restart_refuses_self_and_needs_a_name():
+    import actions.restart_app as ra
+
+    assert "Which app" in ra.restart_app({})
+    assert "will not restart myself" in ra.restart_app({"app_name": "jarvis"})
+
+
+def test_restart_closes_then_reopens_and_verifies_both():
+    import actions.restart_app as ra
+    from core import tasks
+
+    tasks.reset()
+    with patch.object(ac, "is_self_name", return_value=False), \
+         patch.object(ac, "is_running", return_value=True), \
+         patch.object(ac, "close", return_value=(True, "Chrome is closed.")), \
+         patch.object(ac, "open", return_value=(True, "Chrome is now running.")):
+        out = ra.restart_app({"app_name": "Chrome"})
+    assert "closed" in out and "running" in out
+    row = tasks.snapshot()[0]
+    assert row["state"] == "done" and "running again" in row["detail"]
+
+
+def test_restart_never_starts_a_second_copy_when_close_fails():
+    import actions.restart_app as ra
+    from core import tasks
+
+    tasks.reset()
+    with patch.object(ac, "is_self_name", return_value=False), \
+         patch.object(ac, "is_running", return_value=True), \
+         patch.object(ac, "close", return_value=(False, "Spotify refused to close.")), \
+         patch.object(ac, "open", return_value=(True, "opened")) as m:
+        out = ra.restart_app({"app_name": "Spotify"})
+    assert "did not start a second copy" in out
+    m.assert_not_called()
+    assert tasks.snapshot()[0]["state"] == "failed"
+
+
+def test_restart_reports_an_app_that_closed_but_did_not_come_back():
+    import actions.restart_app as ra
+    from core import tasks
+
+    tasks.reset()
+    with patch.object(ac, "is_self_name", return_value=False), \
+         patch.object(ac, "is_running", return_value=True), \
+         patch.object(ac, "close", return_value=(True, "Discord is closed.")), \
+         patch.object(ac, "open", return_value=(False, "Discord did not start.")):
+        out = ra.restart_app({"app_name": "Discord"})
+    assert "did not come back" in out
+    row = tasks.snapshot()[0]
+    assert row["state"] == "failed" and "would not start again" in row["detail"]
+
+
+def test_restart_of_a_closed_app_starts_it_and_says_so():
+    import actions.restart_app as ra
+    from core import tasks
+
+    tasks.reset()
+    with patch.object(ac, "is_self_name", return_value=False), \
+         patch.object(ac, "is_running", return_value=False), \
+         patch.object(ac, "close", return_value=(True, "closed")) as closed, \
+         patch.object(ac, "open", return_value=(True, "Discord is now running.")):
+        out = ra.restart_app({"app_name": "Discord"})
+    assert "was not running, so I started it" in out
+    closed.assert_not_called()
+    assert tasks.snapshot()[0]["detail"] == "started (it was not running)"
+
+    # ... and when even that fails, the failure is the sentence, not a promise.
+    tasks.reset()
+    with patch.object(ac, "is_self_name", return_value=False), \
+         patch.object(ac, "is_running", return_value=False), \
+         patch.object(ac, "open", return_value=(False, "Discord did not start.")):
+        out = ra.restart_app({"app_name": "Discord"})
+    assert "was not running, and it did not start" in out
+    assert tasks.snapshot()[0]["detail"] == "would not start"
+
+
+# ── window control ───────────────────────────────────────────────────────────
+
+
+def test_window_control_delegates_and_never_closes():
+    import inspect
+
+    import actions.window_control as wc
+
+    with patch.object(ac, "window_action",
+                      return_value=(True, "Brought 'Chrome' to the front.")) as m:
+        out = wc.window_control({"action": "focus", "app_name": "Chrome"})
+    assert "front" in out
+    m.assert_called_once_with("focus", name="Chrome", title="", limit=40)
+
+    # `query` is the older parameter name for a title hint.
+    with patch.object(ac, "window_action", return_value=(True, "ok")) as m:
+        wc.window_control({"action": "minimize", "query": "Spotify Premium"})
+    m.assert_called_once_with("minimize", name="", title="Spotify Premium", limit=40)
+
+    # The verb goes through untouched: the controller is the one validator.
+    with patch.object(ac, "window_action", return_value=(False, "Unknown action")) as m:
+        assert "Unknown" in wc.window_control({"action": "close", "title": "X"})
+    assert m.call_args.args[0] == "close"
+
+    # A controller crash is reported, not raised.
+    with patch.object(ac, "window_action", side_effect=RuntimeError("boom")):
+        assert "failed" in wc.window_control({"action": "list"})
+    # Nothing in this tool can close a window.
+    src = inspect.getsource(wc)
+    assert "terminate" not in src and "kill" not in src
+
+
+def test_window_action_validates_the_verb_before_choosing_a_target():
+    # A bogus verb is refused as a bogus verb, even with no target given. The
+    # first version of this answered "Which window?" — advice that leads nowhere,
+    # because no window name makes "teleport" a real action.
+    ok, message = ac.window_action("teleport")
+    assert ok is False and "Unknown window action" in message
+    # A real verb with no target asks for one.
+    ok, message = ac.window_action("focus")
+    assert ok is False and "Which window" in message
+    # And no verb at all is not silently treated as focus-with-no-target.
+    ok, message = ac.window_action("")
+    assert ok is False and "Unknown window action" in message
+
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+
+
+class _FakePlan:
+    name = "Spotify"
+    exe = "/usr/bin/spotify-uninstall"
+    source = "registry"
+    detail = "Vendor uninstaller"
+
+    def command_line(self):
+        return self.exe
+
+
+def test_uninstall_needs_a_name_and_refuses_without_an_uninstaller():
+    import actions.uninstall_app as ua
+
+    assert "Which app" in ua.uninstall_app({})
+    with patch.object(ac, "uninstall_plan",
+                      return_value=(None, "I found no reliable uninstaller for 'Foo'.")):
+        assert "no reliable uninstaller" in ua.uninstall_app({"app_name": "Foo"})
+
+
+def test_uninstall_runs_behind_the_gate_and_verifies_with_the_resolver():
+    import actions.uninstall_app as ua
+    from core import confirm, tasks
+
+    tasks.reset()
+    spoken: list[str] = []
+    shown: list[tuple] = []
+    with patch.object(confirm, "_show_cb", lambda t, d: shown.append((t, d))), \
+         patch.object(confirm, "_hide_cb", lambda: None), \
+         patch.object(ac, "uninstall_plan", return_value=(_FakePlan(), "")), \
+         patch.object(ac, "run_uninstall",
+                      return_value=("removed", "Spotify was uninstalled.")) as ran, \
+         patch("core.app_finder.resolve", return_value=None):
+        pending = ua.uninstall_app({"app_name": "Spotify"}, speak=spoken.append)
+        assert "[CONFIRMATION_PENDING]" in pending
+        assert shown and shown[0][0] == "Uninstall Spotify"
+        assert "Uninstall Spotify" in pending or "Uninstall" in shown[0][0]
+        ran.assert_not_called()
+        confirm.resolve(True)                       # the human pressed CONFIRM
+
+        deadline = time.time() + 10
+        while time.time() < deadline and not spoken:
+            time.sleep(0.05)
+
+    assert ran.call_count == 1
+    assert spoken and "verified" in spoken[0]
+    row = tasks.snapshot()[0]
+    assert row["kind"] == "uninstall" and row["state"] == "done"
+
+
+def test_uninstall_does_not_claim_a_removal_it_could_not_confirm():
+    import actions.uninstall_app as ua
+    from core import confirm, tasks
+
+    tasks.reset()
+    with patch.object(confirm, "_show_cb", lambda t, d: None), \
+         patch.object(confirm, "_hide_cb", lambda: None), \
+         patch.object(ac, "uninstall_plan", return_value=(_FakePlan(), "")), \
+         patch.object(ac, "run_uninstall",
+                      return_value=("running", "The uninstaller is open on your screen.")), \
+         patch.object(confirm, "TIMEOUT_SECONDS", 30.0):
+        ua.uninstall_app({"app_name": "Spotify"})
+        confirm.resolve(True)
+        deadline = time.time() + 10
+        while time.time() < deadline and tasks.snapshot()[0]["state"] == "running":
+            time.sleep(0.05)
+    row = tasks.snapshot()[0]
+    assert row["state"] == "done" and "not confirmed" in row["detail"]
+
+    # A hard failure keeps the uninstaller's own words and fails the task.
+    tasks.reset()
+    with patch.object(confirm, "_show_cb", lambda t, d: None), \
+         patch.object(confirm, "_hide_cb", lambda: None), \
+         patch.object(ac, "uninstall_plan", return_value=(_FakePlan(), "")), \
+         patch.object(ac, "run_uninstall",
+                      return_value=("failed", "The uninstaller exited with an error.")):
+        from core import confirm as cf
+        with patch("core.app_finder.resolve", return_value=object()):
+            ua.uninstall_app({"app_name": "Spotify"})
+            cf.resolve(True)
+            deadline = time.time() + 10
+            while time.time() < deadline and tasks.snapshot()[0]["state"] == "running":
+                time.sleep(0.05)
+    row = tasks.snapshot()[0]
+    assert row["state"] == "failed" and "error" in row["error"].lower()
+
+
+def test_uninstall_is_fail_closed_without_an_interface():
+    import actions.uninstall_app as ua
+    from core import confirm
+
+    with patch.object(confirm, "_show_cb", None), \
+         patch.object(ac, "uninstall_plan", return_value=(_FakePlan(), "")), \
+         patch.object(ac, "run_uninstall", return_value=("removed", "gone")) as ran:
+        out = ua.uninstall_app({"app_name": "Spotify"})
+    assert "not available" in out
+    ran.assert_not_called()
+
+
+# ── the verification layer knows the new tools ───────────────────────────────
+
+
+def test_verify_rechecks_uninstall_through_the_resolver():
+    from core import verify as v
+
+    with patch("core.app_finder.resolve", return_value=None):
+        verdict = v.verify("uninstall_app", {"app_name": "Spotify"}, "gone")
+    assert verdict.ok is True and verdict.method == "recheck"
+
+    with patch("core.app_finder.resolve", return_value=object()), \
+         patch.object(ac, "is_running", return_value=True):
+        verdict = v.verify("uninstall_app", {"app_name": "Spotify"},
+                           "Spotify was uninstalled.")
+    assert verdict.ok is False and "still running" in verdict.detail
+
+
+def test_verify_rechecks_restart_and_window_list():
+    from core import verify as v
+
+    with patch.object(ac, "is_running", return_value=True):
+        assert v.verify("restart_app", {"app_name": "Chrome"}, "restarted").ok is True
+    with patch.object(ac, "is_running", return_value=False):
+        assert v.verify("restart_app", {"app_name": "Chrome"}, "restarted").ok is False
+    # No process access: no strong check, the tool's own words are all there is.
+    with patch.object(ac, "is_running", return_value=None):
+        assert v.verify("restart_app", {"app_name": "Chrome"}, "restarted").method == "text"
+
+    with patch.object(ac, "list_windows", return_value=(["Chrome", "Spotify"], "")):
+        verdict = v.verify("window_control", {"action": "list"}, "2 windows")
+    assert verdict.ok is True and verdict.evidence["windows"] == 2
+    with patch.object(ac, "list_windows", return_value=([], "")):
+        assert v.verify("window_control", {"action": "list"}, "none").ok is False
+    # focus/minimize cannot be re-checked cheaply -> text analysis, not a guess.
+    with patch.object(ac, "list_windows", return_value=(["Chrome"], "")):
+        verdict = v.verify("window_control", {"action": "focus", "app_name": "Chrome"},
+                           "Brought 'Chrome' to the front.")
+    assert verdict.method == "text" and verdict.ok is True
 
 
 if __name__ == "__main__":

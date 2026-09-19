@@ -21,6 +21,15 @@ import re
 import threading
 import time
 
+# The central activity registry (core/tasks.py) is how the UI shows a running
+# countdown. It is optional on purpose: a timer set from a script or a test
+# must still work when nothing is rendering the panel, so a missing registry
+# only costs the visual row, never the countdown.
+try:
+    from core import tasks as _tasks
+except Exception:  # pragma: no cover - registry absent/broken, timer still runs
+    _tasks = None
+
 _MAX_SECONDS = 24 * 60 * 60        # refuse anything longer than a day
 _POLL_SECONDS = 0.5                # cancel stays responsive within half a second
 
@@ -111,15 +120,36 @@ def _log(player, message: str) -> None:
 def _countdown(timer_id: str, seconds: int, label: str, speak, player) -> None:
     """Worker thread: sleep in slices so a cancel is noticed quickly."""
     deadline = time.monotonic() + seconds
+    task = None
+    with _LOCK:
+        entry = _TIMERS.get(timer_id)
+        if entry is not None:
+            task = entry.get("task")
+    last_reported = seconds
     while True:
+        remaining = max(0, int(round(deadline - time.monotonic())))
         with _LOCK:
             entry = _TIMERS.get(timer_id)
             if entry is None or entry.get("cancelled"):
                 # A cancelled timer must leave the registry too, otherwise it
                 # stays listed forever and can be "cancelled" again and again.
                 _TIMERS.pop(timer_id, None)
+                if task is not None and task.state == "running":
+                    task.cancel("Cancelled.")
                 return
-            entry["remaining"] = max(0, int(deadline - time.monotonic()))
+            entry["remaining"] = remaining
+        if task is not None and remaining != last_reported:
+            # One registry write per whole second: the countdown stays truthful
+            # in the panel without touching it on every 0.5 s poll.
+            last_reported = remaining
+            left = max(0, int(deadline - time.monotonic()))
+            if left > 0:
+                task.update(progress=(seconds - left) / float(seconds),
+                            detail=f"{_human(left)} left")
+            elif task.state == "running":
+                # Reaching zero is not success: the timer has not fired until
+                # the announcement below has been attempted.
+                task.update(progress=1.0, detail="calling out")
         left = deadline - time.monotonic()
         if left <= 0:
             break
@@ -128,7 +158,11 @@ def _countdown(timer_id: str, seconds: int, label: str, speak, player) -> None:
     with _LOCK:
         entry = _TIMERS.pop(timer_id, None)
     if entry is None or entry.get("cancelled"):
+        if task is not None and task.state == "running":
+            task.cancel("Cancelled.")
         return
+    if task is None:
+        task = entry.get("task")
 
     message = f"Timer {label} is up." if label else "Your timer is up."
     _log(player, f"TIMER: {message}")
@@ -152,10 +186,24 @@ def _countdown(timer_id: str, seconds: int, label: str, speak, player) -> None:
             announced = True
         except Exception:
             pass
-    if not announced:
-        # A dropped announcement must never take the session down with it; the
-        # log line above already recorded that the timer fired.
-        pass
+
+    if task is not None and task.state == "running":
+        # The countdown really did reach zero — that is the fact the panel
+        # shows. Whether the spoken line was heard is a second, separate fact,
+        # so a failed announcement becomes the detail instead of a fake
+        # "cancelled"/"failed" state: the user still got their timer.
+        task.finish(detail="rang" if announced
+                    else "countdown finished — announcement could not be spoken")
+    # A dropped announcement must never take the session down with it; the log
+    # line above already recorded that the timer fired.
+
+
+def _cancel_from_panel(timer_id: str) -> None:
+    """Cancel request that came from the UI task panel instead of by voice."""
+    with _LOCK:
+        entry = _TIMERS.get(timer_id)
+        if entry is not None:
+            entry["cancelled"] = True
 
 
 def _find(wanted: str) -> list[str]:
@@ -201,7 +249,10 @@ def timer_action(parameters: dict, player=None, speak=None) -> str:
                 if entry is None:
                     continue
                 entry["cancelled"] = True      # the worker may already be asleep
+                task = entry.get("task")
                 names.append(str(entry.get("label") or tid))
+                if task is not None and task.state == "running":
+                    task.cancel("Cancelled.")
         if not names:
             return "There is no matching timer to cancel."
         _log(player, f"TIMER: cancelled {', '.join(names)}")
@@ -219,8 +270,21 @@ def timer_action(parameters: dict, player=None, speak=None) -> str:
     with _LOCK:
         _COUNTER += 1
         timer_id = f"t{_COUNTER}"
-        _TIMERS[timer_id] = {"label": label, "seconds": seconds,
-                             "remaining": seconds, "cancelled": False}
+        entry = {"label": label, "seconds": seconds,
+                 "remaining": seconds, "cancelled": False, "task": None}
+        if _tasks is not None:
+            try:
+                entry["task"] = _tasks.start(
+                    _tasks.KIND_TIMER,
+                    title=f"Timer — {label}" if label else "Timer",
+                    detail=f"{_human(seconds)} left",
+                    progress=0.0,
+                    seconds=seconds,
+                    on_cancel=lambda tid=timer_id: _cancel_from_panel(tid),
+                )
+            except Exception:
+                entry["task"] = None
+        _TIMERS[timer_id] = entry
 
     threading.Thread(
         target=_countdown, args=(timer_id, seconds, label, speak, player),

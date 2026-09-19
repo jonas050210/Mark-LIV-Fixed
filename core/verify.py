@@ -183,10 +183,79 @@ def _recheck_timer(tool: str, params: dict, dispatcher, result: str) -> Verifica
     return None
 
 
+def _recheck_uninstall_app(tool: str, params: dict, dispatcher,
+                           result: str) -> Verification | None:
+    """Removal is verified the only way it can be: the resolver no longer knows
+    the app. An uninstaller's exit code proves nothing here."""
+    from core import app_controller as _ac
+    from core import app_finder as _af
+
+    name = str(params.get("app_name") or params.get("name") or "").strip()
+    if not name:
+        return None
+    try:
+        if _af.resolve(name) is None:
+            return Verification(True, f"'{name}' is no longer installed.",
+                                method="recheck", evidence={"installed": False})
+    except Exception:
+        return None
+    running = None
+    try:
+        running = _ac.is_running(name)
+    except Exception:
+        running = None
+    if running is True:
+        detail = f"'{name}' is still installed and still running."
+    else:
+        detail = f"'{name}' is still installed."
+    return Verification(False, detail, method="recheck",
+                        evidence={"installed": True, "running": running})
+
+
+def _recheck_restart_app(tool: str, params: dict, dispatcher,
+                         result: str) -> Verification | None:
+    from core import app_controller as _ac
+
+    name = str(params.get("app_name") or params.get("name") or "").strip()
+    if not name:
+        return None
+    try:
+        running = _ac.is_running(name)
+    except Exception:
+        return None
+    if running is None:
+        return None
+    return Verification(running, f"'{name}' is {'running' if running else 'not running'}.",
+                        method="recheck", evidence={"running": running})
+
+
+def _recheck_window_control(tool: str, params: dict, dispatcher,
+                            result: str) -> Verification | None:
+    """Only `list` has a cheap ground truth; the rest degrade to text."""
+    if str(params.get("action") or "focus").strip().lower() not in ("list", "show"):
+        return None
+    from core import app_controller as _ac
+
+    try:
+        titles, _why = _ac.list_windows(limit=40)
+    except Exception:
+        return None
+    if titles is None:
+        return None
+    if titles:
+        return Verification(True, f"{len(titles)} titled window(s) are open.",
+                            method="recheck", evidence={"windows": len(titles)})
+    return Verification(False, "no titled windows are open.", method="recheck",
+                        evidence={"windows": 0})
+
+
 #: tool name → strong re-check. Missing tools fall back to text analysis.
 _RECHECKERS = {
     "open_app": _recheck_open_app,
     "close_app": _recheck_close_app,
+    "uninstall_app": _recheck_uninstall_app,
+    "restart_app": _recheck_restart_app,
+    "window_control": _recheck_window_control,
     "file_controller": _recheck_file_op,
     "file_processor": _recheck_file_op,
     "timer": _recheck_timer,
