@@ -78,6 +78,28 @@ def app_inventory(parameters=None, response=None, player=None,
             noun = "game" if len(games) == 1 else "games"
             return (f"Installed {noun} ({len(games)}): " + _fmt_names(games, limit) + ".")
 
+        if action in ("status", "running", "is_running", "state"):
+            # Installed is not running: the controller checks the process
+            # table, so "is Spotify running" gets a true answer, not a guess.
+            if not query:
+                return "Tell me which app to check."
+            try:
+                from core import app_controller as _ac
+            except Exception:
+                return "Running-state checks are unavailable (app_controller failed to load)."
+            try:
+                st = _ac.status(query)
+            except Exception as e:
+                return f"Status check failed ({type(e).__name__})."
+            msg = st.short()
+            if st.window_titles:
+                msg += f" Windows: {'; '.join(st.window_titles[:3])}."
+            if st.detail and not st.installed:
+                sugg = _af.suggest(query)
+                if sugg:
+                    msg += f" Did you mean: {', '.join(sugg)}?"
+            return msg
+
         if action in ("rescan", "refresh", "rebuild"):
             try:
                 n = _af.rescan_shortcuts()
@@ -103,15 +125,17 @@ TOOL = {
     "name": "app_inventory",
     "description": (
         "Inspects the locally installed applications. Use to answer 'what apps "
-        "do I have', 'do I have Spotify', 'what games are installed', and "
-        "'where is Chrome installed'. Never downloads or installs anything."
+        "do I have', 'do I have Spotify', 'what games are installed', "
+        "'where is Chrome installed', and 'is Spotify running' (action=status "
+        "checks the process table - installed is not the same as running). "
+        "Never downloads or installs anything."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | find | where | games | rescan (default: list)"
+                "description": "list | find | where | games | status | rescan (default: list)"
             },
             "query": {
                 "type": "STRING",

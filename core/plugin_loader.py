@@ -65,8 +65,15 @@ class PluginRegistry:
     # -- called by main.py at LiveConnectConfig build time --
     def get_tool_declarations(self) -> list[dict]:
         decls = []
+        _disabled_valid = []
         for name, rec in self._plugins.items():
-            if get_plugin_enabled(name):
+            try:
+                _enabled = bool(get_plugin_enabled(name))
+            except Exception:
+                # The enable flag is user config: a read error must never cost
+                # a valid plugin its tool - default to the opt-out model's on.
+                _enabled = True
+            if _enabled:
                 decl = {
                     "name": rec.name,
                     "description": rec.description,
@@ -75,6 +82,14 @@ class PluginRegistry:
                 if rec.behavior:
                     decl["behavior"] = rec.behavior
                 decls.append(decl)
+            elif rec.valid:
+                _disabled_valid.append(name)
+        if _disabled_valid:
+            # An empty tool list with valid plugins is ALWAYS this branch: say
+            # so by name, so the next tools=[] needs no detective work.
+            self._logger("Valid plugins disabled by user config "
+                         "(not offered as tools): "
+                         + ", ".join(sorted(_disabled_valid)))
         return decls
 
     def has(self, name: str) -> bool:
@@ -86,14 +101,16 @@ class PluginRegistry:
         return rec.scheduling if rec else None
 
     # -- called by main.py from _execute_tool's else branch --
-    def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
+    def run(self, name: str, parameters: dict, player=None, session_memory=None,
+            dispatcher=None) -> str:
         rec = self._plugins.get(name)
         if rec is None or not rec.valid:
             return f"Plugin '{name}' is not available."
         if not get_plugin_enabled(name):
             return f"The '{name}' plugin is currently disabled."
         try:
-            return _call_run(rec.run, parameters, player, session_memory) or "Done."
+            return _call_run(rec.run, parameters, player, session_memory,
+                             dispatcher) or "Done."
         except Exception as e:
             self._logger(f"Plugin '{name}' crashed during run(): {e}")
             self._notify(f"Plugin '{name}' failed — see the console for details.")
@@ -184,7 +201,7 @@ def _call_on_launch(hook_fn, player):
     return hook_fn()
 
 
-def _call_run(run_fn, parameters, player, session_memory):
+def _call_run(run_fn, parameters, player, session_memory, dispatcher=None):
     """Invoke run() passing only the kwargs it actually declares (or all of them
     if it has **kwargs), so a minimal `def run(parameters):` plugin still works."""
     sig = inspect.signature(run_fn)
@@ -194,6 +211,8 @@ def _call_run(run_fn, parameters, player, session_memory):
         kwargs["player"] = player
     if has_var_kw or "session_memory" in sig.parameters:
         kwargs["session_memory"] = session_memory
+    if dispatcher is not None and (has_var_kw or "dispatcher" in sig.parameters):
+        kwargs["dispatcher"] = dispatcher
     return run_fn(parameters, **kwargs)
 
 

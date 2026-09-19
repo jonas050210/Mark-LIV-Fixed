@@ -37,7 +37,9 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     parameters: dict of the args Gemini extracted, matching PLUGIN['parameters'].
     player: the JarvisUI instance — use player.write_log(f"JARVIS: ...") to log,
             same as actions/*.py. May be None.
-    session_memory: reserved, usually None today (core tools mostly pass None too).
+    session_memory: the SessionMemory of THIS run (turns only, RAM-only) —
+            read-only please; record nothing, persist nothing. May be None
+            when called outside the Live session.
     Return a short natural-language string — this is spoken back to the user.
     Never raise: catch your own errors and return a spoken error string instead
     (the loader also catches exceptions as a second safety net, but don't rely on it).
