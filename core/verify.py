@@ -63,24 +63,14 @@ _FAILURE_PHRASES: tuple[str, ...] = (
     "unsupported",
     "not supported",
     "not available",
+    "cannot verify",
+    "unverified",
+    "protected the game",
     "no results",
     "nothing found",
     "i don't know",
     "i do not know",
 )
-
-#: Phrases that REDEEM a result even when a failure phrase matched — e.g. a
-#: search that found nothing for one spelling but something for another, or an
-#: honest "permission denied, did not change anything" (a correct refusal is a
-#: successful no-op, not a failure to build on — but the plan must still stop
-#: before acting on the refused thing; callers treat ok=False + refused=True).
-_REFUSAL_PHRASES: tuple[str, ...] = (
-    "did you mean",
-    "showing instead",
-    "results for",
-    "found ",
-)
-
 
 def is_failure_text(result: str) -> bool:
     """Heuristic: does the tool's own reply read like a failure?"""
@@ -88,7 +78,8 @@ def is_failure_text(result: str) -> bool:
     if not low.strip():
         return True
     if any(p in low for p in _FAILURE_PHRASES):
-        if any(p in low for p in _REFUSAL_PHRASES):
+        if any(p in low for p in ("showing instead", "results for")) and not any(
+                p in low for p in ("permission", "refused", "denied", "forbidden")):
             return False
         return True
     return False
@@ -282,6 +273,9 @@ def verify(
     params = params or {}
     result = result if isinstance(result, str) else str(result)
 
+    if "[CONFIRMATION_PENDING]" in result or "[REFUSED]" in result:
+        return Verification(False, "Action not executed: " + result[:200], method="pending")
+
     checker = _RECHECKERS.get((tool or "").strip())
     if checker is not None:
         try:
@@ -289,6 +283,8 @@ def verify(
         except Exception as e:  # noqa: BLE001 — probes must never break plans
             strong = None
         if strong is not None:
+            if strong.ok and is_failure_text(result):
+                return Verification(False, "The tool reported failure despite existing state: " + result[:160], method="text")
             return strong
 
     if is_failure_text(result):

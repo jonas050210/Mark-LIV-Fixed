@@ -44,8 +44,8 @@ from pathlib import Path
 # and the safety side can never disagree about what an install request is.
 
 from core.install_safety import (  # noqa: E402  (kept next to their use)
-    INSTALLER_TARGET_RE,
-    INSTALL_INTENT_RE,
+    INSTALLER_TARGET_RE as INSTALLER_TARGET_RE,
+    INSTALL_INTENT_RE as INSTALL_INTENT_RE,
     classify_intent as _classify_install_intent,
     is_installer_target as _is_installer_target,
 )
@@ -477,7 +477,11 @@ def open(name: str, verify_seconds: float = 6.0) -> tuple[bool, str]:
     last_problem = f"{display} could not be started."
     for index, attempt in enumerate(_launch_strategies(tgt, _af)):
         try:
-            ok, msg = _af.launch(attempt)
+            from core.gaming import protect_focus
+            if protect_focus():
+                ok, msg = _af.launch(attempt, background=True)
+            else:
+                ok, msg = _af.launch(attempt)
         except Exception as e:
             diag = ""
             try:
@@ -551,7 +555,7 @@ def _shell_safe(title: str) -> bool:
     text = str(title or "")
     if not text.strip() or len(text) > 200:
         return False
-    return not any(ch in text for ch in '"\'\n\r')
+    return not any(ch in text for ch in '"\'\n\r\x00$`\\')
 
 
 def _window_titles_from_os(limit: int) -> tuple[list[str] | None, str]:
@@ -628,27 +632,52 @@ def _matching_windows(query: str, gw):
     return out
 
 
+def _window_flag(win, name):
+    """Missing/unreadable state is unknown, not evidence of success."""
+    try:
+        value = getattr(win, name, None)
+        return value if type(value) is bool else None
+    except Exception:
+        return None
+
+
 def _focus_via_os(title: str) -> tuple[bool, str]:
     """Platform command that raises a window, used when pygetwindow is absent."""
     if not _shell_safe(title):
         return False, "that window title cannot be used safely (quotes or control characters)"
+    titles, _ = _window_titles_from_os(100)
+    if titles is not None:
+        matches = [t for t in titles if title.casefold() in t.casefold()]
+        matches = [t for t in matches if t.casefold() == title.casefold()] or matches
+        if len(matches) > 1:
+            return False, "Several windows match; provide an exact, unique title."
+        if matches:
+            title = matches[0]
+            if not _shell_safe(title):
+                return False, "The resolved window title cannot be used safely."
     try:
         if sys.platform == "win32":
             script = (f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")')
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                            "-Command", script], capture_output=True, timeout=8,
+            response = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", script], capture_output=True, text=True, timeout=8,
                            **_no_window())
-            return True, f"asked Windows to bring '{title}' to the front"
+            if response.returncode or response.stdout.strip().lower() != "true":
+                return False, f"Windows did not accept focusing '{title}'."
+            observed = foreground_window()
+            verified = str(observed.get("title", "")).casefold() == title.casefold()
+            return verified, (f"'{title}' is in front now." if verified else
+                              f"Focus requested for '{title}', but the foreground window is unverified.")
         if sys.platform == "darwin":
             script = (f'tell application "System Events" to set frontmost of '
                       f'(first process whose name contains "{title}") to true')
-            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=8)
-            return True, f"asked macOS to bring '{title}' to the front"
+            response = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=8)
+            return False, (f"Focus request failed for '{title}'." if response.returncode else
+                           f"Focus requested for '{title}', but the foreground window is unverified.")
         for cmd in (["wmctrl", "-a", title],
                     ["xdotool", "search", "--name", title, "windowactivate"]):
             try:
                 if subprocess.run(cmd, capture_output=True, timeout=8).returncode == 0:
-                    return True, f"brought '{title}' to the front"
+                    return False, f"Focus requested for '{title}', but the foreground window is unverified."
             except FileNotFoundError:
                 continue
     except Exception as e:
@@ -657,8 +686,88 @@ def _focus_via_os(title: str) -> tuple[bool, str]:
                    "this machine — none of them is usable here")
 
 
+def foreground_window() -> dict:
+    """Read-only Windows observation. Never changes focus or attaches input queues."""
+    if sys.platform != "win32":
+        return {}
+    try:
+        import win32gui
+        import win32process
+        import win32api
+        hwnd = win32gui.GetForegroundWindow()
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if pid == _own_pid():
+            return {}
+        ps = _psutil()
+        process = ps.Process(pid)
+        path = process.exe()
+        rect = win32gui.GetWindowRect(hwnd)
+        monitor = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))["Monitor"]
+        fullscreen = all(abs(a - b) <= 2 for a, b in zip(rect, monitor))
+        return {"hwnd": hwnd, "pid": pid, "exe": process.name().lower(), "path": path,
+                "title": win32gui.GetWindowText(hwnd), "fullscreen": fullscreen,
+                "monitor_device": win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd)).get("Device", "")}
+    except Exception:
+        return {}
+
+
+def _geometry_action(win, action, monitor=None, width=None, height=None, topmost=False):
+    """Work-area geometry with SWP_NOACTIVATE; verifies the resulting rectangle."""
+    if sys.platform != "win32":
+        return False, "Monitor placement is currently supported on Windows only."
+    try:
+        import win32api
+        import win32gui
+        import win32con
+        import win32process
+        hwnd = win._hWnd
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        ps = _psutil()
+        if ps is None or pid == _own_pid() or _is_protected_name(ps.Process(pid).name()):
+            return False, "Window placement refused for a protected or unverifiable process."
+        if not win32gui.IsWindow(hwnd):
+            return False, "That window no longer exists."
+        current = win32gui.GetWindowRect(hwnd)
+        monitors = [entry[0] for entry in win32api.EnumDisplayMonitors()]
+        selected = win32api.MonitorFromWindow(hwnd)
+        if monitor is not None:
+            index = int(monitor) - 1
+            if not 0 <= index < len(monitors):
+                return False, f"Choose a monitor from 1 to {len(monitors)}."
+            selected = monitors[index]
+        l, t, r, b = win32api.GetMonitorInfo(selected)["Work"]
+        x, y = max(l, current[0]), max(t, current[1])
+        w, h = min(current[2] - current[0], r-l), min(current[3] - current[1], b-t)
+        if action in ("snap_left", "snap_right"):
+            w, h, y = (r-l)//2, b-t, t
+            x = l if action == "snap_left" else r-w
+        elif action == "resize":
+            w = max(160, min(int(width), r-l))
+            h = max(100, min(int(height), b-t))
+        x, y = min(x, r-w), min(y, b-h)
+        flags = win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER
+        order = 0
+        if action == "always_on_top":
+            flags = win32con.SWP_NOACTIVATE | win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            order = win32con.HWND_TOPMOST if topmost else win32con.HWND_NOTOPMOST
+        win32gui.SetWindowPos(hwnd, order, x, y, w, h, flags)
+        if action == "always_on_top":
+            actual = bool(win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST)
+            ok = actual == bool(topmost)
+        else:
+            actual = win32gui.GetWindowRect(hwnd)
+            ok = all(abs(a-b) <= 2 for a, b in zip(actual, (x, y, x+w, y+h)))
+        return ok, (f"Window {action} verified." if ok else
+                    "The app did not accept the requested window geometry; it may enforce a minimum size.")
+    except (TypeError, ValueError):
+        return False, "Resize needs numeric width and height; monitor numbers start at 1."
+    except Exception as exc:
+        return False, f"Window placement unavailable: {type(exc).__name__}."
+
+
 def window_action(action: str, name: str = "", title: str = "",
-                  limit: int = 40) -> tuple[bool, str]:
+                  limit: int = 40, *, monitor=None, width=None, height=None,
+                  topmost=False) -> tuple[bool, str]:
     """List, focus, minimize, maximize or restore windows. Never raises.
 
     ``name`` is an app name (resolved to its own window titles) and ``title`` a
@@ -667,7 +776,7 @@ def window_action(action: str, name: str = "", title: str = "",
     act = str(action or "").strip().lower()
     _KNOWN = ("list", "show", "focus", "activate", "switch", "minimize",
               "minimise", "maximize", "maximise", "restore", "unminimize",
-              "unminimise")
+              "unminimise", "snap_left", "snap_right", "move_monitor", "resize", "always_on_top")
     if act not in _KNOWN:
         return False, (f"Unknown window action '{action}'. Use: list, focus, "
                        f"minimize, maximize, restore.")
@@ -699,7 +808,22 @@ def window_action(action: str, name: str = "", title: str = "",
             wins = _matching_windows(query, gw)
         except Exception:
             wins = []
+    exact = [w for w in wins if str(w.title).casefold() == query.casefold()]
+    if exact:
+        wins = exact
+    if len(wins) > 1:
+        return False, "Several windows match. Give an exact title: " + "; ".join(str(w.title) for w in wins[:5])
     win = wins[0] if wins else None
+
+    from core.gaming import protect_focus
+    protected = protect_focus()
+    if protected and (act in ("maximize", "maximise", "restore", "unminimize", "unminimise")
+                      or (act == "always_on_top" and topmost)):
+        return False, "Gaming Mode protected the game. Explicitly focus the utility first to bring it forward."
+    if act in ("snap_left", "snap_right", "move_monitor", "resize", "always_on_top"):
+        if win is None:
+            return False, f"I could not find a window matching '{query}'."
+        return _geometry_action(win, act, monitor, width, height, topmost)
 
     if act in ("focus", "activate", "switch"):
         if win is not None:
@@ -707,15 +831,11 @@ def window_action(action: str, name: str = "", title: str = "",
                 if bool(getattr(win, "isMinimized", False)):
                     win.restore()
                 win.activate()
-                ok = True
-                try:
-                    ok = bool(getattr(win, "isActive", True))
-                except Exception:
-                    ok = True
+                ok = _window_flag(win, "isActive") is True
                 if ok:
                     return True, (f"'{win.title}' is in front now."
                                   if getattr(win, "title", "") else "Window focused.")
-                return True, (f"Asked '{query}' to come to the front, but it is "
+                return False, (f"Asked '{query}' to come to the front, but it is "
                               f"not the active window yet.")
             except Exception as e:
                 return False, f"Could not focus '{query}': {type(e).__name__}."
@@ -730,13 +850,9 @@ def window_action(action: str, name: str = "", title: str = "",
             win.minimize()
         except Exception as e:
             return False, f"Could not minimize '{query}': {type(e).__name__}."
-        try:
-            done = bool(getattr(win, "isMinimized", True))
-            return True, (f"'{win.title}' is minimized." if done else
-                          f"Asked '{win.title}' to minimize, but it does not "
-                          f"report being minimized.")
-        except Exception:
-            return True, f"Asked '{win.title}' to minimize."
+        done = _window_flag(win, "isMinimized") is True
+        return done, (f"'{win.title}' is minimized." if done else
+                      f"Minimize requested for '{query}', but the resulting state is unverified.")
 
     if act in ("maximize", "maximise"):
         if win is None:
@@ -745,20 +861,19 @@ def window_action(action: str, name: str = "", title: str = "",
             win.maximize()
         except Exception as e:
             return False, f"Could not maximize '{query}': {type(e).__name__}."
-        try:
-            done = bool(getattr(win, "isMaximized", True))
-            return True, (f"'{win.title}' is maximized." if done else
-                          f"Asked '{win.title}' to maximize, but it does not "
-                          f"report being maximized.")
-        except Exception:
-            return True, f"Asked '{win.title}' to maximize."
+        done = _window_flag(win, "isMaximized") is True
+        return done, (f"'{win.title}' is maximized." if done else
+                      f"Maximize requested for '{query}', but the resulting state is unverified.")
 
     if act in ("restore", "unminimize", "unminimise"):
         if win is None:
             return False, f"I could not find a window matching '{query}'."
         try:
             win.restore()
-            return True, f"'{win.title}' is restored."
+            done = (_window_flag(win, "isMinimized") is False
+                    and _window_flag(win, "isMaximized") is False)
+            return done, (f"'{win.title}' is restored." if done else
+                          f"Restore requested for '{query}', but the resulting state is unverified.")
         except Exception as e:
             return False, f"Could not restore '{query}': {type(e).__name__}."
 
@@ -825,7 +940,6 @@ def run_uninstall(plan, name: str = "", *, timeout: float = 180.0,
     central activity registry's :class:`core.tasks.Task`) is told what is going
     on while the uninstaller runs.
     """
-    from core import app_finder as _af
 
     def _note(detail: str) -> None:
         if task is not None:

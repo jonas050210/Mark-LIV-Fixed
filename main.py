@@ -628,6 +628,11 @@ class JarvisLive:
         self._asst_name     = "JARVI    S"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
+        self._standard_german = True
+        self._silent_voice = False
+        self._speech_generation = 0
+        self._standard_voice_lock = None
+        self._standard_voice_task = None
         self.out_queue            = None
         self._loop                     = None
         self._is_speaking         = False
@@ -768,9 +773,11 @@ class JarvisLive:
         _router = get_speech_router()
         _router.set_live_provider(
             is_connected=lambda: self.session is not None,
-            speak=lambda text: self.speak(text),
+            speak=lambda text: self._speak_live(text),
         )
         _router.set_log(self.ui.write_log)
+        _router.set_transcript(self._publish_assistant)
+        _router.set_activity(lambda: self.set_speaking(True), lambda: self.set_speaking(False))
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -1070,6 +1077,7 @@ class JarvisLive:
         # explicitly submitted should wake JARVIS and then be sent.
         if self._wake_enabled and not self._awake:
             self.wake(reason="typed command")
+        self._last_out_logged = ""
         self._queue_or_send(text, source="typed")
 
     def _queue_or_send(self, text: str, source: str = "text") -> None:
@@ -1269,32 +1277,97 @@ class JarvisLive:
         # turn_complete) and skipped its transcript — with no way back.
         with self._speaking_lock:
             _speaking_now = self._is_speaking
+        get_speech_router().stop()
+        self._speech_generation += 1
         q = self.audio_in_queue
+        turn_done = self._turn_done_event
         try:
             _queued_now = bool(q is not None and not q.empty())
         except Exception:
             _queued_now = False
         self._interrupted = bool(_speaking_now or _queued_now)
-        if q:
-            drained = 0
-            while True:
-                try:
-                    q.get_nowait()
-                    drained += 1
-                except Exception:
-                    break
-            if drained:
-                print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+        def clear_output():
+            from core.german_voice import cancel_pending
+            cancel_pending(self)
+            if q is not None:
+                while True:
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            if turn_done:
+                turn_done.clear()
+        loop = getattr(self, "_loop", None)
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(clear_output)
+            except RuntimeError:
+                pass  # The connection loop is already closing.
+        else:
+            clear_output()
         self.set_speaking(False)
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
         self._play_primed = False   # next utterance re-accumulates its cushion
-        if self._turn_done_event:
-            self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
 
+    async def _queue_standard_voice(self, text, generation, queue):
+        from core.german_voice import render_pcm
+        if getattr(self, "_silent_voice", False):
+            return
+        if self._standard_voice_lock is None:
+            self._standard_voice_lock = asyncio.Lock()
+        async with self._standard_voice_lock:
+            if generation != self._speech_generation or queue is not self.audio_in_queue:
+                return
+            pending = self._standard_voice_task = asyncio.current_task()
+            self._standard_voice_generation = generation
+            try:
+                pcm = await render_pcm(text)
+                if generation != self._speech_generation or queue is not self.audio_in_queue:
+                    return
+                if self._turn_done_event:
+                    self._turn_done_event.clear()
+                for offset in range(0, len(pcm), 2400):
+                    if generation != self._speech_generation or queue is not self.audio_in_queue:
+                        return
+                    # Never leave a blocked put() alive across interruption: it
+                    # would enqueue stale speech as soon as the player drains.
+                    while queue.full():
+                        await asyncio.sleep(.01)
+                        if generation != self._speech_generation or queue is not self.audio_in_queue:
+                            return
+                    queue.put_nowait(pcm[offset:offset + 2400])
+                if self._turn_done_event:
+                    self._turn_done_event.set()
+            except Exception as exc:
+                self.ui.write_log(f"SYS: German speech unavailable ({exc}). The complete response is in chat.")
+            finally:
+                if self._standard_voice_task is pending:
+                    self._standard_voice_task = None
+
+    def _publish_assistant(self, text: str) -> None:
+        """The sole final-response sink for Live, tools and offline announcements."""
+        text = text.strip()
+        if not text:
+            return
+        self.ui.write_log(f"{self._asst_name}: {text}")
+        self._session_memory.add_assistant(text, self._asst_name)
+        if self._dashboard and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._dashboard.broadcast({
+                "type": "log", "speaker": "jarvis", "text": text,
+                "ts": datetime.now().isoformat(),
+            }), self._loop)
+
     def speak(self, text: str) -> bool:
+        """All action/timer/error announcements use the shared voice/transcript router."""
+        if not (text or "").strip():
+            return False
+        get_speech_router().announce(text)
+        return True
+
+    def _speak_live(self, text: str) -> bool:
         """Queue `text` to be spoken by the Live session.
 
         Returns True when the line was handed to the session, False when there
@@ -1305,14 +1378,18 @@ class JarvisLive:
         if not self._loop or not self.session:
             return False
         try:
-            asyncio.run_coroutine_threadsafe(
+            self._last_out_logged = ""
+            future = asyncio.run_coroutine_threadsafe(
                 self.session.send_client_content(
                     turns={"role": "user", "parts": [{"text": text}]},
                     turn_complete=True
                 ),
                 self._loop
             )
+            future.result(timeout=10)  # speech-router worker, never the UI/event-loop thread
         except Exception:
+            if "future" in locals():
+                future.cancel()
             return False
         return True
 
@@ -1323,6 +1400,9 @@ class JarvisLive:
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
+        from memory.config_manager import get_gui_settings
+        self._standard_german = get_gui_settings().get("standard_german_voice", True)
+        self._silent_voice = get_speech_router().mode() == "silent"
 
         # Load customization from config
         try:
@@ -2005,7 +2085,7 @@ class JarvisLive:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
 
-                    if response.data:
+                    if response.data and not self._standard_german and not self._silent_voice:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -2025,6 +2105,11 @@ class JarvisLive:
                         sc = response.server_content
 
                         if sc.interrupted:
+                            self._interrupted = True
+                            self._speech_generation += 1
+                            from core.german_voice import cancel_pending
+                            cancel_pending(self)
+                            out_buf = []
                             # Server-side VAD heard the user over our reply and
                             # stopped generating. The audio already queued is
                             # now stale: drop it instead of talking over them.
@@ -2091,10 +2176,8 @@ class JarvisLive:
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
-                                in_buf  = []
                                 out_buf = []
                                 self._visemes.reset()
-                                continue
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -2118,14 +2201,10 @@ class JarvisLive:
                                     full_out = ""
                             if full_out:
                                 self._last_out_logged = full_out
-                                self.ui.write_log(f"{self._asst_name}: {full_out}")
-                                self._session_memory.add_assistant(full_out, self._asst_name)
-                                if self._dashboard:
-                                    _spawn(self._dashboard.broadcast({
-                                        "type": "log", "speaker": "jarvis",
-                                        "text": full_out,
-                                        "ts": datetime.now().isoformat(),
-                                    }))
+                                self._publish_assistant(full_out)
+                                if self._standard_german:
+                                    _spawn(self._queue_standard_voice(full_out, self._speech_generation,
+                                                                     self.audio_in_queue), "standard-german-voice")
                             out_buf = []
 
                     if response.tool_call:
@@ -2871,6 +2950,9 @@ class JarvisLive:
                     # ~20 s of 50 ms slices. Bounded so a receive flood with a
                     # stuck player grows memory by seconds of audio, not
                     # unbounded — the queue drops rather than hoards.
+                    self._speech_generation += 1
+                    from core.german_voice import cancel_pending
+                    cancel_pending(self)
                     self.audio_in_queue   = asyncio.Queue(maxsize=400)
                     self.out_queue        = self._reuse_mic_queue()
                     self._turn_done_event = asyncio.Event()

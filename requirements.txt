@@ -14,6 +14,8 @@ PyQt6>=6.6,<7
 sounddevice>=0.4,<1
 numpy>=1.24,<3
 google-genai>=2.8.0,<3
+edge-tts>=7,<8               # explicit Standard German acoustic voice
+miniaudio>=1.61,<2           # decode TTS into the existing PCM player
 
 # ── Web search & browser control ──────────────────────────────────────────────
 requests>=2.31,<3

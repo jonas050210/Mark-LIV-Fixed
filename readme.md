@@ -385,7 +385,6 @@ Mark LIV/
 ├── test_overall.py           # Live validation report: PASS / FAIL / TIMEOUT / SKIPPED
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
-│   ├── telegram_remote.py    # Control JARVIS from Telegram; optional extras need _telegram_ops.py
 │   ├── chat_takeover.py      # Watches the focused chat on screen and pastes/sends replies there
 │   ├── document_review.py    # Contracts and policies in plain language, ordered by what matters
 │   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
@@ -463,7 +462,6 @@ without the loader showing the helper as a separate skill.
 
 | Plugin | What it does | Setup / safety notes |
 | --- | --- | --- |
-| `telegram_remote` **(parked)** | Starts a Telegram long-poll bridge — **temporarily disabled in this build**: the file is still discovered and listed in 🧩 PLUGINS, but it is not offered as a tool, its launch hook does not run, and calling it says so. Nothing was deleted; the plugin is parked until its bridge ships again. | Original notes:  so approved private chats can send typed or voice-note commands to this JARVIS session from anywhere. It opens no inbound port; all traffic is outbound HTTPS to Telegram. | Configure the bot token, pairing code and approved chat IDs in ⚙ → PLUGIN SETTINGS. It is off until you start it, unless you deliberately enable **Start listening when JARVIS launches**. Screenshot, camera and hardware-readout extras require `plugins/_telegram_ops.py` next to the plugin; without that helper the core remote still loads and works, but `/screen` and `/sys` are unavailable. |
 | `chat_takeover` | Watches the messaging conversation currently visible on screen and replies in the user's texting style until stopped. It can use its own Gemini Live session and falls back to REST if Live is unavailable. | Before starting, click into the message input box yourself. The plugin pastes into the currently focused chat window and uses a focus guard to stop if focus moves, but it still controls the real keyboard/clipboard, so do not start it while another app is focused. |
 | `document_review` | Presents a structured, readable review of a document: summary, serious/caution/note findings, quotes, suggestions and unclear points. | No setup and no legal rulebook inside the plugin. JARVIS must first read the document text from an upload, screen or camera; the plugin only lays out what the model found, in the user's language. |
 
@@ -491,7 +489,7 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
-The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
+The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement. Plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
 
 The phone dashboard is **not reachable from your network until you say so**: it binds `127.0.0.1` and asks the OS for no firewall rule at all. The switch lives in the Remote Access panel (*ALLOW PHONE ACCESS*), it moves the socket while the app runs, and your choice is remembered in `config/api_keys.json`.
 

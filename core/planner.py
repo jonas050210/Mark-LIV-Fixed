@@ -199,6 +199,7 @@ def decompose(goal: str, tool_names: list[str] | None = None) -> list[dict]:
     the local-AI fallback gets a chance at the whole goal.
     """
     goal = (goal or "").strip()
+    goal = re.sub(r"^(?:please\s+)?(?:analy[sz]e|plan|analysiere|plane)\s+(?:(?:this|the|diese|die)\s+)?(?:task|aufgabe)?\s*[:–-]\s*", "", goal, flags=re.I)
     if not goal:
         return []
     # tool_names=None: availability unknown, no grounding. tool_names=[]:
@@ -207,6 +208,7 @@ def decompose(goal: str, tool_names: list[str] | None = None) -> list[dict]:
              if tool_names is not None else None)
     steps: list[dict] = []
     clauses = [c.strip() for c in _STEP_SPLIT_RE.split(goal) if c and c.strip()]
+    unplanned = list(clauses[6:])
     for clause in clauses[:6]:
         for pattern, tool, builder in _RULES:
             m = pattern.search(clause)
@@ -226,19 +228,17 @@ def decompose(goal: str, tool_names: list[str] | None = None) -> list[dict]:
                 real = tool
             steps.append({"tool": real, "params": params, "why": clause[:120]})
             break
+        else:
+            unplanned.append(clause)
+    if steps and unplanned:
+        steps[0]["unplanned"] = unplanned
     return steps
 
 
 def _ground_local_steps(raw: list[dict], tool_names: list[str]) -> list[dict]:
-    known = {t.lower(): t for t in tool_names}
-    steps: list[dict] = []
-    for step in raw[:6]:
-        tool = str(step.get("tool", "")).strip()
-        params = step.get("params", {})
-        if tool.lower() in known and isinstance(params, dict):
-            steps.append({"tool": known[tool.lower()], "params": params,
-                          "why": f"local model: {tool}"})
-    return steps
+    from core.plan_validation import ground_steps
+    return [{**step, "why": f"local model: {step['tool']}"}
+            for step in ground_steps(raw, tool_names, allow_partial=True)]
 
 
 def plan(goal: str, tool_names: list[str] | None = None) -> list[dict]:
@@ -368,18 +368,43 @@ def run_plan(
         return "The action planner is not connected — nothing was run."
 
     available = tool_names if tool_names is not None else _available(dispatcher)
-    steps = plan(goal, available)[: max(1, max_steps)]
+    planned = plan(goal, available)
+    steps = planned[: max(1, max_steps)]
+    unplanned = (list(steps[0].get("unplanned", [])) if steps else [])
+    unplanned += [s.get("why") or s["tool"] for s in planned[len(steps):]]
     if not steps:
+        if re.match(r"^(?:please\s+)?(?:analy[sz]e|plan|analysiere|plane)\b", goal.strip(), re.I):
+            return ("I can help identify the objective, required inputs, dependencies and a way to verify the result. "
+                    "Please include the concrete task or desired outcome. No actions have been run.")
         return (
             f"I could not break that down into anything I can do: '{goal[:120]}'. "
             "Try a single direct command instead."
         )
 
+    analysis = re.match(r"^(?:please\s+)?(?:analy[sz]e|plan|analysiere|plane)\b\s*(.*)$", goal.strip(), re.I)
+    if analysis:
+        lines = [f"Objective: {analysis.group(1)}", "Proposed steps (not executed):"]
+        for index, step in enumerate(steps):
+            deps = step.get("depends_on", [])
+            prerequisites = [j + 1 for j, earlier in enumerate(steps[:index]) if _depends_on(step, earlier)]
+            prerequisites = sorted(set(prerequisites + [d + 1 for d in deps]))
+            lines.append(f"{index + 1}. {step['tool']} — {step.get('params', {})}"
+                         + (f"; requires steps {prerequisites}" if prerequisites else ""))
+        if unplanned:
+            lines.append("Unresolved: " + "; ".join(str(x) for x in unplanned))
+        lines.append("Verify each tool's result before dependent work. No actions have been run.")
+        if task is not None:
+            task.finish(detail="Analysis prepared; no actions executed")
+        return "\n".join(lines)
+
     total = len(steps)
     if task is None:
         title = goal.strip()[:60] or "Multi-step task"
         task = tasks.start(tasks.KIND_AGENT, title,
-                           detail=f"0/{total} steps planned")
+                           detail=f"0/{total} steps planned", pausable=True)
+
+    task.update(pausable=True)
+    task.patch_meta(unplanned=unplanned)
 
     def _cancelled() -> bool:
         try:
@@ -390,7 +415,9 @@ def run_plan(
     def _run_step(step: dict) -> tuple[str, Verification]:
         tool, params = step["tool"], step.get("params", {})
         try:
-            result = dispatcher.run(tool, params, ctx) or "Done."
+            result = dispatcher.run(tool, params, ctx)
+            if not result:
+                return "No result was returned.", Verification(False, "No result was returned; completion is unverified.", method="none")
         except Exception as e:  # noqa: BLE001 — dispatcher already stringifies;
             result = f"Tool '{tool}' failed: {e}"  # this is the last-resort net
         if verify_steps:
@@ -399,6 +426,12 @@ def run_plan(
             verdict = Verification(True, "verification skipped", method="none")
         return result, verdict
 
+    step_states = [{"title": s.get("why") or s["tool"], "state": "queued"} for s in steps]
+    blocked = []
+    def publish():
+        task.patch_meta(steps=step_states)
+    publish()
+
     done: list[str] = []
     failed_steps: list[tuple[dict, str, str]] = []   # step, detail, recovery note
     ran_after_failure: list[str] = []                # steps run despite a failure
@@ -406,16 +439,39 @@ def run_plan(
 
     for i, step in enumerate(steps):
         tool = step["tool"]
-        if _cancelled():
+        if not task.checkpoint() or _cancelled():
             task.cancel("Stopped at your request.")
             progress = (f"Finished {len(done)} of {total} steps. " if done else "")
             return (f"{progress}Stopped at your request before step {i + 1} "
                     f"('{tool}'). Nothing else was run.")
+        deps = step.get("depends_on", [])
+        if any(_depends_on(step, bad) for bad in blocked) or any(
+                isinstance(d, int) and 0 <= d < i and step_states[d]["state"] != "done"
+                for d in deps):
+            step_states[i]["state"] = "blocked"
+            blocked.append(step)
+            publish()
+            continue
+        step_states[i]["state"] = "running"
+        publish()
         task.update(detail=f"step {i + 1}/{total}: {tool}", progress=i / total)
 
         result, verdict = _run_step(step)
         last_result = result
+        task.patch_meta(output=str(result)[:4000])
+        task.append_meta("events", f"Step {i+1}: {verdict.detail or result[:200]}", limit=20)
+        # A tool already in flight cannot be recalled. Publish its actual outcome,
+        # then honor cancellation before any recovery or further tool dispatch.
+        if _cancelled():
+            step_states[i]["state"] = "done" if verdict.ok else "failed"
+            for remaining in step_states[i + 1:]:
+                remaining["state"] = "cancelled"
+            publish()
+            task.cancel("Stopped after the in-flight tool returned; its effects were not undone.")
+            return f"Stopped at your request after '{tool}' returned: {result}. No further actions were run."
         if verdict.ok:
+            step_states[i]["state"] = "done"
+            publish()
             entry = f"{tool}: {verdict.detail}" if verdict.detail else tool
             (ran_after_failure if failed_steps else done).append(entry)
             continue
@@ -434,6 +490,11 @@ def run_plan(
             if fallback and str(fallback.get("tool", "")).lower() in available:
                 task.update(detail=f"step {i + 1}/{total}: {fallback['tool']} "
                                    f"(recovery after {tool} failed)")
+                if not task.checkpoint():
+                    step_states[i]["state"] = "failed"
+                    publish()
+                    task.cancel("Stopped before recovery; the failed tool was not retried.")
+                    return f"'{tool}' failed. Stopped at your request before recovery."
                 _, rverdict = _run_step(fallback)
                 # The fallback is *investigation*, not one of the goal's steps:
                 # it is reported in the note and never counted as progress.
@@ -445,24 +506,15 @@ def run_plan(
                                      f"{detail_text or 'no result'}.")
         failed_steps.append((step, detail, recovery_note))
 
-        # Do not abandon independent work just because one step failed, and do
-        # not run a step that stands on the failed one (e.g. "close X" after
-        # "open X" failed). Either way the failure is reported as a failure.
-        remaining = steps[i + 1:]
-        if any(_depends_on(later, step) for later in remaining):
-            task.fail(error=f"step {i + 1} ('{tool}') failed",
-                      detail=detail[:160])
-            progress = (
-                f"Finished {len(done)} of {total} steps. "
-                if total > 1 else ""
-            ) + (f"Done: {'; '.join(done)}. " if done else "")
-            return (
-                f"{progress}Step {i + 1} ('{tool}') did not succeed: {detail}"
-                f"{recovery_note} The remaining step(s) need it, so I stopped "
-                f"there instead of pretending the rest could work."
-            )
+        blocked.append(step)
+        step_states[i]["state"] = "failed"
+        publish()
 
     if not failed_steps:
+        if unplanned:
+            missing = "; ".join(str(x) for x in unplanned)
+            task.fail(error="Objective only partly executable", detail=f"Not run: {missing[:200]}")
+            return f"Completed {len(done)} supported step(s). Not run: {missing}. The full objective is not complete."
         if total == 1:
             # A single step is a direct command: report the tool's own words.
             task.finish(detail="done")
@@ -489,7 +541,7 @@ def run_plan(
             f"{progress}{'Done: ' + '; '.join(done) + '. ' if done else ''}"
             f"Step {first_index} ('{first_step['tool']}') did not succeed: "
             f"{first_detail}{first_note} I stopped there instead of continuing "
-            f"on a step that failed."
+            f"on a step that failed. Dependent steps were not run."
         )
     # Steps that did not depend on the failed one were carried on with, so the
     # user gets both halves: what worked anyway, and what still needs them.
@@ -497,7 +549,7 @@ def run_plan(
         f"{worked} of {total} steps worked. Step {first_index} "
         f"('{first_step['tool']}') did not succeed: {first_detail}{first_note} "
         f"Carried on with: {'; '.join(ran_after_failure)}. "
-        f"The steps still open: {names}."
+        f"The steps still open: {names}. Dependent steps were not run."
     )
 
 

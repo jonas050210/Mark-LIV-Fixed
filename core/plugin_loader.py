@@ -39,7 +39,6 @@ from typing import Callable, Optional
 #: dict on purpose — the plugin stays first-class and loadable; only the live
 #: session leaves it out.
 PARKED_PLUGINS: dict[str, str] = {
-    "telegram_remote": "temporarily disabled (no bridge is started)",
 }
 
 

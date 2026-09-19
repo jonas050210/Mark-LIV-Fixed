@@ -4,8 +4,8 @@ Multi-step agent — "open Spotify and then search for jazz" as one command.
 Thin voice-facing wrapper over core/planner.py: the goal is decomposed into
 tool steps (rules first, optional local model as fallback), each step runs
 through the shared tool dispatcher, and each result is verified before the
-next step runs. The first unverified step stops the plan with an honest
-message — later steps are never built on a success that never happened.
+next step runs. Failed prerequisites block their dependents; independent work continues.
+Explicit "analyze task:" / "plan:" requests produce a dry run, not actions.
 
 Single-step goals run directly with no planning ceremony, exactly as if the
 underlying tool had been called.
@@ -71,8 +71,9 @@ TOOL = {
     "description": (
         "Runs a MULTI-STEP goal as one command ('open Spotify and search for "
         "jazz', 'schließe Chrome und öffne dann Discord'). Each step is "
-        "executed in order and verified before the next runs; the plan stops "
-        "at the first failed step and says so honestly. Prefer a direct tool "
+        "executed in order and verified; failed dependencies are blocked while "
+        "independent work continues. Prefix with 'analyze task:' for a plan "
+        "without executing actions. Prefer a direct tool "
         "whenever one can do the job — use this only for genuine sequences."
     ),
     "parameters": {
