@@ -21,15 +21,32 @@ Two things it deliberately does NOT install:
   * anything for the avatar — the holographic head renders in software on the
     PyQt6 and numpy already listed here. No GPU, no OpenGL, no extra packages.
 """
+# Entry-point imports: build_parser() needs argparse before the first line of
+# output, and the install steps need run_live. tests/test_setup_execution.py
+# pins both, so a future edit that drops one of these fails the suite instead
+# of shipping a setup script that crashes with a bare NameError.
 import argparse
 import importlib.metadata as importlib_metadata
 import os
 import platform
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
-from core.command_runner import run_live
+try:
+    from core.command_runner import run_live
+except ImportError as exc:
+    # A truncated or partial clone must say so in plain words, not dump a
+    # traceback the user has to decode.
+    print(
+        "\nNOT READY — setup.py cannot import core.command_runner "
+        f"({exc.__class__.__name__}: {exc}).\n"
+        "    A truncated or partial clone is the usual cause. Re-clone the "
+        "repository and run setup again.",
+        flush=True,
+    )
+    raise SystemExit(1)
 
 OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 HERE = Path(__file__).resolve().parent
@@ -497,4 +514,12 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"\nNOT READY — {exc}", flush=True)
+        raise SystemExit(1)
+    except Exception as exc:
+        # Any other crash must still look like a verdict: keep the traceback
+        # for debugging, but never leave the user staring at one without a
+        # NOT READY and a non-zero exit code.
+        traceback.print_exc()
+        print(f"\nNOT READY — setup crashed before verification finished: "
+              f"{exc.__class__.__name__}: {exc}", flush=True)
         raise SystemExit(1)

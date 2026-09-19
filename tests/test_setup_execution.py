@@ -1,7 +1,9 @@
 """Setup orchestration regressions: no downloads or native browser dependencies."""
 import io
+import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -103,3 +105,56 @@ def test_failed_download_does_not_prevent_attempting_other_engines(monkeypatch, 
 def test_satisfied_packages_do_not_invoke_pip(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "_run", Mock(side_effect=AssertionError("unexpected pip")))
     assert S._install_requirements([], tmp_path / "requirements.txt")
+
+
+def test_entry_point_imports_pinned(monkeypatch, capsys):
+    """Regression pin: "NameError: name 'argparse' is not defined".
+
+    A fresh "py setup.py" must reach its plan line with argparse and the live
+    runner import intact. If a future edit drops "import argparse" (the
+    reported regression), these asserts fail the suite instead of shipping a
+    setup script that crashes before it can explain itself.
+    """
+    assert isinstance(getattr(S, "argparse", None), types.ModuleType), \
+        "setup.argparse is missing — build_parser() would NameError at startup"
+    assert getattr(S, "run_live", None) is not None, \
+        "setup.run_live is missing — _run() would fail during the install steps"
+    parser = S.build_parser()
+    assert parser.parse_args([]).browsers is None
+    assert parser.parse_args(["--yes"]).yes is True
+    assert parser.parse_args(["--browsers", "firefox"]).browsers == "firefox"
+
+
+def test_main_completes_with_dead_stdin(monkeypatch, capsys):
+    """Zero user input: main() must finish with a console it cannot read.
+
+    stdin is replaced with a stream that raises on any read and input() is
+    rigged to fail — if any code path asks a question, this test goes red.
+    """
+
+    class DeadStdin(io.StringIO):
+        def read(self, *args):
+            raise AssertionError("setup read stdin")
+        def readline(self, *args):
+            raise AssertionError("setup read stdin")
+        def __iter__(self):
+            raise AssertionError("setup iterated stdin")
+
+    monkeypatch.setattr(sys, "stdin", DeadStdin())
+    monkeypatch.delenv(S.ENV_BROWSERS, raising=False)
+    monkeypatch.setattr("builtins.input", Mock(side_effect=AssertionError("setup prompted")))
+    assert S.main(["--dry-run"]) == 0
+
+
+def test_missing_core_module_fails_with_verdict_not_traceback(tmp_path):
+    """A partial clone (no core/) must say NOT READY, not dump a traceback."""
+    target = tmp_path / "setup.py"
+    shutil.copy(REPO / "setup.py", target)
+    proc = subprocess.run([sys.executable, str(target)], cwd=tmp_path,
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1
+    assert "NOT READY" in out
+    assert "core.command_runner" in out
+    assert "Traceback (most recent call last)" not in out
