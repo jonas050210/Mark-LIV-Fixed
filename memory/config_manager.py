@@ -518,3 +518,301 @@ def get_local_tts_voice() -> str:
 
 def save_local_tts_voice(name: str) -> bool:
     return _patch_config(local_tts_voice=(name or "").strip())
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# GUI / HUD presentation -- Mark LIV 54.
+# Every one of these has a sane default and is read by the UI at build
+# time, on resize, or when the user opens the customize overlay.
+# They are independent: changing the font size does not move the
+# panels around, and turning the animation off does not change the
+# colour. Missing/garbage values fall back to defaults.
+#
+# "ui_mode" controls how much of the chrome is shown:
+#   compact   -- single column, small panels, hud only when needed
+#   normal    -- current 3-column layout (left sysmonitor / centre hud / right log)
+#   expanded  -- wider content panel, larger fonts, more breathing room
+#
+# "hud_anchor" controls where the face/reactor sits when an active task is
+# running. The HUD still animates smoothly between idle (centred) and
+# active positions, and any combination of (ui_mode, hud_anchor, hud_size_*)
+# is valid.
+UI_MODES        = ("compact", "normal", "expanded")
+HUD_ANCHORS     = ("center", "topleft", "topright")
+PANEL_MODES     = ("auto", "always", "off")    # task/activity overlay display
+
+# Bounded numeric ranges -- every getter clamps. These are deliberately
+# generous so an aggressive user can shrink / enlarge things to taste, but
+# a typo cannot produce a UI that is invisible or off-screen.
+_MIN_SCALE,  _MAX_SCALE  = 0.65, 1.60
+_MIN_FONTSZ, _MAX_FONTSZ = 0.75, 1.75
+_MIN_WIDTH,  _MAX_WIDTH  = 280,  900
+_MIN_HUDSZ,  _MAX_HUDSZ  = 0.55, 1.60
+_MIN_ANIM,   _MAX_ANIM   = 0.0,  2.0          # 0 = off, 1 = normal, 2 = extra
+_MIN_ALPHA,  _MAX_ALPHA  = 0.40, 1.00
+
+
+def _clamp(value, lo, hi, default):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if v != v:        # NaN
+        return float(default)
+    return max(lo, min(hi, v))
+
+
+def get_ui_mode() -> str:
+    """UI density: 'compact' | 'normal' | 'expanded'. Default 'normal'."""
+    v = str(load_api_keys().get("ui_mode", "normal") or "normal").strip().lower()
+    return v if v in UI_MODES else "normal"
+
+
+def save_ui_mode(mode: str) -> bool:
+    v = str(mode or "").strip().lower()
+    v = v if v in UI_MODES else "normal"
+    return _patch_config(ui_mode=v)
+
+
+def get_ui_scale() -> float:
+    """Global UI scale (1.0 = the layout as authored)."""
+    return _clamp(load_api_keys().get("ui_scale", 1.0),
+                  _MIN_SCALE, _MAX_SCALE, 1.0)
+
+
+def save_ui_scale(value) -> bool:
+    return _patch_config(ui_scale=_clamp(value, _MIN_SCALE, _MAX_SCALE, 1.0))
+
+
+def get_font_scale() -> float:
+    """Font-size multiplier (1.0 = default Courier sizes)."""
+    return _clamp(load_api_keys().get("font_scale", 1.0),
+                  _MIN_FONTSZ, _MAX_FONTSZ, 1.0)
+
+
+def save_font_scale(value) -> bool:
+    return _patch_config(font_scale=_clamp(value, _MIN_FONTSZ, _MAX_FONTSZ, 1.0))
+
+
+def get_panel_width() -> int:
+    """Side-panel width in pixels (left + right are the same width)."""
+    try:
+        v = int(load_api_keys().get("panel_width", 320))
+    except (TypeError, ValueError):
+        return 320
+    return max(_MIN_WIDTH, min(_MAX_WIDTH, v))
+
+
+def save_panel_width(value) -> bool:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = 320
+    return _patch_config(panel_width=max(_MIN_WIDTH, min(_MAX_WIDTH, v)))
+
+
+def get_hud_size() -> float:
+    """Face/reactor size multiplier (1.0 = the size the HUD was authored at)."""
+    return _clamp(load_api_keys().get("hud_size", 1.0),
+                  _MIN_HUDSZ, _MAX_HUDSZ, 1.0)
+
+
+def save_hud_size(value) -> bool:
+    return _patch_config(hud_size=_clamp(value, _MIN_HUDSZ, _MAX_HUDSZ, 1.0))
+
+
+def get_animation_enabled() -> bool:
+    """False freezes the face/reactor animation entirely (the waveform still
+    pulses from the real audio level)."""
+    return bool(load_api_keys().get("animation_enabled", True))
+
+
+def save_animation_enabled(enabled: bool) -> bool:
+    return _patch_config(animation_enabled=bool(enabled))
+
+
+def get_animation_speed() -> float:
+    """Animation speed multiplier (1.0 = default cadence). 0 freezes it."""
+    return _clamp(load_api_keys().get("animation_speed", 1.0),
+                  _MIN_ANIM, _MAX_ANIM, 1.0)
+
+
+def save_animation_speed(value) -> bool:
+    return _patch_config(animation_speed=_clamp(value, _MIN_ANIM, _MAX_ANIM, 1.0))
+
+
+def get_hud_transparency() -> float:
+    """Panel alpha (1.0 = opaque). Used for side-panels + content area."""
+    return _clamp(load_api_keys().get("hud_transparency", 1.0),
+                  _MIN_ALPHA, _MAX_ALPHA, 1.0)
+
+
+def save_hud_transparency(value) -> bool:
+    return _patch_config(hud_transparency=_clamp(
+        value, _MIN_ALPHA, _MAX_ALPHA, 1.0))
+
+
+def get_hud_anchor() -> str:
+    """Where the face/reactor sits while a task is active. 'center' = idle
+    position (always used when no task is running)."""
+    v = str(load_api_keys().get("hud_anchor", "topleft") or "topleft").strip().lower()
+    return v if v in HUD_ANCHORS else "topleft"
+
+
+def save_hud_anchor(anchor: str) -> bool:
+    v = str(anchor or "").strip().lower()
+    v = v if v in HUD_ANCHORS else "topleft"
+    return _patch_config(hud_anchor=v)
+
+
+def get_task_overlay_mode() -> str:
+    """When to show the task/activity overlay chip:
+       auto   = only while a task is running
+       always = always visible (minimised to a chip otherwise)
+       off    = never show the floating chip (use the inline panel only)"""
+    v = str(load_api_keys().get("task_overlay_mode", "auto") or "auto").strip().lower()
+    return v if v in PANEL_MODES else "auto"
+
+
+def save_task_overlay_mode(mode: str) -> bool:
+    v = str(mode or "").strip().lower()
+    v = v if v in PANEL_MODES else "auto"
+    return _patch_config(task_overlay_mode=v)
+
+
+def get_visualizer_style() -> str:
+    """Reactor-core visualizer style:
+       classic   = rings + spokes (default, the historical MARK LIV look)
+       minimal   = just the outer ring + spectrum ring (calmer)
+       spectrum  = full radial bars, no decorative arcs"""
+    v = str(load_api_keys().get("visualizer_style", "classic") or "classic").strip().lower()
+    return v if v in ("classic", "minimal", "spectrum") else "classic"
+
+
+def save_visualizer_style(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    v = v if v in ("classic", "minimal", "spectrum") else "classic"
+    return _patch_config(visualizer_style=v)
+
+
+def get_log_max_lines() -> int:
+    """Maximum number of lines kept in the activity log."""
+    try:
+        v = int(load_api_keys().get("log_max_lines", 600))
+    except (TypeError, ValueError):
+        return 600
+    return max(50, min(5000, v))
+
+
+def save_log_max_lines(value) -> bool:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = 600
+    return _patch_config(log_max_lines=max(50, min(5000, v)))
+
+
+def get_show_debug_log() -> bool:
+    """Whether the activity log surfaces raw plumbing lines. Off by default --
+    the HUD is built for readable conversation, not console output.
+    Turning it on restores the boot transcript + plugin loader lines."""
+    return bool(load_api_keys().get("show_debug_log", False))
+
+
+def save_show_debug_log(enabled: bool) -> bool:
+    return _patch_config(show_debug_log=bool(enabled))
+
+
+def get_snap_hud_on_task() -> bool:
+    """Whether to smoothly move the HUD into the corner when a longer task
+    starts (so the workspace is free). The HUD still moves back to centre
+    the moment the task finishes."""
+    return bool(load_api_keys().get("snap_hud_on_task", True))
+
+
+def save_snap_hud_on_task(enabled: bool) -> bool:
+    return _patch_config(snap_hud_on_task=bool(enabled))
+
+
+def get_auto_task_delay_ms() -> int:
+    """How long a task has to be running before the HUD snaps into the corner.
+    Short tasks (typos, instant replies) never trigger the snap. 0 disables
+    the delay entirely."""
+    try:
+        v = int(load_api_keys().get("auto_task_delay_ms", 900))
+    except (TypeError, ValueError):
+        return 900
+    return max(0, min(10000, v))
+
+
+def save_auto_task_delay_ms(value) -> bool:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = 900
+    return _patch_config(auto_task_delay_ms=max(0, min(10000, v)))
+
+
+# One helper that bundles the whole GUI block so callers can fetch /
+# persist everything in a single round-trip (used by the customize overlay).
+def get_gui_settings() -> dict:
+    return {
+        "ui_mode":           get_ui_mode(),
+        "ui_scale":          get_ui_scale(),
+        "font_scale":        get_font_scale(),
+        "panel_width":       get_panel_width(),
+        "hud_size":          get_hud_size(),
+        "hud_anchor":        get_hud_anchor(),
+        "hud_transparency":  get_hud_transparency(),
+        "animation_enabled": get_animation_enabled(),
+        "animation_speed":   get_animation_speed(),
+        "task_overlay_mode": get_task_overlay_mode(),
+        "visualizer_style":  get_visualizer_style(),
+        "log_max_lines":     get_log_max_lines(),
+        "show_debug_log":    get_show_debug_log(),
+        "snap_hud_on_task":  get_snap_hud_on_task(),
+        "auto_task_delay_ms": get_auto_task_delay_ms(),
+    }
+
+
+def save_gui_settings(values: dict) -> bool:
+    """Persist the GUI block. Unknown keys are ignored; bad values fall back
+    to defaults; partial updates preserve the rest. Refuses to write if the
+    existing config is corrupt (same rule as every other saver here)."""
+    if not isinstance(values, dict) or not values:
+        return True
+    with _CONFIG_LOCK:
+        data, intact = _read_config_state()
+        if not intact:
+            return _refuse_corrupt_write()
+        data["ui_mode"]           = str(values.get("ui_mode", get_ui_mode())).strip().lower()
+        if data["ui_mode"] not in UI_MODES:
+            data["ui_mode"] = "normal"
+        data["ui_scale"]          = _clamp(values.get("ui_scale", get_ui_scale()),
+                                            _MIN_SCALE, _MAX_SCALE, 1.0)
+        data["font_scale"]        = _clamp(values.get("font_scale", get_font_scale()),
+                                            _MIN_FONTSZ, _MAX_FONTSZ, 1.0)
+        data["panel_width"]       = max(_MIN_WIDTH, min(_MAX_WIDTH,
+                                            int(values.get("panel_width", get_panel_width()))))
+        data["hud_size"]          = _clamp(values.get("hud_size", get_hud_size()),
+                                            _MIN_HUDSZ, _MAX_HUDSZ, 1.0)
+        anchor = str(values.get("hud_anchor", get_hud_anchor())).strip().lower()
+        data["hud_anchor"]        = anchor if anchor in HUD_ANCHORS else "topleft"
+        data["hud_transparency"]  = _clamp(values.get("hud_transparency", get_hud_transparency()),
+                                            _MIN_ALPHA, _MAX_ALPHA, 1.0)
+        data["animation_enabled"] = bool(values.get("animation_enabled",
+                                                     get_animation_enabled()))
+        data["animation_speed"]   = _clamp(values.get("animation_speed", get_animation_speed()),
+                                            _MIN_ANIM, _MAX_ANIM, 1.0)
+        panel = str(values.get("task_overlay_mode", get_task_overlay_mode())).strip().lower()
+        data["task_overlay_mode"] = panel if panel in PANEL_MODES else "auto"
+        viz = str(values.get("visualizer_style", get_visualizer_style())).strip().lower()
+        data["visualizer_style"]  = viz if viz in ("classic", "minimal", "spectrum") else "classic"
+        data["log_max_lines"]     = max(50, min(5000,
+                                            int(values.get("log_max_lines", get_log_max_lines()))))
+        data["show_debug_log"]    = bool(values.get("show_debug_log", get_show_debug_log()))
+        data["snap_hud_on_task"]  = bool(values.get("snap_hud_on_task", get_snap_hud_on_task()))
+        data["auto_task_delay_ms"] = max(0, min(10000,
+                                            int(values.get("auto_task_delay_ms", get_auto_task_delay_ms()))))
+        _write_config_unlocked(data)
+        return True

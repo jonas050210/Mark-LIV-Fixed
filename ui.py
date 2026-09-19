@@ -187,6 +187,105 @@ def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
 
 
+# ── GUI presentation helpers ───────────────────────────────────────────────────
+# All values are clamped on the way in, fall back to sane defaults if the
+# config block is missing, and are designed so a partial update never bricks
+# the HUD: a single bad value drops back to the default rather than throwing
+# during paint.
+
+_BASE_FONT_PT = 9            # the Courier size everything else is scaled from
+_MIN_FONT_PT  = 7
+_MAX_FONT_PT  = 18
+_GUI_CFG_CACHE: dict | None = None
+
+
+def _read_gui_settings() -> dict:
+    """Return the GUI block as a plain dict, with every value clamped.
+
+    Cached for the duration of a session: the UI polls the file once at
+    startup and re-reads when the user opens the customize overlay. The
+    cache is invalidated by apply_gui_settings(), so a settings change
+    immediately propagates to the live UI.
+    """
+    global _GUI_CFG_CACHE
+    if _GUI_CFG_CACHE is not None:
+        return _GUI_CFG_CACHE
+    try:
+        from memory import config_manager as _cm
+        cfg = _cm.get_gui_settings()
+    except Exception:
+        cfg = {}
+    _GUI_CFG_CACHE = {
+        "ui_mode":           str(cfg.get("ui_mode", "normal")).lower(),
+        "ui_scale":          float(cfg.get("ui_scale", 1.0)),
+        "font_scale":        float(cfg.get("font_scale", 1.0)),
+        "panel_width":       int(cfg.get("panel_width", 320)),
+        "hud_size":          float(cfg.get("hud_size", 1.0)),
+        "hud_anchor":        str(cfg.get("hud_anchor", "topleft")).lower(),
+        "hud_transparency":  float(cfg.get("hud_transparency", 1.0)),
+        "animation_enabled": bool(cfg.get("animation_enabled", True)),
+        "animation_speed":   float(cfg.get("animation_speed", 1.0)),
+        "task_overlay_mode": str(cfg.get("task_overlay_mode", "auto")).lower(),
+        "visualizer_style":  str(cfg.get("visualizer_style", "classic")).lower(),
+        "log_max_lines":     int(cfg.get("log_max_lines", 600)),
+        "show_debug_log":    bool(cfg.get("show_debug_log", False)),
+        "snap_hud_on_task":  bool(cfg.get("snap_hud_on_task", True)),
+        "auto_task_delay_ms": int(cfg.get("auto_task_delay_ms", 900)),
+    }
+    if _GUI_CFG_CACHE["ui_mode"] not in ("compact", "normal", "expanded"):
+        _GUI_CFG_CACHE["ui_mode"] = "normal"
+    if _GUI_CFG_CACHE["hud_anchor"] not in ("center", "topleft", "topright"):
+        _GUI_CFG_CACHE["hud_anchor"] = "topleft"
+    if _GUI_CFG_CACHE["visualizer_style"] not in ("classic", "minimal", "spectrum"):
+        _GUI_CFG_CACHE["visualizer_style"] = "classic"
+    return _GUI_CFG_CACHE
+
+
+def reload_gui_settings() -> dict:
+    """Drop the cache and re-read — call after writing the GUI block to config."""
+    global _GUI_CFG_CACHE
+    _GUI_CFG_CACHE = None
+    return _read_gui_settings()
+
+
+def get_gui_settings() -> dict:
+    """Public accessor for the cached GUI block."""
+    return _read_gui_settings()
+
+
+def scale_px(value: int | float) -> int:
+    """Scale a pixel value by the current UI scale (1.0 = unchanged)."""
+    cfg = _read_gui_settings()
+    s = float(cfg.get("ui_scale", 1.0)) or 1.0
+    return max(1, int(round(float(value) * s)))
+
+
+def scaled_font(base_pt: int = _BASE_FONT_PT,
+                *, bold: bool = False,
+                family: str = "Courier New") -> QFont:
+    """Return a QFont sized to the current font_scale.
+
+    Uses Qt's pixel-perfect pipeline: the result is set with pointSize(),
+    which Qt then maps to an integer device-pixel size at the active DPR.
+    Renders Courier sharp at any scale; a fractional size is the usual
+    cause of blurry text on Windows display scaling.
+    """
+    cfg = _read_gui_settings()
+    fs = float(cfg.get("font_scale", 1.0)) or 1.0
+    ui = float(cfg.get("ui_scale", 1.0)) or 1.0
+    pt = max(_MIN_FONT_PT, min(_MAX_FONT_PT,
+                                int(round(float(base_pt) * fs * ui))))
+    f = QFont(family, pt, QFont.Weight.Bold if bold else QFont.Weight.Normal)
+    f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    f.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
+    return f
+
+
+def scaled_font_size(base_pt: int = _BASE_FONT_PT) -> int:
+    """Return the integer point-size that scaled_font would pick."""
+    return scaled_font(base_pt).pointSize()
+
+
 # ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
 _nvml_lib: object = None   # cached ctypes DLL
 _nvml_ok:  object = None   # None=untested, True=works, False=unavailable
@@ -447,6 +546,16 @@ class HudCanvas(QWidget):
         self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
         self._base_halo  = 55.0
 
+        # Animated HUD layout (Mark LIV 54).
+        # The face/reactor lives in a parent container that asks this
+        # canvas to shrink into a corner when a long task starts.
+        # The animation uses the same _step clock as the avatar.
+        # 0 = idle (large, centred), 1 = active (compact, corner).
+        self._layout_t      = 0.0
+        self._layout_target = 0.0
+        self._task_active   = False
+        self._task_started  = 0.0
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
@@ -527,6 +636,60 @@ class HudCanvas(QWidget):
         if lv > self._live_amp:
             self._live_amp = lv
 
+    # ---- animated layout / task-snap (Mark LIV 54) -------------------
+    def set_task_active(self, active: bool) -> None:
+        """Tell the canvas whether a long-running task is in flight.
+
+        When the task is longer than the configured delay the canvas
+        animates itself into a corner so the centre column is free for the
+        conversation panel. The animation is the same one the avatar uses,
+        so the snap and the face move together.
+        """
+        active = bool(active)
+        if active == self._task_active:
+            return
+        self._task_active = active
+        self._task_started = time.time() if active else 0.0
+        # Honour the user's snap preference. If they have the snap off,
+        # the canvas stays centred even during tasks.
+        snap = True
+        try:
+            from memory.config_manager import get_snap_hud_on_task
+            snap = bool(get_snap_hud_on_task())
+        except Exception:
+            pass
+        self.set_layout_target(1.0 if (active and snap) else 0.0)
+
+    def is_task_active(self) -> bool:
+        return self._task_active
+
+    def set_layout_target(self, target: float) -> None:
+        """Set the animated-layout target directly (0 = idle, 1 = active).
+
+        The value is clamped to [0, 1]. The animation lives in _step(),
+        so calling this just changes where the canvas is heading; the
+        current paint frame is unaffected.
+        """
+        try:
+            t = float(target)
+        except (TypeError, ValueError):
+            return
+        self._layout_target = max(0.0, min(1.0, t))
+
+    def layout_factor(self) -> float:
+        """Current animated layout factor (0 = idle, 1 = active)."""
+        return float(self._layout_t)
+
+    def set_hud_style(self, style: str) -> None:
+        """Switch between face and reactor core live."""
+        s = (style or "").strip().lower()
+        if s not in ("face", "core"):
+            s = "face"
+        if s == self.hud_style:
+            return
+        self.hud_style = s
+        self.update()
+
     def _make_grid(self, W: int, H: int) -> QPixmap:
         """Pre-render the static grid-dot background into a transparent pixmap so
         paintEvent can blit it once per frame instead of running a nested
@@ -544,6 +707,24 @@ class HudCanvas(QWidget):
     def _step(self):
         self._tick += 1
         now = time.time()
+
+        # Animated layout factor (Mark LIV 54).
+        # Ease toward the layout target (0 = idle, 1 = active).
+        # tau ~= 250 ms at normal speed, scaled by the animation_speed.
+        # The animation toggle freezes the avatar below, NOT this snap,
+        # because a layout that does not move is the only way the
+        # workspace gets freed.
+        try:
+            anim_speed = float(_read_gui_settings().get("animation_speed", 1.0)) or 0.0
+        except Exception:
+            anim_speed = 1.0
+        tau = max(0.08, 0.25 / max(0.05, anim_speed))
+        _raw_dt = now - self._step_t if hasattr(self, "_step_t") else 0.016
+        _dt = min(0.10, max(0.001, _raw_dt))
+        rate = 1.0 - math.exp(-_dt / tau)
+        self._layout_t += (self._layout_target - self._layout_t) * rate
+        if abs(self._layout_t - self._layout_target) < 1e-3:
+            self._layout_t = self._layout_target
 
         # ── Live audio reactivity ────────────────────────────────────────────
         # A viseme schedule, if one is playing, gives both the level and the
@@ -589,8 +770,25 @@ class HudCanvas(QWidget):
         # starts talking. Same lesson the head's sway taught.
         self._core_phase += min(0.10, max(0.0, dt))
 
+        # Honour the animation toggle (Mark LIV 54). When the user has
+        # turned the animation off we still update audio reactivity
+        # (so the waveform still pulses from real sound) but freeze the
+        # avatar's own motion. animation_speed scales the dt the avatar
+        # sees, so 0 freezes it, 0.5 half-speed, 2 is double.
+        try:
+            _cfg = _read_gui_settings()
+            _anim_on = bool(_cfg.get("animation_enabled", True))
+            _anim_spd = float(_cfg.get("animation_speed", 1.0))
+        except Exception:
+            _anim_on, _anim_spd = True, 1.0
+        _anim_spd = max(0.0, min(2.0, _anim_spd or 0.0))
+        if not _anim_on:
+            _avatar_dt = 0.0
+        else:
+            _avatar_dt = dt * _anim_spd
+
         if self._avatar is not None and self.hud_style == "face":
-            self._avatar.step(dt, amp, speaking=self.speaking,
+            self._avatar.step(_avatar_dt, amp, speaking=self.speaking,
                               muted=self.muted, state=self.state,
                               v_open=v_open, v_wide=v_wide or 0.0,
                               v_level=v_level, v_seq=v_seq,
@@ -830,8 +1028,37 @@ class HudCanvas(QWidget):
         p.fillRect(self.rect(), qcol(C.BG))
 
         W, H = self.width(), self.height()
-        cx, cy = W / 2, H / 2
-        fw = min(W, H)
+
+        # ---- Animated HUD layout (Mark LIV 54) ----------------------
+        # The centrepiece slides between dead-centre (idle) and a corner
+        # (active task), and shrinks/grows with the hud_size setting.
+        # Every value here falls back to a sane default if the GUI block
+        # is missing or the cache has not been primed yet.
+        try:
+            cfg = _read_gui_settings()
+            hud_size = float(cfg.get("hud_size", 1.0))
+            anchor   = str(cfg.get("hud_anchor", "topleft")).lower()
+            anim_on  = bool(cfg.get("animation_enabled", True))
+            anim_spd = float(cfg.get("animation_speed", 1.0))
+        except Exception:
+            hud_size, anchor, anim_on, anim_spd = 1.0, "topleft", True, 1.0
+        anim_spd = max(0.0, min(2.0, anim_spd or 0.0))
+        # Snap speed controls how fast the slide happens; animation_speed
+        # only changes the inner animation cadence, not the layout swap.
+        t = float(self._layout_t)
+        active_scale = max(0.40, min(1.20, hud_size))
+        scale_factor = (1.0 - t) + t * active_scale
+        margin = max(8.0, min(W, H) * 0.04)
+        if anchor == "topleft":
+            corner = (margin, margin)
+        elif anchor == "topright":
+            corner = (W - margin, margin)
+        else:
+            corner = (W * 0.5, H * 0.5)
+        centre = (W * 0.5, H * 0.5)
+        cx = centre[0] + (corner[0] - centre[0]) * t
+        cy = centre[1] + (corner[1] - centre[1]) * t
+        fw = min(W, H) * scale_factor
 
         # grid dots — blitted from a cached layer; rebuilt only when the size
         # or the theme's ghost colour changes (so live re-theming still works).
@@ -992,9 +1219,17 @@ class LogWidget(QTextEdit):
         self.setReadOnly(True)
         # Cap scrollback so an hours-long session can't grow the document
         # without bound — keeps memory flat and every insert cheap. Oldest
-        # lines drop off the top automatically.
-        self.document().setMaximumBlockCount(600)
-        self.setFont(QFont("Courier New", 9))
+        # lines drop off the top automatically. The cap honours the user's
+        # log_max_lines setting; the font honours font_scale.
+        try:
+            from memory.config_manager import get_log_max_lines
+            self.document().setMaximumBlockCount(int(get_log_max_lines()))
+        except Exception:
+            self.document().setMaximumBlockCount(600)
+        try:
+            self.setFont(scaled_font(9))
+        except Exception:
+            self.setFont(QFont("Courier New", 9))
         self.setStyleSheet(f"""
             QTextEdit {{
                 background: {C.PANEL};
@@ -1028,7 +1263,34 @@ class LogWidget(QTextEdit):
     def append_log(self, text: str):
         self._sig.emit(text)
 
+    # Lines that come from plumbing rather than the conversation. The user
+    # never asked for them, they fight the HUD colour, and they survive a
+    # session reset; the console still prints them. The 'show_debug_log'
+    # GUI setting turns the filter back on for the people who want them.
+    _DEBUG_PREFIXES = (
+        "[plugin]", "[action]", "[wake]",
+        "boot transcript", "loaded plugin",
+        "registered", "discovered",
+    )
+
+    def _is_debug_line(self, text: str) -> bool:
+        s = text.lstrip().lower()
+        for prefix in self._DEBUG_PREFIXES:
+            if s.startswith(prefix.lower()):
+                return True
+        return False
+
     def _enqueue(self, text: str):
+        # Filter out debug-only lines when the user has the toggle off.
+        # The check is cheap (prefix match), the queue is local, and the
+        # setting defaults to False so the HUD is useful on first run.
+        try:
+            from memory.config_manager import get_show_debug_log
+            show = bool(get_show_debug_log())
+        except Exception:
+            show = False
+        if not show and self._is_debug_line(text):
+            return
         self._queue.append(text)
         if not self._typing:
             self._next()
@@ -1328,6 +1590,274 @@ class TaskPanel(QWidget):
                 self._rows_box.addWidget(self._rows[task_id])
             self._order = order
         self.setVisible(bool(shown))
+
+
+class TaskActivityOverlay(QFrame):
+    """Compact floating chip shown while tasks are running.
+
+    Designed to live in a screen corner without competing with the HUD.
+    Clicking it opens the relevant full view (the right-side task panel);
+    otherwise it shows a single line of useful state: which task is running,
+    how far it has got, and (if known) speed/ETA. Clicks close to the chip's
+    visual state never show debug noise — only what the registry reported.
+
+    The widget is a child of MainWindow.centralWidget() so it inherits the
+    same stylesheet/retint pipeline as everything else.
+    """
+
+    clicked = pyqtSignal()    # user clicked the chip → show full panel
+
+    _PAD_X = 10
+    _PAD_Y = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TaskActivityOverlay")
+        self.setStyleSheet(
+            "QFrame#TaskActivityOverlay {"
+            " background: rgba(1, 13, 20, 235);"
+            " border: 1px solid #0d3347;"
+            " border-radius: 6px;"
+            " }"
+            " QFrame#TaskActivityOverlay QLabel { background: transparent; }"
+        )
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(self._PAD_X, self._PAD_Y, self._PAD_X, self._PAD_Y)
+        lay.setSpacing(8)
+
+        self._icon = QLabel("❯")  # primary running indicator
+        self._icon.setFont(scaled_font(11, bold=True))
+        self._icon.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(self._icon)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self._title = QLabel("")
+        self._title.setFont(scaled_font(8, bold=True))
+        self._title.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        col.addWidget(self._title)
+        self._detail = QLabel("")
+        self._detail.setFont(scaled_font(7))
+        self._detail.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        col.addWidget(self._detail)
+        lay.addLayout(col, stretch=1)
+
+        self._count = QLabel("")
+        self._count.setFont(scaled_font(7, bold=True))
+        self._count.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        lay.addWidget(self._count)
+
+        self._shown_data = None  # (title, detail, count, kind, state) cache
+        self._manual_position = None
+        self._press_global = None
+        self._press_position = None
+        self._dragging = False
+        # Let the frame handle clicks and drags even over a label.
+        for label in (self._icon, self._title, self._detail, self._count):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def _move_within_parent(self, position):
+        """Clamp only to the parent, not back to the automatic anchor."""
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.move(
+            max(0, min(position.x(), max(0, parent.width() - self.width()))),
+            max(0, min(position.y(), max(0, parent.height() - self.height()))),
+        )
+
+    def reposition(self, anchor):
+        # Keep the requested manual position even if a temporary shrink
+        # clamps it, so growing the window restores that position.
+        position = self._manual_position
+        self._move_within_parent(anchor if position is None else position)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_global = event.globalPosition().toPoint()
+            self._press_position = self.pos()
+            self._dragging = False
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_global is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.globalPosition().toPoint() - self._press_global
+            if self._dragging or delta.manhattanLength() >= QApplication.startDragDistance():
+                self._dragging = True
+                self._move_within_parent(self._press_position + delta)
+                self._manual_position = self.pos()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._press_global is not None:
+            click = not self._dragging and self.rect().contains(event.position().toPoint())
+            self._press_global = None
+            self._press_position = None
+            self._dragging = False
+            if click:
+                self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def show_summary(self, title: str, detail: str, count: int,
+                     kind: str = "task", state: str = "running") -> None:
+        """Update the chip. Keeps three lines at most, all from real data."""
+        key = (title, detail, count, kind, state)
+        if key == self._shown_data:
+            return
+        self._shown_data = key
+
+        # Icon: pick one glyph per kind. New kinds fall back to a dot so
+        # a brand-new task type still gets a useful marker.
+        icon_glyph = {
+            "download": "↓",  # ↓ down arrow
+            "install":  "⊕",  # plus-in-circle
+            "update":   "↻",  # clockwise arrow
+            "uninstall": "⊖",  # minus-in-circle
+            "timer":    "⏱",  # stopwatch
+            "agent":    "❯",  # right-pointing angle
+            "task":     "•",  # bullet
+        }.get(kind, "•")
+        if state == "failed":
+            self._icon.setStyleSheet(f"color: {C.MUTED_C}; background: transparent;")
+        elif state == "done":
+            self._icon.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        else:
+            self._icon.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._icon.setText(icon_glyph)
+
+        # Truncate long titles; the chip is small on purpose.
+        t = (title or "").strip()
+        if len(t) > 36:
+            t = t[:33] + "…"
+        self._title.setText(t or "working…")
+        d = (detail or "").strip()
+        if len(d) > 56:
+            d = d[:53] + "…"
+        self._detail.setText(d)
+        if count and count > 1:
+            self._count.setText(f"×{count}")  # × multiplication sign
+        else:
+            self._count.setText("")
+
+
+class TaskActivityBridge(QObject):
+    """Auto-snaps the HUD into a corner while a long task is running.
+
+    Polls core.tasks the same way the existing TaskPanel does (revision
+    counter, 4 Hz, only the registry thread writes) and emits two signals:
+    "task_active_changed" so the HUD can slide, and "summary_changed" so a
+    floating chip can mirror what is happening. The bridge is the only
+    place that decides when a task has been running long enough to count,
+    which keeps the HUD and the chip from drifting out of sync.
+
+    The bridge never lies: it only reports what the registry has. If the
+    registry is missing the HUD stays centred, which is exactly what it did
+    before this class existed.
+    """
+
+    task_active_changed = pyqtSignal(bool)   # True if a long task is running
+    summary_changed      = pyqtSignal(str, str, int, str, str)  # title, detail, count, kind, state
+
+    _POLL_MS = 250
+
+    def __init__(self, hud=None, parent=None):
+        super().__init__(parent)
+        self._hud = hud            # HudCanvas — may be None (tests)
+        self._revision = -1
+        self._rows = []
+        self._last_active = False
+        self._last_summary = None  # (title, detail, count, kind, state)
+        self._active_started_at = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._poll)
+        self._tmr.start(self._POLL_MS)
+
+    def stop(self) -> None:
+        self._tmr.stop()
+
+    def _poll(self) -> None:
+        if _task_registry is None:
+            if self._last_active:
+                self._last_active = False
+                self._active_started_at = 0.0
+                self.task_active_changed.emit(False)
+            return
+        try:
+            rev = _task_registry.revision()
+        except Exception:
+            return
+        if rev != self._revision:
+            try:
+                self._rows = _task_registry.snapshot(limit=32)
+            except Exception:
+                return
+            self._revision = rev
+        # Delay and settings can change while the registry is unchanged.
+        running = [r for r in self._rows if r.get("state") == "running"]
+        now = time.time()
+
+        # Build a one-line summary from the highest-priority running task
+        # (most-recently-updated wins; downloads/installs/agents beat timers).
+        if running:
+            priority = {"download": 0, "install": 1, "update": 1,
+                         "uninstall": 1, "agent": 2, "task": 3, "timer": 4}
+            top = sorted(running,
+                         key=lambda r: (priority.get(r.get("kind", "task"), 9),
+                                         -float(r.get("started_at") or 0.0)))[0]
+            title = str(top.get("title") or top.get("kind", "task")).strip()
+            detail = str(top.get("detail") or "").strip()
+            # Fall back to a useful derived detail when none was supplied.
+            if not detail:
+                pct = top.get("percent")
+                if pct is not None:
+                    detail = f"{pct}%"
+                elif top.get("speed_human"):
+                    detail = top["speed_human"]
+                elif top.get("kind") == "timer":
+                    detail = "running"
+                else:
+                    detail = "working…"
+            summary = (title, detail, len(running),
+                       str(top.get("kind", "task")), "running")
+        else:
+            summary = ("", "", 0, "task", "idle")
+        if summary != self._last_summary:
+            self._last_summary = summary
+            self.summary_changed.emit(*summary)
+
+        # Snap the HUD only after the task has been alive for the configured
+        # grace period. Anything shorter was almost certainly a typo or an
+        # instantaneous reply, and a snap on every keystroke is the kind of
+        # motion the user disables within the first minute.
+        try:
+            cfg = _read_gui_settings()
+            delay_ms = int(cfg.get("auto_task_delay_ms", 900))
+            snap_enabled = bool(cfg.get("snap_hud_on_task", True))
+        except Exception:
+            delay_ms, snap_enabled = 900, True
+
+        if running and snap_enabled:
+            if not self._active_started_at:
+                # Take the most-recently-started running task as our clock.
+                self._active_started_at = max(
+                    float(r.get("started_at") or now) for r in running)
+            elapsed_ms = (now - self._active_started_at) * 1000.0
+            active_now = elapsed_ms >= delay_ms
+        else:
+            active_now = False
+            self._active_started_at = 0.0
+
+        if active_now != self._last_active:
+            self._last_active = active_now
+            self.task_active_changed.emit(active_now)
 
 
 class FileDropZone(QWidget):
@@ -2105,6 +2635,418 @@ class HueWheel(QWidget):
         if self._drag:
             self._drag = False
             self.hue_committed.emit(self.color())
+
+
+class GuiSettingsOverlay(QWidget):
+    """HUD / presentation preferences overlay.
+
+    One place for every value in core/memory.config_manager.get_gui_settings().
+    The form is split into two columns: layout (mode, scale, font, panel
+    width, transparency) and HUD (face size, anchor, animation, visualizer,
+    task overlay). Changes preview live where possible and persist on Apply.
+
+    The save path uses save_gui_settings() so the whole block is written
+    atomically; if the on-disk config is unreadable the write is refused
+    rather than silently losing other settings (see config_manager).
+    """
+
+    saved = pyqtSignal(dict)    # the validated gui block, post-apply
+    _OW, _OH = 720, 600
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "GuiSettingsOverlay {"
+            " background: rgba(0, 6, 10, 248);"
+            " border: 1px solid #1a5c7a;"
+            " border-radius: 6px;"
+            " }"
+        )
+
+        from memory.config_manager import (
+            UI_MODES, HUD_ANCHORS, PANEL_MODES,
+        )
+        self.UI_MODES = UI_MODES
+        self.HUD_ANCHORS = HUD_ANCHORS
+        self.PANEL_MODES = PANEL_MODES
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setSpacing(8)
+
+        title = QLabel("\u2699  DISPLAY & HUD")
+        title.setFont(scaled_font(12, bold=True))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(title)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep)
+
+        # Two columns side by side.
+        cols = QHBoxLayout()
+        cols.setSpacing(16)
+        cols.addLayout(self._build_layout_column(), stretch=1)
+        cols.addLayout(self._build_hud_column(),    stretch=1)
+        lay.addLayout(cols)
+
+        # Bottom action row.
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        reset_btn = QPushButton("\u26A1  RESET DEFAULTS")
+        reset_btn.setFixedHeight(30)
+        reset_btn.setFont(scaled_font(8, bold=True))
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setStyleSheet(self._btn_css(C.TEXT_DIM))
+        reset_btn.clicked.connect(self._reset_defaults)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+
+        cancel_btn = QPushButton("CANCEL")
+        cancel_btn.setFixedHeight(34)
+        cancel_btn.setFont(scaled_font(9))
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(self._btn_css(C.TEXT_MED))
+        cancel_btn.clicked.connect(self._cancel)
+        btn_row.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("\u25B8  APPLY")
+        apply_btn.setFixedHeight(34)
+        apply_btn.setFont(scaled_font(9, bold=True))
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_btn.setStyleSheet(self._btn_css(C.PRI, primary=True))
+        apply_btn.clicked.connect(self._save)
+        btn_row.addWidget(apply_btn)
+
+        lay.addLayout(btn_row)
+
+        # Status line (last action feedback, like the API keys overlay).
+        self._status = QLabel("")
+        self._status.setFont(scaled_font(8))
+        self._status.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._status)
+
+        from memory.config_manager import get_gui_settings as _gs
+        self._initial = dict(_gs())
+        self._load()
+
+    def _btn_css(self, color, primary=False):
+        if primary:
+            return (
+                f"QPushButton {{ background: transparent; color: {color};"
+                f" border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}"
+                f"QPushButton:hover {{ background: {C.PRI_GHO};"
+                f" border: 1px solid {C.PRI}; }}"
+            )
+        return (
+            f"QPushButton {{ background: transparent; color: {color};"
+            f" border: 1px solid {C.BORDER}; border-radius: 3px; }}"
+            f"QPushButton:hover {{ color: {C.TEXT};"
+            f" border-color: {C.BORDER_B}; }}"
+        )
+
+    def _section(self, title):
+        lbl = QLabel(title)
+        lbl.setFont(scaled_font(8, bold=True))
+        lbl.setStyleSheet(
+            "color: #5ab8cc; background: transparent;"
+            " padding-top: 4px; border-bottom: 1px solid #0d3347;"
+        )
+        return lbl
+
+    def _field_row(self, label, widget):
+        from PyQt6.QtWidgets import QHBoxLayout as _QH
+        row = _QH()
+        row.setSpacing(8)
+        l = QLabel(label)
+        l.setFont(scaled_font(8))
+        l.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        l.setMinimumWidth(150)
+        row.addWidget(l)
+        row.addWidget(widget, stretch=1)
+        return row
+
+    def _build_layout_column(self):
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        col.addWidget(self._section("LAYOUT"))
+
+        # ui_mode pills
+        self._mode_btns = {}
+        mode_row = QHBoxLayout(); mode_row.setSpacing(4)
+        for mode in self.UI_MODES:
+            b = QPushButton(mode.upper())
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setFont(scaled_font(8, bold=True))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, m=mode: self._pick_mode(m))
+            self._mode_btns[mode] = b
+            mode_row.addWidget(b)
+        col.addLayout(mode_row)
+
+        self._ui_scale    = self._make_slider("\u00d7", 65, 160, 5)
+        self._font_scale  = self._make_slider("\u00d7", 75, 175, 5)
+        self._panel_width = self._make_slider("px", 280, 900, 10, integer=True)
+        self._hud_alpha   = self._make_slider("", 40, 100, 5)
+        col.addLayout(self._field_row("UI scale",     self._ui_scale["container"]))
+        col.addLayout(self._field_row("Font size",    self._font_scale["container"]))
+        col.addLayout(self._field_row("Panel width",  self._panel_width["container"]))
+        col.addLayout(self._field_row(
+            "Panel transparency", self._hud_alpha["container"]))
+
+        col.addSpacing(6)
+        col.addWidget(self._section("ACTIVITY LOG"))
+        self._log_lines = self._make_slider("", 50, 5000, 50, integer=True,
+                                             fmt="{:,}")
+        col.addLayout(self._field_row(
+            "Log max lines", self._log_lines["container"]))
+
+        self._show_debug = QCheckBox(
+            "Show raw debug lines in activity log")
+        self._show_debug.setFont(scaled_font(8))
+        self._show_debug.setStyleSheet(
+            "color: #8ffcff; background: transparent;")
+        col.addWidget(self._show_debug)
+
+        col.addStretch()
+        return col
+
+    def _build_hud_column(self):
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        col.addWidget(self._section("FACE / REACTOR"))
+
+        self._hud_size = self._make_slider("\u00d7", 55, 160, 5)
+        col.addLayout(self._field_row(
+            "Centrepiece size", self._hud_size["container"]))
+
+        # anchor pills
+        self._anchor_btns = {}
+        anchor_row = QHBoxLayout(); anchor_row.setSpacing(4)
+        for anchor in self.HUD_ANCHORS:
+            b = QPushButton(anchor.upper())
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setFont(scaled_font(8, bold=True))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, a=anchor: self._pick_anchor(a))
+            self._anchor_btns[anchor] = b
+            anchor_row.addWidget(b)
+        col.addLayout(anchor_row)
+
+        col.addSpacing(6)
+        col.addWidget(self._section("ANIMATION"))
+
+        self._anim_on = QCheckBox(
+            "Animate HUD (uncheck to freeze the face/reactor motion)")
+        self._anim_on.setFont(scaled_font(8))
+        self._anim_on.setStyleSheet(
+            "color: #8ffcff; background: transparent;")
+        col.addWidget(self._anim_on)
+
+        self._anim_spd = self._make_slider("\u00d7", 0, 200, 5)
+        col.addLayout(self._field_row(
+            "Animation speed", self._anim_spd["container"]))
+
+        self._snap_on_task = QCheckBox(
+            "Snap HUD to a corner while a task runs")
+        self._snap_on_task.setFont(scaled_font(8))
+        self._snap_on_task.setStyleSheet(
+            "color: #8ffcff; background: transparent;")
+        col.addWidget(self._snap_on_task)
+
+        self._snap_delay = self._make_slider("ms", 0, 5000, 100, integer=True)
+        col.addLayout(self._field_row(
+            "Snap delay", self._snap_delay["container"]))
+
+        col.addSpacing(6)
+        col.addWidget(self._section("TASK OVERLAY"))
+
+        self._panel_btns = {}
+        panel_row = QHBoxLayout(); panel_row.setSpacing(4)
+        for mode in self.PANEL_MODES:
+            b = QPushButton(mode.upper())
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setFont(scaled_font(8, bold=True))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, m=mode: self._pick_panel_mode(m))
+            self._panel_btns[mode] = b
+            panel_row.addWidget(b)
+        col.addLayout(panel_row)
+
+        col.addSpacing(6)
+        col.addWidget(self._section("VISUALIZER"))
+
+        self._viz_btns = {}
+        viz_row = QHBoxLayout(); viz_row.setSpacing(4)
+        for v in ("classic", "minimal", "spectrum"):
+            b = QPushButton(v.upper())
+            b.setCheckable(True)
+            b.setFixedHeight(26)
+            b.setFont(scaled_font(8, bold=True))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, vv=v: self._pick_viz(vv))
+            self._viz_btns[v] = b
+            viz_row.addWidget(b)
+        col.addLayout(viz_row)
+
+        col.addStretch()
+        return col
+
+    def _make_slider(self, suffix, lo, hi, step, integer=False, fmt="{:.2f}"):
+        from PyQt6.QtWidgets import QSlider, QHBoxLayout as _QH
+        container = QWidget()
+        row = _QH(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(lo)
+        slider.setMaximum(hi)
+        slider.setSingleStep(step)
+        slider.setPageStep(max(step * 5, 1))
+        slider.setTickInterval(max((hi - lo) // 6, 1))
+        row.addWidget(slider, stretch=1)
+        lbl = QLabel("")
+        lbl.setFont(scaled_font(8, bold=True))
+        lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lbl.setMinimumWidth(56)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight |
+                         Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(lbl)
+        return {"slider": slider, "label": lbl, "suffix": suffix,
+                "fmt": fmt, "container": container, "integer": integer}
+
+    def _sync_slider(self, s, real_value):
+        s["slider"].setValue(int(round(real_value)))
+        s["slider"].valueChanged.connect(
+            lambda v, ss=s: self._on_slider_change(ss, v))
+        self._on_slider_change(s, int(round(real_value)))
+
+    def _on_slider_change(self, s, value):
+        if s.get("integer"):
+            text = f"{int(value):,}{s['suffix']}"
+        else:
+            real = value / 100.0
+            text = s["fmt"].format(real) + s["suffix"]
+        s["label"].setText(text)
+
+    def _refresh_pills(self, buttons, active,
+                       active_color=None, dim_color=None):
+        active_color = active_color or C.PRI
+        dim_color    = dim_color    or C.TEXT_MED
+        for name, b in buttons.items():
+            on = (name == active)
+            b.setChecked(on)
+            if on:
+                b.setStyleSheet(
+                    f"QPushButton {{ background: rgba(0, 31, 46, 220);"
+                    f" color: {active_color};"
+                    f" border: 1px solid {active_color};"
+                    f" border-radius: 3px; }}"
+                )
+            else:
+                b.setStyleSheet(
+                    f"QPushButton {{ background: transparent;"
+                    f" color: {dim_color};"
+                    f" border: 1px solid #0d3347;"
+                    f" border-radius: 3px; }}"
+                    f"QPushButton:hover {{ color: #d8f8ff;"
+                    f" border-color: #1a5c7a; }}"
+                )
+
+    def _pick_mode(self, mode):
+        self._refresh_pills(self._mode_btns, mode)
+
+    def _pick_anchor(self, anchor):
+        self._refresh_pills(self._anchor_btns, anchor)
+
+    def _pick_viz(self, v):
+        self._refresh_pills(self._viz_btns, v)
+
+    def _pick_panel_mode(self, mode):
+        self._refresh_pills(self._panel_btns, mode)
+
+    def _load(self):
+        cfg = self._initial
+        self._refresh_pills(self._mode_btns, cfg.get("ui_mode", "normal"))
+        self._refresh_pills(self._anchor_btns,
+                             cfg.get("hud_anchor", "topleft"))
+        self._refresh_pills(self._viz_btns,
+                             cfg.get("visualizer_style", "classic"))
+        self._refresh_pills(self._panel_btns,
+                             cfg.get("task_overlay_mode", "auto"))
+
+        self._sync_slider(self._ui_scale,    float(cfg.get("ui_scale", 1.0)) * 100)
+        self._sync_slider(self._font_scale,  float(cfg.get("font_scale", 1.0)) * 100)
+        self._sync_slider(self._panel_width, float(int(cfg.get("panel_width", 320))))
+        self._sync_slider(self._hud_size,    float(cfg.get("hud_size", 1.0)) * 100)
+        self._sync_slider(self._hud_alpha,   float(cfg.get("hud_transparency", 1.0)) * 100)
+        self._sync_slider(self._anim_spd,    float(cfg.get("animation_speed", 1.0)) * 100)
+        self._sync_slider(self._snap_delay,  float(int(cfg.get("auto_task_delay_ms", 900))))
+        self._sync_slider(self._log_lines,   float(int(cfg.get("log_max_lines", 600))))
+
+        self._anim_on.setChecked(bool(cfg.get("animation_enabled", True)))
+        self._snap_on_task.setChecked(bool(cfg.get("snap_hud_on_task", True)))
+        self._show_debug.setChecked(bool(cfg.get("show_debug_log", False)))
+
+    def _collect(self):
+        def _active(buttons):
+            for name, b in buttons.items():
+                if b.isChecked():
+                    return name
+            return list(buttons.keys())[0] if buttons else None
+        return {
+            "ui_mode":           _active(self._mode_btns) or "normal",
+            "ui_scale":          self._ui_scale["slider"].value() / 100.0,
+            "font_scale":        self._font_scale["slider"].value() / 100.0,
+            "panel_width":       int(self._panel_width["slider"].value()),
+            "hud_size":          self._hud_size["slider"].value() / 100.0,
+            "hud_anchor":        _active(self._anchor_btns) or "topleft",
+            "hud_transparency":  self._hud_alpha["slider"].value() / 100.0,
+            "animation_enabled": self._anim_on.isChecked(),
+            "animation_speed":   self._anim_spd["slider"].value() / 100.0,
+            "snap_hud_on_task":  self._snap_on_task.isChecked(),
+            "auto_task_delay_ms": int(self._snap_delay["slider"].value()),
+            "task_overlay_mode": _active(self._panel_btns) or "auto",
+            "visualizer_style":  _active(self._viz_btns) or "classic",
+            "log_max_lines":     int(self._log_lines["slider"].value()),
+            "show_debug_log":    self._show_debug.isChecked(),
+        }
+
+    def _reset_defaults(self):
+        defaults = {
+            "ui_mode": "normal", "ui_scale": 1.0, "font_scale": 1.0,
+            "panel_width": 320, "hud_size": 1.0, "hud_anchor": "topleft",
+            "hud_transparency": 1.0, "animation_enabled": True,
+            "animation_speed": 1.0, "snap_hud_on_task": True,
+            "auto_task_delay_ms": 900, "task_overlay_mode": "auto",
+            "visualizer_style": "classic", "log_max_lines": 600,
+            "show_debug_log": False,
+        }
+        self._initial = dict(defaults)
+        self._load()
+        self._status.setText("Defaults restored \u2014 press APPLY to save.")
+
+    def _cancel(self):
+        self.hide()
+
+    def _save(self):
+        from memory.config_manager import save_gui_settings
+        values = self._collect()
+        ok = save_gui_settings(values)
+        if ok:
+            self._status.setText("Saved.")
+            self.saved.emit(values)
+            self.hide()
+        else:
+            self._status.setText(
+                "Could not save \u2014 the existing config is unreadable.")
 
 
 class CustomizeOverlay(QWidget):
@@ -3462,6 +4404,7 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
         self._api_keys_overlay: ApiKeysOverlay | None = None
+        self._gui_overlay = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -3584,6 +4527,18 @@ class MainWindow(QMainWindow):
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
 
+        # Task-activity bridge: polls core.tasks, slides the HUD into a
+        # corner while a long task is running, and feeds the floating
+        # overlay chip (see TaskActivityOverlay above). Created LAST so the
+        # signals can connect to widgets that exist.
+        self._task_bridge = TaskActivityBridge(hud=self.hud, parent=self)
+        self._task_bridge.task_active_changed.connect(self.hud.set_task_active)
+
+        self._task_overlay = TaskActivityOverlay(self.centralWidget())
+        self._task_overlay.clicked.connect(self._open_task_panel)
+        self._task_bridge.summary_changed.connect(self._on_task_summary)
+        self._task_overlay.hide()
+
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -3596,6 +4551,73 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+    def _on_task_summary(self, title: str, detail: str, count: int,
+                          kind: str, state: str) -> None:
+        """Slot — update the floating task chip from the bridge."""
+        overlay = getattr(self, "_task_overlay", None)
+        if overlay is None:
+            return
+        try:
+            cfg = _read_gui_settings()
+            mode = str(cfg.get("task_overlay_mode", "auto")).lower()
+        except Exception:
+            mode = "auto"
+        # The chip only appears when the registry actually has work;
+        # "off" mode hides it permanently; "always" shows it even when
+        # idle (so the user can see it is wired up).
+        if mode == "off":
+            overlay.hide()
+            return
+        if state == "idle" or count == 0:
+            overlay.hide()
+            return
+        overlay.show_summary(title, detail, count, kind, state)
+        overlay.adjustSize()
+        self._position_task_overlay()
+        overlay.show()
+        overlay.raise_()
+
+    def _position_task_overlay(self) -> None:
+        """Apply the automatic corner anchor or clamp a manually dragged chip.
+
+        hud_anchor controls the Face/Reactor separately; the chip's default
+        remains bottom-right, just to the left of the current right panel.
+        Position hidden chips too, before their first show.
+        """
+        overlay = getattr(self, "_task_overlay", None)
+        if overlay is None:
+            return
+        cw = self.centralWidget()
+        if cw is None:
+            return
+        margin = 12
+        w = overlay.width()
+        h = overlay.height()
+        # bottom-right, just inside the right panel's left edge if visible.
+        right = getattr(self, "_right_panel", None)
+        right_width = right.width() if right is not None and not right.isHidden() else 0
+        x = cw.width() - right_width - w - margin - 8
+        y = cw.height() - h - margin - 32   # 32 = footer + breathing room
+        if x < margin:
+            x = margin
+        if y < margin:
+            y = margin
+        overlay.reposition(QPointF(x, y).toPoint())
+
+    def _open_task_panel(self) -> None:
+        """User clicked the floating chip → focus the right panel."""
+        panel = getattr(self, "_task_panel", None)
+        if panel is None:
+            return
+        if not panel.isVisible():
+            # Nothing to show — the chip fired during the brief idle between a finish and the next start. Best effort: ignore.
+            return
+        # Find the right-panel container and bring it forward.
+        right = self._right_panel
+        if right is not None:
+            right.raise_()
+        panel.setFocus()
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -4059,6 +5081,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
 
+        # Follow the default anchor, or keep a manually moved chip in bounds.
+        self._position_task_overlay()
+
     def _update_metrics(self):
         snap = _metrics.snapshot()
 
@@ -4403,6 +5428,18 @@ class MainWindow(QMainWindow):
         cust_btn.setStyleSheet(_BTN_STYLE_DIM)
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
+
+        # Mark LIV 54: HUD/presentation overlay (Mark LIV 54). Sits next to
+        # CUSTOMISE so the two are always together, and adds the live
+        # settings that change how the HUD itself behaves (size, anchor,
+        # animation, transparency, etc.).
+        hud_btn = QPushButton("⚙  DISPLAY &amp; HUD")
+        hud_btn.setFixedHeight(26)
+        hud_btn.setFont(QFont("Courier New", 7))
+        hud_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hud_btn.setStyleSheet(_BTN_STYLE_DIM)
+        hud_btn.clicked.connect(self._open_gui_settings)
+        lay.addWidget(hud_btn)
 
         self._brief_btn = QPushButton()
         self._brief_btn.setFixedHeight(26)
@@ -5481,11 +6518,117 @@ class MainWindow(QMainWindow):
         ov.show()
         self._customize_overlay = ov
 
+    def _open_gui_settings(self) -> None:
+        """Open the HUD/presentation overlay (Mark LIV 54)."""
+        if self._gui_overlay:
+            self._gui_overlay.hide()
+        cw = self.centralWidget()
+        ov = GuiSettingsOverlay(parent=cw)
+        ow, oh = GuiSettingsOverlay._OW, GuiSettingsOverlay._OH
+        # Clamp height to the central widget so the overlay never spills
+        # outside the window on a short window.
+        oh = min(oh, cw.height() - 16)
+        ov.setGeometry(
+            (cw.width()  - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        ov.saved.connect(self._on_gui_settings_saved)
+        ov.show()
+        self._gui_overlay = ov
+
     def _preview_ui_color(self, hex_color: str):
         """Live preview — paints the whole interface the new colour (does NOT write to config)."""
         old = current_palette()
         if apply_ui_accent(hex_color):
             retheme_all_widgets(old, current_palette())
+
+    def _on_gui_settings_saved(self, values):
+        """Apply the GUI block to the live UI after the overlay saves."""
+        try:
+            reload_gui_settings()
+        except Exception:
+            pass
+
+        try:
+            from memory.config_manager import get_hud_style
+            self.hud.set_hud_style(get_hud_style())
+        except Exception:
+            pass
+
+        try:
+            from memory.config_manager import (get_panel_width,
+                                                get_log_max_lines,
+                                                get_ui_mode)
+            pw = int(get_panel_width())
+            self._left_panel.setFixedWidth(pw)
+            self._right_panel.setFixedWidth(pw)
+            mode = str(get_ui_mode())
+            try:
+                self._log.document().setMaximumBlockCount(
+                    int(get_log_max_lines()))
+            except Exception:
+                pass
+            self._apply_ui_mode(mode)
+        except Exception:
+            pass
+
+        try:
+            self._refresh_fonts()
+            self.hud.update()
+        except Exception:
+            pass
+
+        try:
+            self._log.append_log("SYS: HUD settings applied.")
+        except Exception:
+            pass
+
+    def _apply_ui_mode(self, mode):
+        """Compact / normal / expanded mode (Mark LIV 54).
+
+        Compact mode hides the left sys-monitor panel so the centre
+        HUD gets the room. Expanded keeps everything and widens the
+        centre by widening the right panel. Normal leaves the layout
+        as authored. Anything not matched is treated as 'normal' so a
+        bad value can never make panels disappear.
+        """
+        try:
+            from memory.config_manager import get_panel_width
+            base_pw = int(get_panel_width())
+        except Exception:
+            base_pw = 320
+        if mode == "compact":
+            self._left_panel.setVisible(False)
+            self._right_panel.setFixedWidth(base_pw)
+        elif mode == "expanded":
+            self._left_panel.setVisible(True)
+            self._right_panel.setFixedWidth(int(base_pw * 1.25))
+        else:
+            self._left_panel.setVisible(True)
+            self._right_panel.setFixedWidth(base_pw)
+
+    def _refresh_fonts(self):
+        """Refresh every widget so the new font_scale is honoured.
+
+        Cheap and effective: schedule a full repaint. The font_scale is
+        honoured inside scaled_font() which the widgets call on every
+        rebuild, so the only thing we need to do here is trigger one
+        rebuild pass.
+        """
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                for w in app.allWidgets():
+                    try:
+                        ss = w.styleSheet()
+                        if ss:
+                            w.setStyleSheet(ss)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
 
     def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
                            voice: str = ""):
@@ -5763,6 +6906,22 @@ class _RootShim:
 class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
+        # Qt 6 handles native (including fractional) per-screen DPI.
+        # Do not override a screen's device pixel ratio or use removed Qt 5 flags.
+
+        # Global font defaults: prefer the OS hinting engine and turn
+        # antialiasing on. Without these Courier renders with the
+        # rasteriser default sub-pixel offset and small text picks up a
+        # 1-pixel blur that compounds on a 4K monitor.
+        try:
+            from PyQt6.QtGui import QFont
+            default_font = QFont()
+            default_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+            default_font.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
+            self._app.setFont(default_font)
+        except Exception:
+            pass
+
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)

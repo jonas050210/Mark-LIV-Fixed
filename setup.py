@@ -27,6 +27,7 @@ Two things it deliberately does NOT install:
     PyQt6 and numpy already listed here. No GPU, no OpenGL, no extra packages.
 """
 import argparse
+import importlib.metadata as importlib_metadata
 import importlib.util
 import os
 import platform
@@ -309,7 +310,134 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print what would be installed, then exit")
     parser.add_argument("--requirements", default=str(HERE / "requirements.txt"),
                         help="requirements file to install (default: ./requirements.txt)")
+    # Mark LIV 54: by default setup.py detects what's already installed and
+    # installs only the missing packages. --force-full-install skips that and
+    # reinstalls every requirement (the old behaviour). --auto makes the
+    # detect-only path explicit so a script can rely on the flag without the
+    # default flipping under it.
+    parser.add_argument("--force-full-install", action="store_true",
+                        help="skip the install-check and reinstall every "
+                             "package in the requirements file")
+    parser.add_argument("--auto", action="store_true",
+                        help="explicit alias for the default auto-detect path "
+                             "(installed packages are skipped, only missing "
+                             "ones are downloaded)")
     return parser
+
+
+# ── Auto-detection of already-installed packages ──────────────────────────────
+def _requirement(spec):
+    """Parse PEP 508 using packaging, or pip's bundled copy during bootstrap."""
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:
+        from pip._vendor.packaging.requirements import Requirement
+    return Requirement(spec)
+
+
+def _read_requirements_lines(req_path):
+    """Return (pip requirement, distribution name), preserving markers/pins.
+
+    Directives are kept for pip, with an empty name. Inline comments are
+    removed, but URL fragments (which have no preceding whitespace) survive.
+    Invalid requirements fail explicitly rather than being marked installed.
+    """
+    if not req_path.exists():
+        return []
+    import re
+    out = []
+    for raw in req_path.read_text(encoding="utf-8").splitlines():
+        line = re.split(r"\s+#", raw.strip(), maxsplit=1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append((line, "" if line.startswith("-") else _requirement(line).name))
+    return out
+
+
+def _is_installed(spec):
+    """Check distribution metadata and version, not a guessed import name.
+
+    importlib.metadata normalises distribution names. This accepts renamed,
+    namespace, binary and data-only distributions without importing them.
+    An unrelated importable module is not evidence of an installed package.
+    Non-applicable platform markers are satisfied without a lookup. Extras
+    are left intact in the pip spec; this checks the named distribution.
+    This is installation verification, not a native-library/runtime smoke test.
+    """
+    try:
+        req = _requirement(spec)
+        if req.marker is not None and not req.marker.evaluate():
+            return True
+        dist = importlib_metadata.distribution(req.name)
+        version = dist.version
+        return bool(version) and req.specifier.contains(version, prereleases=True)
+    except (importlib_metadata.PackageNotFoundError, ValueError, TypeError):
+        return False
+
+
+def _missing_requirements(req_path):
+    """Return missing or version-incompatible requirements for this platform."""
+    return [line for line, name in _read_requirements_lines(req_path)
+            if not name or not _is_installed(line)]
+
+
+def _install_requirements(missing, req_path):
+    """Install only the missing lines, with one pip call.
+
+    Passing the whole requirements file when nothing is missing would still
+    work but takes seconds; this branch is a fast exit. We always run pip
+    with --upgrade-strategy only-if-needed so reinstalling is a no-op for
+    packages already at the pinned version.
+    """
+    if not missing:
+        print("\n  All required Python packages already installed \u2014 nothing to do.")
+        return True
+    print(f"\n  Installing {len(missing)} missing package(s):")
+    for line in missing:
+        # Trim very long lines for readability.
+        pretty = line if len(line) <= 64 else line[:61] + "..."
+        print(f"    \u2022 {pretty}")
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--upgrade-strategy", "only-if-needed", *missing]
+    if any(line.startswith("-") for line in missing):
+        cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_path)]
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"\n\u26a0\ufe0f  pip exited with status {e.returncode}.")
+        print(f"    The full requirements file is still available at: {req_path}")
+        print(f"    You can install it manually with:  {Path(sys.executable).name} "
+              f"-m pip install -r {req_path}")
+        return False
+
+
+def _verify_requirements(req_path):
+    """Verify every applicable distribution/version and report each failure."""
+    print("\n  Verifying installation...")
+    if not req_path.is_file():
+        print(f"  Requirements file not found: {req_path}")
+        return False
+    bad = _missing_requirements(req_path)
+    if not bad:
+        print("  ✅ All applicable package distributions and versions verified.")
+        return True
+    print(f"  ⚠️  {len(bad)} requirement(s) missing, incompatible or unverifiable:")
+    for line in bad:
+        print(f"     - {line}")
+    print(f'    Retry: "{sys.executable}" -m pip install -r "{req_path}"')
+    return False
+
+
+def _auto_install(req_path_str: str) -> bool:
+    """Install missing/incompatible requirements; propagate verification failure."""
+    req_path = Path(req_path_str)
+    if not req_path.is_file():
+        print(f"\n  ⚠️  Requirements file not found at {req_path}.")
+        return False
+    print(f"\n  Scanning {req_path.name} for missing packages...")
+    missing = _missing_requirements(req_path)
+    return _install_requirements(missing, req_path) and _verify_requirements(req_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -327,17 +455,46 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("\nDry run — nothing was installed.")
-        print(f"  would run: {Path(sys.executable).name or 'python'} -m pip install "
-              f"-r {args.requirements}")
+        # Show what auto-detection would do, the same way the live run will.
+        req = Path(args.requirements)
+        if req.exists():
+            if getattr(args, "force_full_install", False):
+                print(f"  --force-full-install: would reinstall every package in {req}")
+            else:
+                missing = _missing_requirements(req)
+                if missing:
+                    print(f"  Auto-detect: {len(missing)} of "
+                          f"{len(_read_requirements_lines(req))} packages are missing.")
+                    print(f"  would install: {Path(sys.executable).name or 'python'} "
+                          f"-m pip install --upgrade-strategy only-if-needed")
+                    for line in missing:
+                        pretty = line if len(line) <= 64 else line[:61] + "..."
+                        print(f"    - {pretty}")
+                else:
+                    print("  Auto-detect: every required package is already installed.")
+        else:
+            print(f"  would run: {Path(sys.executable).name or 'python'} -m pip install "
+                  f"-r {args.requirements}")
         if browser_args:
             print(f"  would run: {browser_retry_command(choice)}")
         else:
             print("  no browser download")
         return 0
 
-    # requirements.txt filters OS-specific extras by itself via pip markers.
-    _run("Installing Python dependencies (OS-specific extras auto-filtered)…",
-         [sys.executable, "-m", "pip", "install", "-r", args.requirements])
+    # Mark LIV 54: detect installed packages first, install only missing ones.
+    # This is the default path; pass --force-full-install to skip the check
+    # and reinstall every requirement (the old v53 behaviour).
+    if getattr(args, "force_full_install", False):
+        print("\n  --force-full-install set: reinstalling every package in " +
+              f"{args.requirements}")
+        _run("Installing Python dependencies (full reinstall)…",
+             [sys.executable, "-m", "pip", "install", "--upgrade",
+              "-r", args.requirements])
+        if not _verify_requirements(Path(args.requirements)):
+            return 1
+    else:
+        if not _auto_install(args.requirements):
+            return 1
 
     if browser_args:
         # Chromium covers Chrome/Edge/Opera/Brave/Vivaldi; Firefox for Firefox.
