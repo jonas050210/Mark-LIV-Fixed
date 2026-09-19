@@ -39,6 +39,11 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+try:
+    from core import tasks as _task_registry
+except Exception:      # pragma: no cover — the HUD renders without the registry
+    _task_registry = None
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -1107,6 +1112,222 @@ def _fmt_size(size: int) -> str:
     elif size < 1024**2: return f"{size/1024:.1f} KB"
     elif size < 1024**3: return f"{size/1024**2:.1f} MB"
     else:                return f"{size/1024**3:.1f} GB"
+
+
+class TaskRow(QFrame):
+    """One line of the activity panel: what is running, how far, and a stop button.
+
+    Updated in place rather than rebuilt — a download reports several times a
+    second, and recreating widgets at that rate is exactly the kind of work the
+    HUD should not be doing.
+    """
+
+    _STATE_COLOUR = {"running": C.PRI, "done": C.GREEN, "failed": C.MUTED_C,
+                     "cancelled": C.TEXT_MED}
+
+    def __init__(self, task_id: str, parent=None):
+        super().__init__(parent)
+        self.task_id = task_id
+        self.setObjectName("TaskRow")
+        self.setStyleSheet(
+            f"QFrame#TaskRow {{ background: {C.PANEL2}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; }}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 5)
+        lay.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        self._title = QLabel("")
+        self._title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._title.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        self._state = QLabel("")
+        self._state.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._state.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._cancel = QPushButton("\u2715")
+        self._cancel.setFixedSize(16, 16)
+        self._cancel.setFont(QFont("Courier New", 8))
+        self._cancel.setToolTip("Stop this task")
+        self._cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel.setStyleSheet(
+            f"QPushButton {{ color: {C.TEXT_DIM}; background: transparent; "
+            f"border: none; }} QPushButton:hover {{ color: {C.MUTED_C}; }}"
+        )
+        self._cancel.clicked.connect(self._request_cancel)
+        top.addWidget(self._title, stretch=1)
+        top.addWidget(self._state)
+        top.addWidget(self._cancel)
+        lay.addLayout(top)
+
+        self._bar = QProgressBar()
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._bar.setRange(0, 100)
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ background: {C.PANEL}; border: none; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {C.PRI}; border-radius: 3px; }}"
+        )
+        lay.addWidget(self._bar)
+
+        self._detail = QLabel("")
+        self._detail.setFont(QFont("Courier New", 7))
+        self._detail.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._detail.setWordWrap(True)
+        lay.addWidget(self._detail)
+
+    def _request_cancel(self):
+        """Ask the owner to stop. The owner's loop notices and does the rest."""
+        if _task_registry is None:
+            return
+        try:
+            row = next((t for t in _task_registry.snapshot(limit=32)
+                        if t["id"] == self.task_id), None)
+            if row and row["state"] == "running":
+                _task_registry.request_cancel(self.task_id)
+                self._state.setText("CANCELLING")
+        except Exception:
+            pass
+
+    def set_data(self, snap: dict) -> None:
+        state = str(snap.get("state") or "running")
+        colour = self._STATE_COLOUR.get(state, C.TEXT_MED)
+        self._title.setText(
+            f"{snap.get('label', chr(0x2022))} {snap.get('title', '')}".strip()[:64])
+        self._state.setText(state.upper())
+        self._state.setStyleSheet(f"color: {colour}; background: transparent;")
+        self._cancel.setVisible(state == "running")
+
+        progress = snap.get("progress")
+        if state == "running" and progress is None:
+            self._bar.setRange(0, 0)          # busy indicator: honest "unknown"
+        else:
+            self._bar.setRange(0, 100)
+            if state == "done":
+                self._bar.setValue(100)
+            elif state == "failed":
+                self._bar.setValue(100 if progress is None else int(progress * 100))
+            else:
+                self._bar.setValue(int((progress or 0.0) * 100))
+        chunk = C.MUTED_C if state == "failed" else (
+            C.TEXT_DIM if state == "cancelled" else C.PRI)
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ background: {C.PANEL}; border: none; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {chunk}; border-radius: 3px; }}"
+        )
+        self._detail.setText("  \u00b7  ".join(
+            part for part in (self._line(snap), (snap.get("detail") or "").strip())
+            if part)[:160])
+
+    @staticmethod
+    def _line(snap: dict) -> str:
+        """Numbers, not adjectives: bytes/speed/ETA only when they are known."""
+        bits = []
+        done, total = snap.get("done_bytes"), snap.get("total_bytes")
+        if total:
+            bits.append(f"{snap.get('done_human', '')} / {snap.get('total_human', '')}"
+                        if done is not None else snap.get("total_human", ""))
+        elif done:
+            bits.append(snap.get("done_human", ""))
+        if snap.get("percent") is not None and snap.get("state") == "running":
+            bits.append(f"{snap['percent']}%")
+        if snap.get("speed_human"):
+            bits.append(snap["speed_human"])
+        if snap.get("eta_human") and snap.get("state") == "running":
+            bits.append(f"ETA {snap['eta_human']}")
+        if snap.get("state") != "running" and snap.get("elapsed_human"):
+            bits.append(f"took {snap['elapsed_human']}")
+        return "  \u00b7  ".join(b for b in bits if b)
+
+
+class TaskPanel(QWidget):
+    """Live view of core/tasks: downloads, timers, installs and agent runs.
+
+    Polling, not signals: the registry is a small dict behind a lock, so a 4 Hz
+    QTimer that reads `revision()` and only touches the widgets when it changes
+    keeps the HUD out of every other thread's way — the same pattern the content
+    panel uses via `_content_sig`. The panel hides itself when nothing is
+    running so it never eats layout space for no reason.
+    """
+
+    _POLL_MS = 250
+    _MAX_ROWS = 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._rows: dict[str, TaskRow] = {}
+        self._order: list[str] = []
+        self._revision = -1
+        self._sig = ""
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self._header = QLabel("\u25b8 TASKS")
+        self._header.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._header.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        lay.addWidget(self._header)
+        self._rows_box = QVBoxLayout()
+        self._rows_box.setContentsMargins(0, 0, 0, 0)
+        self._rows_box.setSpacing(4)
+        lay.addLayout(self._rows_box)
+
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._poll)
+        self._tmr.start(self._POLL_MS)
+        self.hide()
+
+    def _poll(self) -> None:
+        # Polling continues while the panel is hidden: that is how it learns it
+        # has work to show. Only the registry being absent stops it.
+        if _task_registry is None:
+            return
+        try:
+            revision = _task_registry.revision()
+        except Exception:
+            return
+        if revision == self._revision:
+            return
+        self._revision = revision
+        try:
+            rows = _task_registry.snapshot(limit=32)
+        except Exception:
+            return
+        live = [r for r in rows if r.get("state") == "running"]
+        shown = (live[: self._MAX_ROWS]
+                 + [r for r in rows if r.get("state") != "running"][
+                     : max(0, self._MAX_ROWS - len(live))])
+        sig = repr([(r["id"], r["state"], r.get("percent"), r.get("detail"),
+                     r.get("done_bytes"), r.get("speed_bps")) for r in shown])
+        if sig == self._sig:
+            return
+        self._sig = sig
+        self._render(shown)
+
+    def _render(self, shown: list[dict]) -> None:
+        for stale in set(self._rows) - {r["id"] for r in shown}:
+            row = self._rows.pop(stale)
+            self._rows_box.removeWidget(row)
+            row.deleteLater()
+        order: list[str] = []
+        for snap in shown:
+            task_id = snap["id"]
+            order.append(task_id)
+            row = self._rows.get(task_id)
+            if row is None:
+                row = TaskRow(task_id)
+                self._rows[task_id] = row
+            row.set_data(snap)
+            if task_id not in self._order:
+                self._rows_box.addWidget(row)
+        if order != self._order:
+            for task_id in order:                     # keep running work on top
+                self._rows_box.removeWidget(self._rows[task_id])
+            for task_id in order:
+                self._rows_box.addWidget(self._rows[task_id])
+            self._order = order
+        self.setVisible(bool(shown))
 
 
 class FileDropZone(QWidget):
@@ -2642,92 +2863,6 @@ class MemoryOverlay(_HudOverlay):
         QTimer.singleShot(0, self._rebuild)
 
 
-class ClipboardPanel(QWidget):
-    """Floating panel shown when text is copied — offers quick Jarvis actions."""
-
-    action_requested = pyqtSignal(str)
-    _W, _H = 326, 112
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"""
-            ClipboardPanel {{
-                background: rgba(0, 8, 14, 248);
-                border: 1px solid {C.BORDER_B};
-                border-radius: 6px;
-            }}
-        """)
-        self.setFixedWidth(self._W)
-        self._clip_text = ""
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 7)
-        lay.setSpacing(4)
-
-        hdr = QHBoxLayout(); hdr.setSpacing(4)
-        icon_lbl = QLabel("◈  CLIPBOARD DETECTED")
-        icon_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        icon_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
-        hdr.addWidget(icon_lbl); hdr.addStretch()
-        x_btn = QPushButton("✕")
-        x_btn.setFixedSize(16, 16)
-        x_btn.setFont(QFont("Courier New", 8))
-        x_btn.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
-        x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        x_btn.clicked.connect(self.hide)
-        hdr.addWidget(x_btn)
-        lay.addLayout(hdr)
-
-        self._preview = QLabel()
-        self._preview.setFont(QFont("Courier New", 8))
-        self._preview.setStyleSheet(f"""
-            color: {C.TEXT}; background: {C.PANEL2};
-            border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 6px;
-        """)
-        self._preview.setWordWrap(False)
-        self._preview.setFixedHeight(28)
-        lay.addWidget(self._preview)
-
-        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
-        _bs = (f"QPushButton {{ background: {C.PANEL2}; color: {C.TEXT_MED}; "
-               f"border: 1px solid {C.BORDER}; border-radius: 2px; }}"
-               f"QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}")
-        for label, cmd_fmt in [
-            ("TRANSLATE", "Translate this text to English: {text}"),
-            ("SUMMARISE", "Summarise this: {text}"),
-            ("EXPLAIN",   "Explain this: {text}"),
-            ("FIX",       "Fix grammar and spelling: {text}"),
-        ]:
-            b = QPushButton(label)
-            b.setFixedHeight(22)
-            b.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(_bs)
-            b.clicked.connect(lambda _, c=cmd_fmt: self._trigger(c))
-            btn_row.addWidget(b)
-        lay.addLayout(btn_row)
-
-        self._dismiss_timer = QTimer(self)
-        self._dismiss_timer.setSingleShot(True)
-        self._dismiss_timer.timeout.connect(self.hide)
-        self.hide()
-
-    def _trigger(self, cmd_fmt: str):
-        if self._clip_text:
-            self.action_requested.emit(cmd_fmt.format(text=self._clip_text[:800]))
-        self.hide()
-
-    def show_clipboard(self, text: str):
-        self._clip_text = text
-        preview = text[:58].replace('\n', ' ')
-        if len(text) > 58:
-            preview += "…"
-        self._preview.setText(f'"{preview}"')
-        self.show(); self.raise_()
-        self._dismiss_timer.start(8000)
-
-
 class PluginSettingsOverlay(QWidget):
     """Floating overlay — renders per-plugin settings forms.
 
@@ -3276,7 +3411,6 @@ class MainWindow(QMainWindow):
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
-    _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
@@ -3441,7 +3575,6 @@ class MainWindow(QMainWindow):
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
-        self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
@@ -3451,10 +3584,6 @@ class MainWindow(QMainWindow):
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
 
-        # Clipboard panel (child of central widget, bottom-center)
-        self._clipboard_panel = ClipboardPanel(self.centralWidget())
-        self._clipboard_panel.action_requested.connect(self._on_clipboard_action)
-        QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -3926,9 +4055,6 @@ class MainWindow(QMainWindow):
             cw.height() - ph - 28,
             pw, ph,
         )
-        # Clipboard panel — bottom-center
-        if hasattr(self, '_clipboard_panel') and self._clipboard_panel.isVisible():
-            self._position_clipboard_panel()
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
@@ -4141,6 +4267,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
+
+        # Live activity: downloads, timers, installs, agent runs (core/tasks).
+        # Hides itself while nothing is running, so the log keeps its space.
+        self._task_panel = TaskPanel()
+        lay.addWidget(self._task_panel)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -5513,33 +5644,6 @@ class MainWindow(QMainWindow):
         ov.show()
         ov.raise_()
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
-
-    # ── Clipboard intelligence ───────────────────────────────────────────────────
-
-    def _on_clipboard_changed(self):
-        try:
-            text = QApplication.clipboard().text().strip()
-            if len(text) >= 10:
-                self._clipboard_sig.emit(text)
-        except Exception:
-            pass
-
-    def _show_clipboard_panel(self, text: str):
-        self._clipboard_panel.show_clipboard(text)
-        self._position_clipboard_panel()
-
-    def _position_clipboard_panel(self):
-        cw = self.centralWidget()
-        pw = ClipboardPanel._W
-        ph = self._clipboard_panel.sizeHint().height() or ClipboardPanel._H
-        x = (cw.width() - pw) // 2
-        y = cw.height() - ph - 6
-        self._clipboard_panel.setGeometry(x, y, pw, ph)
-        self._clipboard_panel.raise_()
-
-    def _on_clipboard_action(self, cmd: str):
-        if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(cmd,), daemon=True).start()
 
     # ────────────────────────────────────────────────────────────────────────────
 

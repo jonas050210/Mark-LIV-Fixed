@@ -163,3 +163,28 @@ Work on `arena/01a0b859-mark-liv-fixed`. `actions/` now holds 25 files: 20 with 
 * `file_controller.get_disk_usage` deliberately takes any path: it reports only total/used/free numbers (no content) and jailing it would break legitimate "how full is C:" questions.
 * `open_app` on Linux passes trailing CLI args (`"libreoffice --writer"` → argv) — restored, tested behaviour (`test_open_app_linux_args_split`), never shelled. The model can pass flags to programs it launches; that is the tool's documented purpose, not a bypass.
 * Windows/macOS-only paths (Start Menu typing, `os.startfile` branches, AppleScript tiers, schtasks/launchd registration) were verified by simulation and code review in this Linux sandbox, not by execution. Real-machine confirmation remains the outstanding step.
+
+---
+
+## Addendum — install gate, task registry, lazy plugins (Mark LIV, arena/01a0ba20)
+
+### New surfaces
+
+| File / tool | Purpose | Main risk | Posture |
+|---|---|---|---|
+| `actions/uninstall_app.py` (`uninstall_app`) | Removes an app by running the vendor's own uninstaller. | Running an attacker-influenced command line, or "uninstalling" by deleting a folder. | The command comes from the Windows Uninstall registry (or an `.app` bundle / `send2trash` on macOS) and is parsed with `shlex` into an argv — no shell, ever. `_SHELL_HOSTS` (cmd, powershell, wscript, python, …) are refused, `msiexec` must carry `/x`, and the exact command line is shown in the CONFIRM banner before it runs. Protected targets (Windows, drivers, runtimes) are refused before the banner; no resolver match means "no reliable uninstaller", not a directory delete. Completion is `app_finder.resolve(name) is None` — the resolver's answer, never the uninstaller's exit code. |
+| `actions/restart_app.py` (`restart_app`) | Close then start an app through `core/app_controller`, verifying both halves. | Starting a second copy when the close failed. | A refused close stops the sequence and says "I did not start a second copy". `is_running` decides the order (a closed app is started, and the answer says so); JARVIS refuses to restart itself. |
+| `actions/window_control.py` (`window_control`) | List/focus/minimize/maximize/restore windows by name or title. | Keystrokes into whatever is focused; closing the wrong thing. | Every verb goes through `core/app_controller.window_action`, which validates the verb *before* choosing a target and never closes a window; the focus keystroke path that used to interpolate titles into PowerShell/AppleScript is gone (`computer_control._focus_window` delegates here too). |
+| `core/install_safety.py` (shared) | One gate for install/update/download/uninstall. | A model-composed "confirmed=yes". | The confirmation token is issued by the HUD (`core/confirm`), not by a tool parameter; unbound UI is fail-closed. `core/installer.py` is the single documented exemption (`SELF_SOURCE`, package list in code) and says so in its request object. |
+
+### Changed paths
+
+* `actions/game_updater.py`: install/update now run behind `install_safety.guard`; success is read from Steam's `appmanifest_*.acf` files, and anything else returns `install_safety.unverified(...)` — "Steam accepted my request, but I could not verify it completed". Epic exposes no download state to other programs, so the tool says exactly that instead of counting a launch as an update.
+* `core/installer.py`: the Playwright browser download is measured (cache growth on disk) and reported to `core/tasks.py`; completion still comes from `browser_cache_state()`, not the exit code.
+* `core/plugin_loader.py`: plugin bodies whose top level only imports/defines/assigns are imported on first use rather than at startup; `PARKED_PLUGINS` keeps `telegram_remote` discovered, listed and refused by name (run, tool declarations and `on_launch` all skip it). A body that fails at import is still diagnosed at discovery — the loader imports any plugin containing `try`/`if`/`raise`/loops at the top level, so a broken plugin remains a launch-time report and never a crash on first click.
+* `core/app_finder.py`: Roblox launches with its build directory as cwd; the `roblox-player` protocol handler's registered exe is preferred over stale version folders.
+
+### Still open (this addendum)
+
+* The uninstall confirm → run → verify path is covered by unit tests with a stubbed uninstaller and a stubbed resolver. No uninstaller resolves on the Linux test machine, so the real registry → `Popen` → "gone from the resolver" trip is unexecuted here.
+* Deferred plugin bodies are imported on the calling thread (under a per-record lock). For the current plugins that is sub-20 ms; a plugin with a slow top-level import would be felt by the first call that needs it, not by the boot.

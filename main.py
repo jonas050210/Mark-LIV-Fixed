@@ -74,7 +74,8 @@ from memory.memory_manager import (
 # (screen_process, close_camera, save_memory, manage_monitor, shutdown_jarvis,
 # system_status).
 from actions.screen_processor  import _capture_camera, _capture_screen
-from actions.system_monitor    import SystemMonitor, get_system_status
+from actions.system_monitor    import (SystemMonitor, format_system_status,
+                                       get_system_status)
 from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
@@ -86,7 +87,7 @@ from memory.config_manager     import (
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
     save_dashboard_lan_enabled,
 )
-from core.plugin_loader        import discover_plugins
+from core.plugin_loader        import discover_plugins, filter_parked
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
@@ -1369,9 +1370,13 @@ class JarvisLive:
         # the host, the capability list from the registries that were just
         # discovered. Rename the assistant, add a plugin or move to another OS
         # and this follows without anyone editing a prompt.
+        # Parked plugins (core.plugin_loader.PARKED_PLUGINS) are discovered and
+        # listed in the plugin manager, but the live session does not offer them:
+        # no tool, no launch hook, and run() refuses them by name.
         _all_decls = (TOOL_DECLARATIONS
                       + self._action_registry.get_tool_declarations()
-                      + self._plugin_registry.get_tool_declarations())
+                      + filter_parked(self._plugin_registry.get_tool_declarations(),
+                                      log=lambda msg: print(f"[Plugins] {msg}")))
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
         sys_prompt = _render_prompt(sys_prompt, {
@@ -1519,7 +1524,7 @@ class JarvisLive:
                 return f"Could not save: {e}"
         if name == "system_status":
             try:
-                return str(get_system_status())
+                return format_system_status(get_system_status())
             except Exception as e:
                 return f"System status unavailable: {e}"
         if name == "undo":
@@ -1628,7 +1633,8 @@ class JarvisLive:
                 result = "Camera closed."
 
             elif name == "system_status":
-                r = await loop.run_in_executor(None, get_system_status)
+                r = await loop.run_in_executor(
+                    None, lambda: format_system_status(get_system_status()))
                 result = str(r)
 
             elif name == "manage_monitor":
