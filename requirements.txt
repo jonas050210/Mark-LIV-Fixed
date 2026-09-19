@@ -21,8 +21,6 @@ beautifulsoup4>=4.12,<5
 trafilatura>=1.8,<2
 lxml_html_clean
 playwright>=1.40,<2
-httpx>=0.28,<1
-browser-harness>=0.1.13,<1
 
 # ── Automation / input control ────────────────────────────────────────────────
 pyautogui
@@ -88,6 +86,7 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 #   pip install pydub        # file_processor: audio metadata and conversion
 #                            #   (also needs ffmpeg on PATH for most formats)
 #   pip install mediapipe    # pushup_counter: elbow-angle rep detection
+#   pip install plyer        # reminder: desktop notification backend (optional, has fallbacks)
 
 # ── Optional: local wake word ("Hey Jarvis") ──────────────────────────────────
 # Deliberately NOT installed by default — it's opt-in. Enable it (and download

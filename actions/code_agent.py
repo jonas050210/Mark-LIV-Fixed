@@ -33,6 +33,21 @@ def _clean_code(text: str) -> str:
     return text.strip()
 
 
+def _within(root: Path, candidate: Path) -> bool:
+    """True when `candidate` resolves inside `root` (symlinks/traversal safe)."""
+    try:
+        r, c = root.resolve(), candidate.resolve()
+        return c == r or c.is_relative_to(r)
+    except Exception:
+        return False
+
+
+# Same boundary as file_controller: the model works inside the user's home —
+# projects, Desktop, documents — and never in system locations, no matter what
+# path it was given. Violations return a message, never raise.
+_HOME = Path.home()
+
+
 def _resolve_save_path(output_path: str, language: str) -> Path:
     ext_map = {
         "python": ".py", "py": ".py",
@@ -45,7 +60,11 @@ def _resolve_save_path(output_path: str, language: str) -> Path:
     }
     if output_path:
         p = Path(output_path)
-        return p if p.is_absolute() else DESKTOP / p
+        p = p if p.is_absolute() else DESKTOP / p
+        # A relative "../../x" or an absolute system path must not escape home.
+        if not _within(_HOME, p if p.exists() else p.parent):
+            raise ValueError(f"Refusing to write outside your home folder: {output_path}")
+        return p
     ext = ext_map.get((language or "python").lower(), ".py")
     return DESKTOP / f"jarvis_code{ext}"
 
@@ -128,6 +147,8 @@ def _single_file_edit(file_path: str, instruction: str) -> str:
     p = Path(file_path)
     if not p.exists():
         return f"File not found: {file_path}"
+    if not _within(_HOME, p):
+        return f"Access denied: I only edit files inside your home folder: {file_path}"
     content = p.read_text(encoding="utf-8")
     prompt = f"""You are an expert programmer. Modify the code according to the instruction.
 Return ONLY the complete updated code — no markdown, no explanation, no backticks.
@@ -152,6 +173,9 @@ def _single_file_explain(file_path: str, code: str) -> str:
         p = Path(file_path)
         if not p.exists():
             return f"File not found: {file_path}"
+        # Explain sends the content to the model — never from outside home.
+        if not _within(_HOME, p):
+            return f"Access denied: I only read files inside your home folder: {file_path}"
         content = p.read_text(encoding="utf-8")
     if not content:
         return "Please provide code or a file path to explain."
@@ -204,10 +228,15 @@ Return ONLY valid JSON:
     if player and hasattr(player, "write_log"):
         player.write_log(f"[CodeAgent] Scaffolding {proj_name} ({len(files)} files)...")
 
-    # Write files
+    # Write files — each plan path is jailed to the project dir: the plan is
+    # model JSON, and a "../../evil.py" in it must not escape the scaffold.
+    _proj_root = project_dir.resolve()
     for fi in files:
         fpath = fi.get("path")
         if not fpath:
+            continue
+        if not _within(_proj_root, project_dir / fpath):
+            print(f"[CodeAgent] ⚠️ Skipping escaping plan path: {fpath}")
             continue
         write_prompt = f"""Write complete, working {lang} code for: {fpath}
 Purpose: {fi.get('description', '')}
@@ -230,10 +259,24 @@ Code:"""
     if deps:
         subprocess.run([sys.executable, "-m", "pip", "install"] + deps, capture_output=True, timeout=60, cwd=str(project_dir))
 
-    # Test run
+    # Test run — the command is model JSON, so it is not trusted verbatim: the
+    # program must be a bare allowed interpreter and any script under it must
+    # live inside the scaffold. Anything else falls back to running the entry
+    # point with this Python.
+    _INTERP = {"python", "python3", "node", "ts-node", "ruby", "php", "java", "dotnet"}
+    try:
+        _argv = shlex.split(run_command) if run_command else []
+    except Exception:
+        _argv = []
+    _entry = project_dir / entry_point
+    if (not _argv or Path(_argv[0]).name not in _INTERP
+            or (len(_argv) > 1 and not _within(_proj_root, project_dir / _argv[1]))):
+        _argv = [sys.executable, str(_entry)] if _within(_proj_root, _entry) else []
+    if not _argv:
+        return f"Project '{proj_name}' created at: {project_dir}\nFiles: {len(files)}\n\nTest run skipped: entry point left the project dir."
     try:
         run_res = subprocess.run(
-            shlex.split(run_command),
+            _argv,
             capture_output=True, text=True,
             timeout=timeout, cwd=str(project_dir)
         )
@@ -256,15 +299,22 @@ def code_agent(parameters: dict, player=None, **_kwargs) -> str:
     description = str(p.get("description", "")).strip()
     language = str(p.get("language", "python")).strip()
     output_path = str(p.get("output_path", "")).strip()
-    file_path = str(p.get("file_path", "")).strip()
-    code = str(p.get("code", "")).strip()
+    file_path = str(p.get("file_path") or "").strip()
+    code = str(p.get("code") or "").strip()
     args = _as_arg_list(p.get("args"))
-    timeout = int(p.get("timeout", 30))
+    try:
+        timeout = int(p.get("timeout", 30))
+    except (TypeError, ValueError):
+        timeout = 30
+    timeout = max(5, min(300, timeout))
 
     if action in ("write", "create"):
         if not description:
             return "Please provide a description of the code to write."
-        _, path = _single_file_write(description, language, output_path)
+        try:
+            _, path = _single_file_write(description, language, output_path)
+        except ValueError as e:
+            return str(e)
         return f"Code written and saved to: {path}"
 
     elif action == "edit":
@@ -281,6 +331,8 @@ def code_agent(parameters: dict, player=None, **_kwargs) -> str:
         p_file = Path(file_path)
         if not p_file.exists():
             return f"File not found: {file_path}"
+        if not _within(_HOME, p_file):
+            return f"Access denied: I only run files inside your home folder: {file_path}"
         return _run_file(p_file, args, timeout)
 
     elif action in ("build_project", "scaffold", "dev_agent"):
@@ -292,7 +344,10 @@ def code_agent(parameters: dict, player=None, **_kwargs) -> str:
     else:
         # Default fallback to write
         if description:
-            _, path = _single_file_write(description, language, output_path)
+            try:
+                _, path = _single_file_write(description, language, output_path)
+            except ValueError as e:
+                return str(e)
             return f"Code written and saved to: {path}"
         return f"Unknown action: '{action}'. Available: write, edit, explain, run, build_project."
 

@@ -12,7 +12,10 @@ from datetime import datetime
 try:
     import pyautogui
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
+    # ImportError when missing — but also KeyError('DISPLAY') / X errors on
+    # headless machines. Either way the action must load and degrade, not die.
+    pyautogui = None
     _PYAUTOGUI = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -36,54 +39,11 @@ def _get_desktop() -> Path:
             return Path(xdg)
     return Path.home() / "Desktop"
 
-def _build_sandbox() -> dict:
-    import time
-
-    safe_builtins = {
-        "print": print,
-        "len": len, "str": str, "int": int, "float": float,
-        "bool": bool, "list": list, "dict": dict, "tuple": tuple,
-        "range": range, "enumerate": enumerate, "sorted": sorted,
-        "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
-        "max": max, "min": min, "sum": sum, "abs": abs,
-        "zip": zip, "map": map, "filter": filter,
-    }
-
-    sandbox = {
-        "__builtins__": safe_builtins,
-        "Path": Path,
-        "time": time,
-        "shutil": type("shutil", (), {
-            "copy2":      shutil.copy2,
-            "copytree":   shutil.copytree,
-            "disk_usage": shutil.disk_usage,
-        })(),
-        "os_path": os.path,  
-    }
-
-    if _PYAUTOGUI:
-        sandbox["pyautogui"] = pyautogui
-
-    if _OS == "Windows":
-        try:
-            import ctypes
-            import winreg
-            sandbox["ctypes"] = ctypes
-            sandbox["winreg"] = type("winreg", (), {
-                # Sadece okuma
-                "OpenKey":      winreg.OpenKey,
-                "QueryValueEx": winreg.QueryValueEx,
-                "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
-            })()
-        except ImportError:
-            pass
-
-    return sandbox
-
-
-def _execute_generated_code(code: str, player=None) -> str:
-    """Safely handle dynamic task requests without using arbitrary exec()."""
-    return "Dynamic arbitrary code execution has been disabled for security. Please use deterministic desktop actions like organize, clean, list, stats, or wallpaper."
+# NOTE: an older revision built an "exec sandbox" dict here and a stub that refused
+# to run it. Both were dead code (no call sites anywhere) — removed outright
+# rather than carried: a dict full of ctypes/shutil handles is not something to
+# keep warm for no reason. Desktop tasks go through the keyword classifier and
+# the deterministic actions below.
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
@@ -115,7 +75,9 @@ def set_wallpaper(image_path: str) -> str:
             if path.suffix.lower() in {".webp", ".png"}:
                 try:
                     from PIL import Image
-                    bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
+                    _tmp = tempfile.NamedTemporaryFile(suffix=".bmp", delete=False)
+                    _tmp.close()
+                    bmp_path = Path(_tmp.name)
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
                 except ImportError:
@@ -124,6 +86,11 @@ def set_wallpaper(image_path: str) -> str:
             return f"Wallpaper set: {path.name}"
 
         elif _OS == "Darwin":
+            # The path is interpolated into AppleScript source: a quote in it
+            # would break out of the string. Reject instead of escaping — a
+            # wallpaper path has no business containing quotes.
+            if '"' in str(path):
+                return f"Image path contains an unsupported character: {path.name}"
             script = (
                 f'tell application "System Events" to tell every desktop to '
                 f'set picture to POSIX file "{path}"'
@@ -187,11 +154,25 @@ for (var i = 0; i < allDesktops.length; i++) {{
 
 
 def set_wallpaper_from_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return "Only http(s) image addresses can be used for wallpaper."
+    tmp = None
     try:
         import urllib.request
-        suffix = Path(url.split("?")[0]).suffix or ".jpg"
-        tmp    = Path(tempfile.mktemp(suffix=suffix))
-        urllib.request.urlretrieve(url, str(tmp))
+        suffix = Path(text.split("?")[0]).suffix or ".jpg"
+        _tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        _tmp.close()
+        tmp = Path(_tmp.name)
+        with urllib.request.urlopen(text, timeout=15) as resp:
+            data = resp.read(25_000_001)
+        if len(data) > 25_000_000:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            return "That image is too large to use as wallpaper."
+        tmp.write_bytes(data)
         result = set_wallpaper(str(tmp))
         try:
             tmp.unlink()
@@ -199,6 +180,11 @@ def set_wallpaper_from_url(url: str) -> str:
             pass
         return result
     except Exception as e:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
         return f"Could not download wallpaper: {e}"
 
 
@@ -379,7 +365,7 @@ def desktop_control(
     """
     params = parameters or {}
     action = str(params.get("action") or "").lower().strip()
-    task   = params.get("task", "").strip()
+    task   = str(params.get("task") or "").strip()
 
     if player:
         player.write_log(f"[desktop] {action or task[:40]}")
@@ -415,8 +401,14 @@ def desktop_control(
             return _ask_gemini_for_desktop_action(actual_task)
 
         else:
+            # Unknown actions are rejected, not reinterpreted: the old fallback
+            # fed any typo ("bogus") into the task classifier, which answered
+            # "Desktop task completed" for something nobody asked. Free-form
+            # requests still work through action="task" + the `task` text above.
             if action:
-                return _ask_gemini_for_desktop_action(action)
+                return (f"Unknown desktop action: '{action}'. Available: wallpaper, "
+                        f"wallpaper_url, current_wallpaper, organize, clean, list, "
+                        f"stats, task.")
             return "No action or task specified."
 
     except Exception as e:

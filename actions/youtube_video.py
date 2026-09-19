@@ -5,16 +5,14 @@ import sys
 import time
 import subprocess
 import shutil
+import socket
+import ipaddress
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
-
+# NOTE: no pyautogui import — this action never uses it, and importing it here
+# once killed the whole action on headless machines (KeyError: 'DISPLAY').
 try:
     import numpy as np
     _NUMPY = True
@@ -136,6 +134,29 @@ def _ask_for_url(prompt_text: str = "YouTube video URL:") -> str | None:
         return None
 
 
+def _blocked_host(host: str) -> bool:
+    """True when a URL points at this machine or a private network.
+
+    Caption URLs come from remote metadata; a malicious or hijacked entry
+    must not turn this fetch into a request against local services.
+    """
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, socket.gaierror):
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except (ValueError, IndexError):
+            continue
+        if addr.is_loopback or addr.is_private or addr.is_link_local \
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+            return True
+    return False
+
+
 def _get_transcript(video_id: str) -> str | None:
     # Tier 1: Try youtube-transcript-api
     if _TRANSCRIPT_OK:
@@ -182,7 +203,7 @@ def _get_transcript(video_id: str) -> str | None:
             for lang in ["en", "tr", "de", "fr", "es"]:
                 if lang in subs and subs[lang]:
                     sub_url = subs[lang][0].get("url")
-                    if sub_url and _REQUESTS_OK:
+                    if sub_url and _REQUESTS_OK and not _blocked_host(urlparse(sub_url).hostname or ""):
                         resp = requests.get(sub_url, timeout=10)
                         if resp.ok:
                             # Subtitles are JSON3 or VTT, extract text blocks
@@ -331,7 +352,7 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         return []
 
 def _handle_play(parameters: dict, player) -> str:
-    query = parameters.get("query", "").strip()
+    query = str(parameters.get("query") or "").strip()
     if not query:
         return "Please tell me what you'd like to watch, sir."
 
@@ -361,7 +382,11 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
     if not _TRANSCRIPT_OK:
         return "youtube-transcript-api is not installed. Run: pip install youtube-transcript-api"
 
-    url = _ask_for_url("Please paste the YouTube video URL:")
+    # Prefer a URL the model already has (same pattern as get_info); only pop
+    # the paste dialog when none was supplied.
+    url = str(parameters.get("url") or "").strip()
+    if not url:
+        url = _ask_for_url("Please paste the YouTube video URL:")
     if not url:
         return "No URL provided, sir. Summary cancelled."
     if not _is_valid_youtube_url(url):
@@ -399,7 +424,7 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
 
 
 def _handle_get_info(parameters: dict, player, speak) -> str:
-    url = parameters.get("url", "").strip()
+    url = str(parameters.get("url") or "").strip()
     if not url:
         url = _ask_for_url("Please paste the YouTube video URL:")
     if not url or not _is_valid_youtube_url(url):
@@ -430,7 +455,11 @@ def _handle_get_info(parameters: dict, player, speak) -> str:
 
 
 def _handle_trending(parameters: dict, player, speak) -> str:
-    region = parameters.get("region", "TR").upper()
+    # Clamped to a 2-letter country code: the value lands in a query string,
+    # and an explicit None must not crash the .upper() call.
+    region = str(parameters.get("region") or "TR").upper()
+    if not (len(region) == 2 and region.isalpha()):
+        region = "TR"
 
     if player:
         player.write_log(f"[YouTube] Trending: {region}")
@@ -515,7 +544,7 @@ TOOL = {
             },
             "url": {
                 "type": "STRING",
-                "description": "Video URL for get_info action"
+                "description": "Video URL for get_info or summarize (summarize asks for one if omitted)"
             }
         },
         "required": []

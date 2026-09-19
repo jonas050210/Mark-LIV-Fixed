@@ -123,9 +123,32 @@ def _from_url(raw) -> tuple[str, str]:
     except ImportError:
         return "", "The web helper packages are not installed."
 
+    # Redirects are followed by hand, not by the HTTP client: a public link
+    # that bounces to http://localhost or a metadata address must face the
+    # same scheme/host checks as the original URL.
     try:
-        response = requests.get(parsed.geturl(), timeout=_URL_TIMEOUT, stream=True,
-                                headers={"User-Agent": "MARK-LIV/1.0 (+local assistant)"})
+        from urllib.parse import urljoin
+        headers = {"User-Agent": "MARK-LIV/1.0 (+local assistant)"}
+        url = parsed.geturl()
+        response = None
+        for _ in range(5):
+            response = requests.get(url, timeout=_URL_TIMEOUT, stream=True,
+                                    headers=headers, allow_redirects=False)
+            if response.status_code not in (301, 302, 303, 307, 308):
+                break
+            nxt = urljoin(url, response.headers.get("location", ""))
+            response.close()
+            response = None
+            hop = urlparse(nxt)
+            hop_host = hop.hostname or ""
+            if hop.scheme.lower() not in _ALLOWED_SCHEMES or not hop.netloc \
+                    or not hop_host or _blocked_host(hop_host):
+                return "", "That link redirects somewhere I am not allowed to fetch."
+            url = hop.geturl()
+        else:
+            return "", "That link redirects too many times."
+        if response is None:  # pragma: no cover - loop always leaves a response
+            return "", "I could not fetch that page."
         response.raise_for_status()
         chunks, size = [], 0
         for chunk in response.iter_content(chunk_size=8192):

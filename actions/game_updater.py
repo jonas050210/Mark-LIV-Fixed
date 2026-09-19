@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
+from core import confirm
+
 from config import get_os, is_windows, is_mac, is_linux
 
 _CNW: dict = (
@@ -57,6 +59,12 @@ _KNOWN_APPIDS: dict[str, tuple[str, str]] = {
     "poe":                 ("238960",  "Path of Exile"),
     "lost ark":            ("1599340", "Lost Ark"),
     "new world":           ("1063730", "New World: Aeternum"),
+    "gd":                  ("322170",  "Geometry Dash"),
+    "geometry dash":       ("322170",  "Geometry Dash"),
+    "ksp":                 ("220200",  "Kerbal Space Program"),
+    "kerbal space program": ("220200", "Kerbal Space Program"),
+    "ksp2":                ("954850",  "Kerbal Space Program 2"),
+    "kerbal space program 2": ("954850", "Kerbal Space Program 2"),
 }
 
 def _find_steam_path() -> Path | None:
@@ -639,6 +647,36 @@ def _system_shutdown() -> None:
         subprocess.run(["systemctl", "poweroff"])
 
 
+def _arm_auto_shutdown(steam_path: Path, speak=None) -> str:
+    """Park the shutdown-after-download watcher behind the on-screen gate.
+
+    Powering the machine off is irreversible — the same category as the
+    restart/shutdown actions in computer_settings — so a human presses a
+    button, or this does not happen. The download itself already started;
+    only the shutdown afterwards waits for approval. With no interface
+    bound, confirm.request refuses fail-closed instead of arming.
+    """
+    def _start() -> str:
+        threading.Thread(
+            target=_watch_and_shutdown,
+            kwargs={"steam_path": steam_path, "speak": speak},
+            daemon=True,
+        ).start()
+        return ("Auto-shutdown armed: the PC will shut down "
+                "when the download finishes.")
+
+    if confirm.pending_title():
+        return ("There is already a confirmation waiting on screen. Ask the "
+                "user to answer that one first — auto-shutdown was not armed.")
+    return confirm.request(
+        key="game_shutdown",
+        title="Shut this computer down when the download finishes",
+        detail=("Steam keeps downloading. Once it is done the computer powers "
+                "off — anything unsaved will be lost."),
+        run=_start,
+    )
+
+
 def _watch_and_shutdown(steam_path: Path, speak=None,
                         check_interval: int = 30, timeout_hours: int = 12):
     print("[GameUpdater]...")
@@ -813,13 +851,16 @@ def _schedule_windows(hour: int, minute: int) -> str:
     task_name   = "JARVIS_GameUpdater"
     script_path = Path(__file__).resolve()
     subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True, **_CNW)
-    for extra in (["/RL", "HIGHEST", "/RU", "SYSTEM"], []):
-        cmd    = ["schtasks", "/Create", "/TN", task_name,
-                  "/TR", f'"{sys.executable}" "{script_path}" --scheduled',
-                  "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F", *extra]
-        result = subprocess.run(cmd, capture_output=True, text=True, **_CNW)
-        if result.returncode == 0:
-            return f"Daily game update scheduled at {hour:02d}:{minute:02d}."
+    # Deliberately a plain per-user task: the scheduled command runs this
+    # user-writable .py file, so registering it as SYSTEM/HIGHEST would turn
+    # every future edit of this file into SYSTEM code execution. Steam
+    # updates are per-user work and need no elevation.
+    cmd    = ["schtasks", "/Create", "/TN", task_name,
+              "/TR", f'"{sys.executable}" "{script_path}" --scheduled',
+              "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F"]
+    result = subprocess.run(cmd, capture_output=True, text=True, **_CNW)
+    if result.returncode == 0:
+        return f"Daily game update scheduled at {hour:02d}:{minute:02d}."
     return f"Scheduling failed: {result.stderr.strip()}"
 
 
@@ -828,6 +869,8 @@ def _schedule_mac(hour: int, minute: int) -> str:
     plist_dir.mkdir(parents=True, exist_ok=True)
     plist_path  = plist_dir / "com.jarvis.gameupdater.plist"
     script_path = Path(__file__).resolve()
+    from xml.sax.saxutils import escape as _xml_escape
+    _exe_xml, _script_xml = _xml_escape(sys.executable), _xml_escape(str(script_path))
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -835,8 +878,8 @@ def _schedule_mac(hour: int, minute: int) -> str:
     <key>Label</key><string>com.jarvis.gameupdater</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{sys.executable}</string>
-        <string>{script_path}</string>
+        <string>{_exe_xml}</string>
+        <string>{_script_xml}</string>
         <string>--scheduled</string>
     </array>
     <key>StartCalendarInterval</key>
@@ -937,11 +980,17 @@ def _get_schedule_status() -> str:
 def game_updater(parameters: dict, player=None, speak=None) -> str:
     p         = parameters or {}
     action    = str(p.get("action") or "update").lower().strip()
-    platform  = p.get("platform",  "both").lower().strip()
-    game_name = (p.get("game_name") or "").strip() or None
-    app_id    = (p.get("app_id")    or "").strip() or None
-    hour      = int(p.get("hour",   3))
-    minute    = int(p.get("minute", 0))
+    platform  = str(p.get("platform") or "both").lower().strip()
+    game_name = str(p.get("game_name") or "").strip() or None
+    app_id    = str(p.get("app_id") or "").strip() or None
+    try:
+        hour = max(0, min(23, int(p.get("hour", 3))))
+    except (TypeError, ValueError):
+        hour = 3
+    try:
+        minute = max(0, min(59, int(p.get("minute", 0))))
+    except (TypeError, ValueError):
+        minute = 0
     shutdown  = str(p.get("shutdown_when_done", "false")).lower() == "true"
 
     results = []
@@ -1003,12 +1052,7 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
                             steam_path, game_name=game_name, app_id=app_id
                         )
                         if shutdown:
-                            threading.Thread(
-                                target=_watch_and_shutdown,
-                                kwargs={"steam_path": steam_path, "speak": speak},
-                                daemon=True
-                            ).start()
-                            msg += " Auto-shutdown enabled."
+                            msg += " " + _arm_auto_shutdown(steam_path, speak=speak)
                         if player: player.write_log(f"[GameUpdater] {msg[:100]}")
                         if speak:  speak(msg)
                         return msg
@@ -1023,12 +1067,7 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
                         results.append(f"Steam: {_update_steam_games(steam_path)}")
 
                 if shutdown:
-                    threading.Thread(
-                        target=_watch_and_shutdown,
-                        kwargs={"steam_path": steam_path, "speak": speak},
-                        daemon=True
-                    ).start()
-                    results.append("Auto-shutdown enabled.")
+                    results.append(_arm_auto_shutdown(steam_path, speak=speak))
 
         if platform in ("epic", "both"):
             if is_linux():
@@ -1092,7 +1131,8 @@ TOOL = {
             },
             "shutdown_when_done": {
                 "type": "BOOLEAN",
-                "description": "Shut down PC when download finishes"
+                "description": ("Shut down the PC when the download finishes. "
+                                "The user must approve this on screen first.")
             }
         },
         "required": []

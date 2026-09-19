@@ -193,6 +193,24 @@ def _linux_notify(title: str, message: str, seconds: int) -> bool:
         return False
 
 
+def _mac_notify(title: str, message: str) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    # Interpolated into AppleScript source: strip quotes rather than escaping,
+    # the same sanitization the reminder scheduler uses for its alerts.
+    safe_title = title.replace('"', "")
+    safe_msg = message.replace('"', "")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe_msg}" with title "{safe_title}"'],
+            check=False, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def notify_action(parameters: dict, player=None) -> str:
     """
     Show a desktop notification immediately.
@@ -214,6 +232,7 @@ def notify_action(parameters: dict, player=None) -> str:
     delivered = (_windows_toast(title, message, seconds)
                  or _windows_balloon(title, message, seconds)
                  or _linux_notify(title, message, seconds)
+                 or _mac_notify(title, message)
                  or _windows_msg(message, seconds))
 
     if player is not None:
@@ -224,8 +243,8 @@ def notify_action(parameters: dict, player=None) -> str:
 
     if delivered:
         return f"Notification shown: {message}"
-    # No desktop notifier available (headless Linux, macOS, or the toast package
-    # is missing). The log entry above is the fallback, and saying so out loud
+    # No desktop notifier available (headless Linux, or the toast package is
+    # missing). The log entry above is the fallback, and saying so out loud
     # beats silently claiming success.
     return (f"No desktop notifier answered, so I logged it instead: {message}")
 

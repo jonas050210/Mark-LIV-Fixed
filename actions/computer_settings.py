@@ -1,5 +1,6 @@
 #computer_settings.py
 import json
+import os
 import re
 import sys
 import time
@@ -12,13 +13,17 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
+    # ImportError when missing — but also KeyError('DISPLAY') / X errors on
+    # headless machines. Either way the action must load and degrade, not die.
+    pyautogui = None
     _PYAUTOGUI = False
 
 try:
     import pyperclip
     _PYPERCLIP = True
 except ImportError:
+    pyperclip = None
     _PYPERCLIP = False
 
 from core import confirm
@@ -188,6 +193,35 @@ def volume_set(value: int):
             capture_output=True)
         return
 
+
+def _xrandr_brightness(delta: float) -> None:
+    """brightnessctl is missing: parse xrandr in Python, call it as argv.
+
+    Same result as the old shell pipeline (`xrandr | grep ... | cut ...` plus
+    a `python3 -c` inside $(...)), but the connected-output name travels as an
+    argument, never through a shell — there is no shell=True left to inject.
+    """
+    out = subprocess.run(["xrandr"], capture_output=True, text=True,
+                         timeout=5).stdout or ""
+    connected = None
+    for line in out.splitlines():
+        if " connected" in line and line.split():
+            connected = line.split()[0]
+            break
+    if not connected:
+        return
+    verb = subprocess.run(["xrandr", "--verbose"], capture_output=True,
+                          text=True, timeout=5).stdout or ""
+    m = re.search(r"Brightness:\s*([0-9]*\.?[0-9]+)", verb)
+    try:
+        current = float(m.group(1)) if m else 1.0
+    except ValueError:
+        current = 1.0
+    new = min(1.0, max(0.1, current + delta))
+    subprocess.run(["xrandr", "--output", connected, "--brightness", f"{new:.2f}"],
+                   capture_output=True, timeout=5)
+
+
 def brightness_up():
     if _OS == "Darwin":
         subprocess.run(["osascript", "-e",
@@ -198,13 +232,10 @@ def brightness_up():
                 capture_output=True).returncode == 0:
             subprocess.run(["brightnessctl", "set", "+10%"], capture_output=True)
         else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(min(1.0,b+0.1))")',
-                shell=True, capture_output=True
-            )
+            try:
+                _xrandr_brightness(+0.1)
+            except Exception as e:
+                print(f"[Settings] xrandr brightness up failed: {e}")
     else:
         try:
             subprocess.run(
@@ -227,13 +258,10 @@ def brightness_down():
                 capture_output=True).returncode == 0:
             subprocess.run(["brightnessctl", "set", "10%-"], capture_output=True)
         else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(max(0.1,b-0.1))")',
-                shell=True, capture_output=True
-            )
+            try:
+                _xrandr_brightness(-0.1)
+            except Exception as e:
+                print(f"[Settings] xrandr brightness down failed: {e}")
     else:
         try:
             subprocess.run(
@@ -609,7 +637,9 @@ def set_wallpaper(image_path: str) -> str:
                 try:
                     from PIL import Image
                     import tempfile
-                    bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
+                    _tmp = tempfile.NamedTemporaryFile(suffix=".bmp", delete=False)
+                    _tmp.close()
+                    bmp_path = Path(_tmp.name)
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
                 except ImportError:
@@ -617,6 +647,11 @@ def set_wallpaper(image_path: str) -> str:
             ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3)
             return f"Wallpaper set: {path.name}"
         elif _OS == "Darwin":
+            # The path is interpolated into AppleScript source: a quote in it
+            # would break out of the string. Reject instead of escaping — a
+            # wallpaper path has no business containing quotes.
+            if '"' in str(path):
+                return f"Image path contains an unsupported character: {path.name}"
             script = (
                 f'tell application "System Events" to tell every desktop to '
                 f'set picture to POSIX file "{path}"'
@@ -844,11 +879,11 @@ def computer_settings(
     session_memory=None,
 ) -> str:
     if not _PYAUTOGUI:
-        return "pyautogui is not installed. Run: pip install pyautogui"
+        return "PyAutoGUI is not available (not installed, or no display on a headless machine). Run: pip install pyautogui"
 
     params      = parameters or {}
-    raw_action  = params.get("action", "").strip()
-    description = params.get("description", "").strip()
+    raw_action  = str(params.get("action") or "").strip()
+    description = str(params.get("description") or "").strip()
     value       = params.get("value", None)
 
     if not raw_action and description:

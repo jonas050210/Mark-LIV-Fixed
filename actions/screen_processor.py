@@ -119,10 +119,14 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
     if not cap.isOpened():
         cap.release()
         return False
-    for _ in range(warmup):
-        cap.read()
-    ret, frame = cap.read()
-    cap.release()
+    try:
+        for _ in range(warmup):
+            cap.read()
+        ret, frame = cap.read()
+    finally:
+        # A failed read must not leave the device handle open: on some
+        # drivers the camera stays locked until the process exits.
+        cap.release()
     if not ret or frame is None:
         return False
     return bool(np.mean(frame) > 8)
@@ -147,7 +151,10 @@ def _detect_camera_index() -> int:
 def _get_camera_index() -> int:
     cfg = _load_config()
     if "camera_index" in cfg:
-        return int(cfg["camera_index"])
+        try:
+            return int(cfg["camera_index"])
+        except (TypeError, ValueError):
+            pass  # corrupt value: fall through to re-detection
     return _detect_camera_index()
 
 
@@ -162,11 +169,13 @@ def _capture_camera() -> tuple[bytes, str]:
     if not cap.isOpened():
         raise RuntimeError(f"Camera index {index} could not be opened.")
 
-    for _ in range(10):
-        cap.read()
+    try:
+        for _ in range(10):
+            cap.read()
 
-    ret, frame = cap.read()
-    cap.release()
+        ret, frame = cap.read()
+    finally:
+        cap.release()
 
     if not ret or frame is None:
         raise RuntimeError("Camera returned no frame.")

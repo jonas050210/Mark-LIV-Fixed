@@ -123,6 +123,23 @@ _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
 
 
+def _spawn(coro, label: str = "background") -> "asyncio.Task":
+    """Fire-and-forget that cannot die silently: a failed task logs its error
+    instead of surfacing as 'Task exception was never retrieved' (or nothing)."""
+    task = asyncio.create_task(coro)
+
+    def _done(t: "asyncio.Task") -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            print(f"[JARVIS] ⚠️ background {label} failed: {exc}")
+
+    task.add_done_callback(_done)
+    return task
+
+
 def _pcm_level(samples) -> float:
     """Map a block of int16 PCM samples to a 0.0–1.0 loudness level for the HUD
     waveform. Returns 0.0 on empty/invalid input so it can never raise."""
@@ -552,6 +569,53 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
+# Live models documented NOT to accept the `proactivity` setup field. Sending
+# it to one of these gets the setup refused with a 1007, which used to arrive
+# as two scary tracebacks (and a sacrificed turn-tuning) on every startup —
+# or, when the reason string carried no recognisable token, as a bogus "API
+# key invalid" prompt for a key that was never the problem. Substrings of the
+# full model id, so a rename still matches until the list is reviewed.
+_NO_PROACTIVITY_MODELS = ("3.1-flash-live",)
+
+
+def _live_supports_proactivity() -> bool:
+    """False when LIVE_MODEL is known to refuse the proactivity field."""
+    model = LIVE_MODEL or ""
+    return not any(tag in model for tag in _NO_PROACTIVITY_MODELS)
+
+
+def _contains_cancel(exc: BaseException) -> bool:
+    """True if `exc` is (or wraps) an asyncio cancellation — i.e. this task is
+    being shut down and must propagate, never reconnect."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_cancel(sub) for sub in exc.exceptions)
+    return False
+
+
+# Substrings (matched case-insensitively) that mean the setup failed because
+# the credentials are wrong — the ONLY case that may ask the user for a key.
+# A bare close code is deliberately not enough: a 1007 also carries setup
+# rejections for fields the model dislikes, and prompting for a key there
+# wedged the app on a valid key with no way forward.
+_KEY_FAILURE_TOKENS = (
+    "api key not valid", "api_key_invalid", "unauthenticated",
+    "permission_denied", "http 401", "http 403", "invalid key",
+    "invalid api key", "api key expired", "api key not found",
+    "unauthorized", "forbidden",
+)
+
+
+# Substrings that mean the network (not the session, not the key) is at fault.
+# Shared by the setup-phase and mid-session paths so a DNS outage or a refused
+# socket can never cost the session its features via the shed ladder.
+_NET_TOKENS = (
+    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
+    "ConnectionRefusedError", "OSError", "Cannot connect",
+)
+
+
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
@@ -630,8 +694,10 @@ class JarvisLive:
         # _session_log keeps seeing the same object.
         self._summary = SessionSummary(self._session_log, self._write_session_summary)
 
-        self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
+        self._enhanced_live = True  # v1alpha + proactive audio; shed if setup is rejected
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
+        self._compressed_live = True  # context-window compression; same fallback
+        self._proact_gate_logged = False  # the model-gate note below fires once
 
         _base_dir = Path(__file__).resolve().parent
         _inline_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -1042,8 +1108,18 @@ class JarvisLive:
 
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
-        self._interrupted = True
+        # Arm the discard flag ONLY when an answer is actually in flight. The
+        # button/shortcut can fire while idle, and arming it then ate the HEAD
+        # of the next reply (its audio discarded until that turn's
+        # turn_complete) and skipped its transcript — with no way back.
+        with self._speaking_lock:
+            _speaking_now = self._is_speaking
         q = self.audio_in_queue
+        try:
+            _queued_now = bool(q is not None and not q.empty())
+        except Exception:
+            _queued_now = False
+        self._interrupted = bool(_speaking_now or _queued_now)
         if q:
             drained = 0
             while True:
@@ -1158,11 +1234,6 @@ class JarvisLive:
             session_resumption=types.SessionResumptionConfig(
                 handle=self._resume_handle
             ),
-            # Sliding-window compression: session never dies from a full context
-            # window — JARVIS can stay in one conversation for hours
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(),
-            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1171,6 +1242,14 @@ class JarvisLive:
                 )
             ),
         )
+        if self._compressed_live:
+            # Sliding-window compression: session never dies from a full context
+            # window — JARVIS can stay in one conversation for hours
+            cfg["context_window_compression"] = (
+                types.ContextWindowCompressionConfig(
+                    sliding_window=types.SlidingWindow(),
+                )
+            )
         if self._enhanced_live:
             # Proactive audio: JARVIS stays silent when speech isn't addressed
             # to it (background chatter, talking to someone else in the room).
@@ -1179,7 +1258,14 @@ class JarvisLive:
             #  To restore it on a 2.5 native-audio model, add back:
             #  cfg["enable_affective_dialog"] = True )
             if get_proactive_audio_enabled():
-                cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
+                if _live_supports_proactivity():
+                    cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
+                elif not self._proact_gate_logged:
+                    self._proact_gate_logged = True
+                    print(f"[JARVIS] Proactive audio is not supported by "
+                          f"{LIVE_MODEL} — continuing without it. "
+                          f"(The 'proactive_audio' setting still applies to "
+                          f"models that have the feature.)")
 
         if self._tuned_live:
             cfg.update(self._tuning_config())
@@ -1379,7 +1465,7 @@ class JarvisLive:
                             pass
                     import os as _os
                     _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+                _spawn(_do_shutdown(), "voice-shutdown")
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
@@ -1444,7 +1530,10 @@ class JarvisLive:
             await self.session.send_realtime_input(
                 audio=types.Blob(
                     data=msg["data"],
-                    mime_type=msg.get("mime_type", "audio/pcm"),
+                    # The documented input form (docs + SDK examples use
+                    # audio/pcm;rate=16000); the bare type leaves the rate
+                    # unsaid and risks the server ignoring the audio.
+                    mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                 )
             )
 
@@ -1529,7 +1618,7 @@ class JarvisLive:
                         pass
                 loop.call_soon_threadsafe(
                     _push,
-                    {"data": data, "mime_type": "audio/pcm"}
+                    {"data": data, "mime_type": "audio/pcm;rate=16000"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
@@ -1664,6 +1753,29 @@ class JarvisLive:
                     if response.server_content:
                         sc = response.server_content
 
+                        if sc.interrupted:
+                            # Server-side VAD heard the user over our reply and
+                            # stopped generating. The audio already queued is
+                            # now stale: drop it instead of talking over them.
+                            # Same audio bits as interrupt(), but the turn's
+                            # transcripts stay valid — only the sound is dead.
+                            _drained = 0
+                            _q = self.audio_in_queue
+                            if _q is not None:
+                                while True:
+                                    try:
+                                        _q.get_nowait()
+                                        _drained += 1
+                                    except asyncio.QueueEmpty:
+                                        break
+                                    except Exception:
+                                        break
+                            self.set_speaking(False)
+                            self._visemes.reset()
+                            self._play_cursor = 0.0
+                            print(f"[JARVIS] Barge-in — server interrupted, "
+                                  f"{_drained} queued chunks dropped")
+
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
                             # A turn that involves a tool call passes through
@@ -1691,6 +1803,19 @@ class JarvisLive:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
+                            # This turn_complete IS the vision answer — close camera +
+                            # release the busy flag. Placed BEFORE the interrupted
+                            # skip below on purpose: interrupting a vision answer
+                            # used to `continue` past the release, wedging every
+                            # later "look at the screen" on the busy latch.
+                            if self._vision_close_pending:
+                                self._vision_close_pending = False
+                                self._vision_busy = False
+                                async def _cam_close():
+                                    await asyncio.sleep(2.0)
+                                    self.ui.stop_camera_stream()
+                                _spawn(_cam_close(), "camera-close")
+
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
@@ -1706,7 +1831,7 @@ class JarvisLive:
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
                                 if self._dashboard:
-                                    asyncio.create_task(self._dashboard.broadcast({
+                                    _spawn(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
                                         "text": full_in,
                                         "ts": datetime.now().isoformat(),
@@ -1725,21 +1850,12 @@ class JarvisLive:
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
-                                    asyncio.create_task(self._dashboard.broadcast({
+                                    _spawn(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
                                         "text": full_out,
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
-
-                            if self._vision_close_pending:
-                                # This turn_complete IS the vision answer — close camera + release busy flag
-                                self._vision_close_pending = False
-                                self._vision_busy = False
-                                async def _cam_close():
-                                    await asyncio.sleep(2.0)
-                                    self.ui.stop_camera_stream()
-                                asyncio.create_task(_cam_close())
 
                     if response.tool_call:
                         fn_responses = []
@@ -1815,6 +1931,16 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    # A wait_for timeout expiring while the task is being
+                    # cancelled converts the CancelledError into TimeoutError
+                    # (asyncio.timeout semantics): the cancel is consumed and
+                    # nothing redelivers it, so a bare `continue` here would
+                    # swallow TaskGroup shutdown/reconnect and loop forever.
+                    # The timeout's own self-cancels are uncancel()ed by the
+                    # context manager, so a nonzero count is always foreign.
+                    _play_task = asyncio.current_task()
+                    if _play_task is not None and _play_task.cancelling():
+                        break
                     continue
 
                 self.set_speaking(True)
@@ -1828,6 +1954,13 @@ class JarvisLive:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                # The server's audio blobs are arbitrary lengths, so a batch
+                # can sum to an ODD byte count — and RawOutputStream.write
+                # raises ValueError on those, which used to unwind the whole
+                # TaskGroup and reconnect mid-reply. One silence byte keeps
+                # every write a whole number of int16 frames.
+                if len(batch) % 2:
+                    batch.append(0)
 
                 # Drive the HUD waveform and the avatar's mouth from JARVIS's
                 # own voice. The batch is up to 200 ms long, so we hand over a
@@ -1888,6 +2021,20 @@ class JarvisLive:
             raise
         finally:
             self.set_speaking(False)
+            # The mic side opens its stream with `with`; the speaker side
+            # never closed at all — every reconnect leaked a PortAudio output
+            # stream until the device went busy and the voice died. Abort
+            # drops the buffered tail (a new session is starting anyway) and
+            # close releases the device. Best-effort: unwinding must never
+            # fail because the device already went away.
+            try:
+                stream.abort()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
             stream.stop()
             stream.close()
 
@@ -2025,7 +2172,7 @@ class JarvisLive:
                 print(f"[JARVIS] Briefing phase 2 failed: {e}")
                 self.ui.write_log("SYS: Could not fetch the news for the briefing.")
 
-        asyncio.create_task(_deliver_news())
+        _spawn(_deliver_news(), "briefing-news")
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
@@ -2201,6 +2348,12 @@ class JarvisLive:
             except asyncio.TimeoutError:
                 # No audio for 1 s → phone mic inactive, give PC mic back
                 self._phone_active = False
+                # Same wait_for/cancel race as _play_audio: a timeout that
+                # expires mid-cancel converts CancelledError to TimeoutError
+                # and this `continue` would swallow TaskGroup shutdown.
+                _relay_task = asyncio.current_task()
+                if _relay_task is not None and _relay_task.cancelling():
+                    break
                 continue
             self._phone_active = True   # phone is streaming — silence PC mic
             with self._speaking_lock:
@@ -2243,6 +2396,11 @@ class JarvisLive:
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
+                # Same wait_for/cancel race as _play_audio: without this the
+                # loop swallows TaskGroup shutdown (see _play_audio comment).
+                _cmd_task = asyncio.current_task()
+                if _cmd_task is not None and _cmd_task.cancelling():
+                    break
                 pass
             except Exception as e:
                 print(f"[Dashboard] Command error: {e}")
@@ -2287,9 +2445,9 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
+            _spawn(self._dashboard.serve(), "dashboard-serve")
             # Runs for the whole lifetime, not just inside an active session
-            asyncio.create_task(self._process_dashboard_commands())
+            _spawn(self._process_dashboard_commands(), "dashboard-commands")
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
@@ -2299,6 +2457,10 @@ class JarvisLive:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 _resumed_with = self._resume_handle is not None
+                # Set beside _resumed_with (not at the connect): the handler
+                # below reads it for failures raised anywhere in the try —
+                # including _build_config itself — so it must always exist.
+                _entered_session = False
                 config = self._build_config()
 
                 # A key that is MISSING is neither a network problem nor an
@@ -2319,8 +2481,8 @@ class JarvisLive:
                     continue
 
                 # Fresh client on every reconnect — avoids stale HTTP session state
-                # v1alpha carries proactive audio; if it gets rejected we fall
-                # back to v1beta.
+                # v1alpha first; shedding _enhanced_live (see the setup-failure
+                # ladder below) retries on v1beta without proactive audio.
                 client = genai.Client(
                     api_key=_api_key,
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
@@ -2330,7 +2492,11 @@ class JarvisLive:
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
+                    _entered_session = True
                     self.session          = session
+                    # An interrupt whose turn never completed (server dropped
+                    # mid-reply) must not eat the new session's first answer.
+                    self._interrupted     = False
                     # ~20 s of 50 ms slices. Bounded so a receive flood with a
                     # stuck player grows memory by seconds of audio, not
                     # unbounded — the queue drops rather than hoards.
@@ -2412,12 +2578,23 @@ class JarvisLive:
                 raise
             except SystemExit:
                 raise
+            except asyncio.CancelledError:
+                # Shutdown, not failure: propagate so a single cancel ends the
+                # loop. (The finally below still runs: session cleared, summary
+                # task started.) Swallowing this is what used to make run()
+                # reconnect instead of stopping.
+                raise
             except BaseException as e:
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
+                # A group that carries a cancellation is still a shutdown: the
+                # parent is going away, and reconnecting into it wedges the
+                # loop instead of ending it.
+                if _contains_cancel(e):
+                    raise
                 # Voluntary reconnect (voice change) — not an error. Rebuild the
                 # session immediately with no backoff and no scary logs.
                 if _is_reconnect_signal(e):
@@ -2448,64 +2625,103 @@ class JarvisLive:
                     continue
 
                 err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
+                if not _entered_session:
+                    # ── SETUP-PHASE failure: the handshake or the setup was
+                    # refused before any audio flowed. This is the only place a
+                    # key prompt or a feature shed may come from: mid-session
+                    # the credentials already worked and the setup already held.
+                    _low = err_str.lower()
 
-                # Turn-taking / media / thinking knobs rejected by the server
-                # (preview API drift) — drop them first, because they are the
-                # newest fields and the cheapest to lose. Proactive audio is
-                # tried again on the next pass if the error persists.
-                if self._tuned_live and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                    or "realtime_input" in err_str.lower()
-                    or "media_resolution" in err_str.lower()
-                    or "thinking" in err_str.lower()
-                ):
-                    self._tuned_live = False
-                    print("[JARVIS] Live tuning rejected — reconnecting without it.")
-                    continue
+                    # 1. Credentials — the ONLY key prompt. Matched on text the
+                    # server actually sends for bad keys, never on a bare close
+                    # code: a 1007 also carries setup rejections for fields the
+                    # model dislikes, and asking for a key there wedged the app
+                    # on a valid key with no way forward.
+                    if any(t in _low for t in _KEY_FAILURE_TOKENS):
+                        self.ui.write_log("ERR: API key invalid — please re-enter your key.")
+                        self.ui.set_state("SLEEPING")
+                        self.ui.prompt_reconfig()
+                        while not self.ui._win._ready:
+                            await asyncio.sleep(1)
+                        print("[JARVIS] New API key saved — reconnecting...")
+                        self._conn_backoff = 0
+                        continue
 
-                # Proactive audio rejected by the server (preview API drift) —
-                # drop it and reconnect with the plain config.
-                if self._enhanced_live and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "proactiv" in err_str.lower()
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                ):
-                    self._enhanced_live = False
-                    self.ui.write_log(
-                        "SYS: Proactive audio unavailable — reconnecting without it."
-                    )
-                    continue
-
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
-                    self.ui.write_log("ERR: API key invalid — please re-enter your key.")
-                    self.ui.set_state("SLEEPING")
-                    self.ui.prompt_reconfig()
-                    while not self.ui._win._ready:
-                        await asyncio.sleep(1)
-                    print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
-                    continue
-
-                # Network / timeout errors — log clearly and back off
-                is_net_err = any(k in err_str for k in (
-                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
-                    "ConnectionRefusedError", "OSError", "Cannot connect",
-                ))
-                if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
-                    self._conn_backoff = _conn_backoff
-                    self.ui.write_log(
-                        f"NET: Connection failed — retrying in {_conn_backoff}s. "
-                        "(a VPN may be required)"
-                    )
+                    # 2. Dial-level network failure: back off WITHOUT shedding.
+                    # A DNS outage or a refused socket must not cost the session
+                    # its features — they would be gone for the whole process.
+                    if any(k in err_str for k in _NET_TOKENS):
+                        _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                        self._conn_backoff = _conn_backoff
+                        self.ui.write_log(
+                            f"NET: Connection failed — retrying in {_conn_backoff}s. "
+                            "(a VPN may be required)"
+                        )
+                    else:
+                        # 3. Setup refused: shed optional fields in order,
+                        # retrying immediately after each. When the reason names
+                        # the field, that field goes first so no innocent knob
+                        # is sacrificed; a bare close code names nothing, so the
+                        # default order proactivity → tuning → compression is
+                        # the diagnosis, one offender per retry. "Was sent"
+                        # mirrors _build_config exactly, so a field already off
+                        # costs no extra attempt.
+                        _proact_sent = (self._enhanced_live and get_proactive_audio_enabled()
+                                        and _live_supports_proactivity())
+                        _tune_sent = bool(self._tuned_live and self._tuning_config())
+                        _compress_sent = bool(self._compressed_live)
+                        if "compress" in _low and _compress_sent:
+                            self._compressed_live = False
+                            print("[JARVIS] Setup refused (compression) — "
+                                  "reconnecting without it.")
+                            continue
+                        if (("thinking" in _low or "mediaresolution" in _low)
+                                and _tune_sent):
+                            self._tuned_live = False
+                            print("[JARVIS] Setup refused (live tuning) — "
+                                  "reconnecting without it.")
+                            continue
+                        if _proact_sent:
+                            self._enhanced_live = False
+                            print("[JARVIS] Setup refused with proactive audio — "
+                                  "retrying on v1beta without it.")
+                            self.ui.write_log("SYS: Proactive audio unavailable — "
+                                              "reconnecting without it.")
+                            continue
+                        if _tune_sent:
+                            self._tuned_live = False
+                            print("[JARVIS] Setup refused with live tuning — "
+                                  "reconnecting without it.")
+                            continue
+                        if _compress_sent:
+                            self._compressed_live = False
+                            print("[JARVIS] Setup refused with compression — "
+                                  "reconnecting without it.")
+                            continue
+                        # 4. Minimal setup still refused, and it is neither the
+                        # key nor the network: say exactly that, then keep
+                        # retrying with backoff. Transient server trouble heals;
+                        # a misdiagnosis would not.
+                        _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                        self._conn_backoff = _conn_backoff
+                        print(f"[JARVIS] Setup keeps failing ({type(e).__name__}): "
+                              f"{err_str[:200]} — retrying minimal setup in {_conn_backoff}s")
+                        self.ui.write_log("SYS: Live setup failing — retrying with the minimal config.")
                 else:
-                    self._conn_backoff = 3
+                    # ── MID-SESSION failure: the handshake worked, so this is
+                    # neither the key nor the setup — just reconnect with backoff.
+                    is_net_err = any(k in err_str for k in _NET_TOKENS)
+                    if is_net_err:
+                        _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                        self._conn_backoff = _conn_backoff
+                        self.ui.write_log(
+                            f"NET: Connection failed — retrying in {_conn_backoff}s. "
+                            "(a VPN may be required)"
+                        )
+                    else:
+                        print(f"[JARVIS] Error ({type(e).__name__}): {e}")
+                        traceback.print_exc()
+                        self._conn_backoff = 3
             finally:
                 self.session = None
                 # Only save if there was a real conversation (≥3 turns). The task

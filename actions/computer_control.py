@@ -1,5 +1,4 @@
 #computer_control.py
-import io
 import json
 import platform
 import re
@@ -21,13 +20,15 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
+    pyautogui = None
     _PYAUTOGUI = False
 
 try:
     import pyperclip
     _PYPERCLIP = True
 except ImportError:
+    pyperclip = None
     _PYPERCLIP = False
 
 # Windows UI Automation (UIA) support for robust, DPI-independent, and
@@ -89,8 +90,8 @@ def _safe_screenshot_path(requested: str | None) -> Path:
     return fallback
 
 def _require_pyautogui():
-    if not _PYAUTOGUI:
-        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+    if pyautogui is None:
+        raise RuntimeError("PyAutoGUI is not available (not installed, or no display on a headless machine). Run: pip install pyautogui")
 
 _FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",
@@ -271,6 +272,13 @@ def _clear_field() -> str:
 def _focus_window(title: str) -> str:
     os_name = _get_os()
 
+    # The title is interpolated into PowerShell/AppleScript source below: a
+    # quote in it would break out of the string and execute. Reject instead
+    # of escaping — a window title with a quote can be matched by substring
+    # without it, or the user can rephrase.
+    if '"' in title:
+        return "focus_window: title contains an unsupported character"
+
     if os_name == "windows":
         try:
             script = f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")'
@@ -401,49 +409,18 @@ def _uia_type(name: str, text: str, clear_first: bool = True) -> Optional[str]:
     return None
 
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
-    if not api_key:
+    # Delegates to the shared vision layer (actions/screen_vision.py): one
+    # capture path, normalized 0-1000 coordinates mapped to real pixels
+    # locally, JSON parsing instead of regexing "x,y" out of prose.
+    if not _get_api_key():
         print("[ComputerControl] ⚠️ No API key for screen_find")
         return None
-
     try:
-        from google import genai
-        from google.genai import types as gtypes
-
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
-
-        prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
-            f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
-        )
-
-        from core import gemini
-        response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt],
-            tier=gemini.FAST, timeout_ms=20_000,
-        )
-        if response is None:
-            return None
-
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
-
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-
+        from actions.screen_vision import find_element
+        return find_element(description)
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
-
-    return None
+        return None
 
 def computer_control(
     parameters: dict,

@@ -71,7 +71,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 📄 Document Q&A | Ask questions of a PDF, Word, Excel or PowerPoint file — read-only, page-ranged, and idle-scheduled so it never interrupts you |
 | 📝 Summarize Anything | Summarise the clipboard, a URL, a text file or dictated text into spoken bullet points — with an SSRF guard on URLs |
 | 💻 Code Agent | Full autonomous software engineering agent: file editing, testing, project scaffolding & fix loops |
-| 🌐 Autonomous Browser Agent | Multi-step web automation with Jev Ultrafast CDP engine + Playwright fallback |
+| 🌐 Browser Control | Deterministic browser automation with Playwright (navigation, forms, screenshots) |
 | 📨 Send Message | Compose and send messages through WhatsApp, Telegram, and more |
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
 | 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
@@ -311,20 +311,25 @@ A failed or skipped browser download is never fatal — MARK LIV starts and work
 Five files in `actions/`, no new dependencies, nothing else touched. Each one is a single `TOOL` dict plus a handler, discovered at launch like every other skill.
 
 * **⏱️ `timer`** — *"Set a timer for 10 minutes."* The countdown runs in a daemon thread, so the conversation never blocks on it, and it announces itself through the same thread-safe `speak()` the rest of the app uses. Durations are matched against a whitelist (`10m`, `1h30m`, `90s`, `10:30`, `1.5h`, `45 seconds`) and never evaluated — there is no `eval()` anywhere in the file. Timers can be listed and cancelled, and a cancelled timer leaves the registry immediately.
-* **🔔 `notify`** — puts any message into the OS notification centre. The ladder is `win10toast` → **the Windows shell's own notification** → `notify-send` on Linux → `msg *` → activity log, and if nothing answers it *says so* rather than pretending the toast appeared. That second tier exists for Windows 11, where `win10toast` frequently raises and `msg.exe` is missing from Home editions — without it a Windows 11 Home machine would only ever get a log line. It is pure standard library (`ctypes` around `Shell_NotifyIconW`), so no package, no PowerShell and no batch file: the text is written into the notification structure as *data*, which leaves no command line to inject into. Every subprocess notifier is called with an argument vector.
+* **🔔 `notify`** — puts any message into the OS notification centre. The ladder is `win10toast` → **the Windows shell's own notification** → `notify-send` on Linux → AppleScript `display notification` on macOS (quotes stripped, argv-invoked) → `msg *` → activity log, and if nothing answers it *says so* rather than pretending the toast appeared. That second tier exists for Windows 11, where `win10toast` frequently raises and `msg.exe` is missing from Home editions — without it a Windows 11 Home machine would only ever get a log line. It is pure standard library (`ctypes` around `Shell_NotifyIconW`), so no package, no PowerShell and no batch file: the text is written into the notification structure as *data*, which leaves no command line to inject into. Every subprocess notifier is called with an argument vector.
 * **📝 `summarize`** — summarises the clipboard, a URL, a text file or dictated text through `core.gemini` at the SMART tier, speaks the result and shows it in the content panel. URLs are restricted to `http`/`https` and resolved through `ipaddress`, so a page cannot point the assistant at `127.0.0.1`, a private range or link-local address. File paths go through the same home/tempdir guard `file_controller` uses. Office and PDF files are deliberately refused and handed to `document_qa`.
 * **📄 `document_qa`** — answers questions about PDF, DOCX, XLSX, PPTX and plain-text files. It is strictly read-only: it never writes, renames or executes anything, and the file is byte-identical afterwards. Page ranges (`"3"`, `"1-5"`, `"2,4,6-8"`) keep long documents inside the context budget, and it falls back to the currently open file the same way `main.py` does. This is the one action declared `NON_BLOCKING` / `WHEN_IDLE`, so extraction happens while the assistant is idle instead of interrupting a sentence.
 * **🔊 `audio_device`** — lists microphones and speakers and switches either one by name via `core.audio_devices`, with the change pushed onto `core.undo`. Matching is exact-or-unique: an ambiguous name is reported instead of guessed. It writes the choice to config and tells you honestly that the running audio session is rebuilt on the next start — it does not claim a live switch it cannot perform.
 
+Two more skills joined later, bringing the total to 20:
+
+* **📦 `app_inventory`** — answers "what do I have installed / where is X / is Y a game and how do I launch it" from the same shared index `open_app` resolves against, so the two can never disagree. Read-only: it never launches, downloads or installs anything.
+* **👁️ `screen_vision`** — on-demand screen understanding for the voice model: describe what's visible, read a named element's text, or locate an element by description (normalised 0–1000 coordinates, converted to real pixels). Captures are cooldown-gated, target names matching credential patterns are refused before any capture, and the prompt forbids transcribing secrets. `computer_control`'s `screen_find`/`screen_click` delegate to its shared `find_element` instead of carrying their own copy.
+
 **Security, Modernization & Architecture Highlights:**
 
-* **Autonomous Code & Browser Agents**: `code_agent` consolidates single-file editing/running/debugging with autonomous multi-file project scaffolding. `browser_agent` powers Jev Ultrafast multi-step browser tasks using direct Chrome DevTools Protocol (CDP).
+* **Autonomous Code Agent & Browser Control**: `code_agent` consolidates single-file editing/running/debugging with autonomous multi-file project scaffolding. `browser_control` is the remaining browser automation tool, using deterministic Playwright scripting.
 * **Modernized $0 Local Backends**:
   * `actions/computer_control.py`: Windows UI Automation (`uiautomation`) primary semantic control engine with seamless `pyautogui` fallback.
   * `actions/document_qa.py`: High-speed `PyMuPDF` (`pymupdf`) Tier 1 PDF extractor (11.4× faster) with `pdfplumber` and `PyPDF2` fallbacks.
   * `actions/summarize.py`: `trafilatura` clean article extractor stripping navigation and cookie boilerplate (50–70% token savings) with BeautifulSoup fallback and SSRF guard.
   * `actions/youtube_video.py`: Resilient `yt-dlp` metadata extraction and automatic caption fallback.
-  * `actions/open_app.py`: Persistent application shortcut caching (`~/.jarvis_app_cache.json`) for sub-10ms launching, with hardened shell-free execution.
+  * `core/app_finder.py` (+ `actions/open_app.py`): shared alias/discovery/launch engine — natural names, Start Menu index, persistent cache (`~/.jarvis_app_cache.json`) for sub-10ms lookups, trailing CLI args on Linux, hardened shell-free execution. Also serves `app_inventory` and `send_message`, so all three agree on what is installed.
 * `core/llm_client.py`: Standalone local-LLM path for Ollama or OpenAI-compatible local servers.
 
 ### 📦 How much does it actually download?
@@ -356,7 +361,7 @@ On disk it ends up larger than the download, because those wheels are compressed
 | **Python** | 3.11, 3.12 or 3.13 |
 | **Microphone** | Required for voice interaction (and for the "Hey Jarvis" wake word) |
 | **Speakers** | Required for voice replies |
-| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`); an optional TypeSafe API key for Jev Ultrafast browser automation is managed from ⚙ → API KEYS with a per-provider connection check |
+| **API Key** | Free Gemini API key (entered on first launch → `config/api_keys.json`) |
 | **GPU** | **Not required.** The avatar is rendered in software |
 | **Disk space** | ~0.8 GB for the packages; ~1.4 GB if you add Chromium (see above) |
 | **Wake word** *(optional)* | One-click download from ⚙ → WAKE WORD (`openwakeword`, a few MB, fully local, runs in its own process) |
@@ -378,10 +383,10 @@ Mark LIV/
 │   ├── document_review.py    # Contracts and policies in plain language, ordered by what matters
 │   ├── _template.py          # Copy this to write a new plugin — one file, drop in, done
 │   └── _*.py                 # Optional shared helpers; skipped by the plugin loader by design
-├── actions/                  # Bundled skills — 19 active tools, each self-describing via a TOOL dict + handler
+├── actions/                  # Bundled skills — 20 active tools, each self-describing via a TOOL dict + handler
+│   ├── app_inventory.py      # Answers "what is installed / where is X" from the shared app index
 │   ├── audio_device.py       # List and switch microphone / speakers by name
-│   ├── browser_agent.py      # Jev Ultrafast autonomous browser task agent (CDP harness)
-│   ├── browser_control.py    # Playwright deterministic browser control (navigation, forms)
+│   ├── browser_control.py    # Playwright deterministic browser control (navigation, forms) — the remaining browser automation tool
 │   ├── code_agent.py         # Autonomous software engineering agent (single-file + project fix/scaffold)
 │   ├── computer_control.py   # Keyboard/mouse control: Windows UI Automation semantic primary + PyAutoGUI fallback
 │   ├── computer_settings.py  # Volume, brightness, WiFi, power, process control (per-OS)
@@ -393,6 +398,7 @@ Mark LIV/
 │   ├── notify.py             # OS notification centre with fallback chain
 │   ├── open_app.py           # App launcher with Start Menu index & persistent cache (~/.jarvis_app_cache.json)
 │   ├── reminder.py           # OS-native scheduled notifications (Task Scheduler / LaunchAgent / systemd)
+│   ├── screen_vision.py      # On-demand screen understanding: describe / read / find-by-description + redaction
 │   ├── send_message.py       # Messaging integration (WhatsApp, Telegram)
 │   ├── summarize.py          # Trafilatura clean article extraction + BeautifulSoup fallback with SSRF guard
 │   ├── timer.py              # Voice countdowns — daemon thread, announces itself
@@ -417,6 +423,11 @@ Mark LIV/
 │   ├── undo.py               # One shared undo stack — actions register how to reverse themselves
 │   ├── confirm.py            # Irreversible-action gate — the token is issued by the UI, not the model
 │   ├── audio_devices.py      # Microphone / speaker list — filtered, measured, resolved by name
+│   ├── app_finder.py         # Shared app/Game/URL resolver + launcher (open_app, app_inventory, send_message)
+│   ├── gemini.py             # Model ladder, timeouts, quota backoff — every Gemini call goes through here
+│   ├── llm_client.py         # Standalone local-LLM path (Ollama / OpenAI-compatible servers)
+│   ├── stt.py / tts.py       # Speech-to-text and text-to-speech engines
+│   ├── installer.py          # Runtime dependency provisioning helpers
 │   ├── plugin_loader.py      # Plugin engine — discovery, validation, crash isolation
 │   ├── action_loader.py      # Bundled-action engine — the built-in twin of plugin_loader
 │   ├── session_summary.py    # Holds the conversation until its summary is really on disk
@@ -466,7 +477,7 @@ Everything stays on your machine. There is no MARK server, no telemetry and no a
 | Dashboard TLS certificate + private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
 | What the assistant remembers about you | `memory/long_term.json` | Delete the file to make it forget everything. |
 
-The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement; an optional TypeSafe key (for the Jev Ultrafast autonomous browser agent) can be tested against its provider endpoint before saving. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
+The native **⚙ → API KEYS** panel manages the core provider credentials without showing stored values. Gemini Live remains the default and first-launch requirement. Telegram and other plugin-owned credentials remain in **⚙ → PLUGIN SETTINGS**. The panel stores keys in `config/api_keys.json`, which is local plaintext and must be treated like a password file.
 
 The phone dashboard is **not reachable from your network until you say so**: it binds `127.0.0.1` and asks the OS for no firewall rule at all. The switch lives in the Remote Access panel (*ALLOW PHONE ACCESS*), it moves the socket while the app runs, and your choice is remembered in `config/api_keys.json`.
 

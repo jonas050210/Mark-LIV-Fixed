@@ -25,16 +25,34 @@ def _normalize_url(url: str) -> str:
     """
     Bare words like "instagram" → "https://instagram.com"
     Domains like "instagram.com" → "https://instagram.com"
-    Full URLs pass through unchanged.
+    Full http(s) URLs pass through unchanged.
+
+    Anything else with a scheme is REJECTED (ValueError): file:// would let a
+    get_text read local files into model context, and javascript:/data: URLs
+    execute in the page. Local files are file_controller's job, not the
+    browser's. Every navigation path (native + playwright) funnels through here.
     """
     url = url.strip()
     if not url:
         return "about:blank"
+    # Dangerous schemes without "//" ("javascript:alert(1)") would otherwise
+    # slip past the check below disguised as a search term. Host:port pairs
+    # ("localhost:8000") are unaffected — only known schemes match.
+    _prefix = url.split(":", 1)[0].lower() if ":" in url else ""
+    if _prefix in ("javascript", "data", "file", "vbscript", "blob", "jar"):
+        raise ValueError(f"Blocked URL scheme '{_prefix}': only http(s) addresses can be opened.")
     if "://" in url:
-        return url
-    # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
+        scheme = url.split("://", 1)[0].lower()
+        if scheme in ("http", "https"):
+            return url
+        raise ValueError(f"Blocked URL scheme '{scheme}': only http(s) addresses can be opened.")
+    # No dot at all → assume .com  (e.g. "instagram" → "instagram.com"),
+    # unless it looks like a host:port pair ("localhost:8000").
     if "." not in url:
-        url = url + ".com"
+        _host = url.split("/", 1)[0]
+        _port = _host.rsplit(":", 1)[-1] if ":" in _host else ""
+        if not _port.isdigit():
+            url = url + ".com"
     return "https://" + url
 
 
@@ -376,7 +394,10 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
     session restore) — exactly as if the user had opened it themselves.
     Works on all three of Windows / macOS / Linux.
     """
-    url = _normalize_url(url) if url and url.strip() else ""
+    try:
+        url = _normalize_url(url) if url and url.strip() else ""
+    except ValueError as e:
+        return str(e)
     if url == "about:blank":
         url = ""
 
@@ -634,7 +655,10 @@ class _BrowserSession:
 
     async def go_to(self, url: str) -> str:
 
-        url      = _normalize_url(url)
+        try:
+            url = _normalize_url(url)
+        except ValueError as e:
+            return str(e)
         page     = await self._get_page()
         prev_url = page.url
 
@@ -931,11 +955,11 @@ def browser_control(
 ) -> str:
     params  = parameters or {}
     action  = str(params.get("action") or "").lower().strip()
-    browser = params.get("browser", "").lower().strip() or None
+    browser = str(params.get("browser") or "").lower().strip() or None
     result  = "Unknown action."
 
     if action == "switch":
-        target = browser or params.get("target", "").lower().strip()
+        target = browser or str(params.get("target") or "").lower().strip()
         result = _registry.switch(target) if target else "Please specify a browser."
         _log(player, result)
         return result
@@ -967,12 +991,12 @@ def browser_control(
             sess = _registry.get(browser)
             try:
                 if action == "search":
-                    result = sess.run(sess.search(params.get("query", ""),
-                                                  params.get("engine", "google")))
+                    result = sess.run(sess.search(str(params.get("query") or ""),
+                                                  str(params.get("engine") or "google")))
                 elif action == "new_tab":
-                    result = sess.run(sess.new_tab(params.get("url", "")))
+                    result = sess.run(sess.new_tab(str(params.get("url") or "")))
                 else:
-                    result = sess.run(sess.go_to(params.get("url", "")))
+                    result = sess.run(sess.go_to(str(params.get("url") or "")))
             except concurrent.futures.TimeoutError:
                 result = f"Browser action '{action}' timed out (60s)."
             except Exception as e:
@@ -981,11 +1005,11 @@ def browser_control(
             return result
 
         if action == "search":
-            base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
+            base    = _SEARCH_ENGINES.get(str(params.get("engine") or "google").lower(),
                                           _SEARCH_ENGINES["google"])
-            nav_url = base + params.get("query", "").replace(" ", "+")
+            nav_url = base + str(params.get("query") or "").replace(" ", "+")
         else:
-            nav_url = params.get("url", "").strip()
+            nav_url = str(params.get("url") or "").strip()
 
         result = _open_native(nav_url, browser)
         if result.startswith("Opened") and nav_url:
