@@ -318,7 +318,7 @@ def _install_requirements(missing, req_path):
 
 def _verify_requirements(req_path):
     """Verify every applicable distribution/version and report each failure."""
-    print("\n  Verifying installation...")
+    print("\n  Verifying installation...", flush=True)
     if not req_path.is_file():
         print(f"  Requirements file not found: {req_path}")
         return False

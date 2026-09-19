@@ -758,6 +758,9 @@ def save_auto_task_delay_ms(value) -> bool:
 def get_gui_settings() -> dict:
     return {
         "ui_mode":           get_ui_mode(),
+        "mini_mode": bool(load_api_keys().get("mini_mode", False)),
+        "standard_german_voice": bool(load_api_keys().get("standard_german_voice", True)),
+        "gaming_mode": bool(load_api_keys().get("gaming_mode", False)),
         "ui_scale":          get_ui_scale(),
         "font_scale":        get_font_scale(),
         "panel_width":       get_panel_width(),
@@ -785,6 +788,8 @@ def save_gui_settings(values: dict) -> bool:
         data, intact = _read_config_state()
         if not intact:
             return _refuse_corrupt_write()
+        for key in ("mini_mode", "gaming_mode", "standard_german_voice"):
+            data[key] = bool(values.get(key, data.get(key, key == "standard_german_voice")))
         data["ui_mode"]           = str(values.get("ui_mode", get_ui_mode())).strip().lower()
         if data["ui_mode"] not in UI_MODES:
             data["ui_mode"] = "normal"
@@ -816,3 +821,14 @@ def save_gui_settings(values: dict) -> bool:
                                             int(values.get("auto_task_delay_ms", get_auto_task_delay_ms()))))
         _write_config_unlocked(data)
         return True
+
+
+def get_mini_geometry():
+    from core.hud_layout import valid_placement
+    return valid_placement(load_api_keys().get("mini_geometry"))
+
+
+def save_mini_geometry(value):
+    from core.hud_layout import valid_placement
+    placement = valid_placement(value)
+    return _patch_config(mini_geometry=placement) if placement else False

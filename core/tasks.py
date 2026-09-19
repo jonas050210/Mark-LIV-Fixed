@@ -28,6 +28,7 @@ through the same lock. Long-running loops that support cancellation poll
 
 from __future__ import annotations
 
+import copy
 import itertools
 import threading
 import time
@@ -44,9 +45,12 @@ KIND_UPDATE = "update"
 KIND_UNINSTALL = "uninstall"
 KIND_TASK = "task"
 
-#: States a task can be in. ``running`` covers queued work whose owner has not
-#: started it yet — the difference has no consequence in the UI.
+#: Queued/paused work remains active. Only owners acknowledge pause and completion.
 RUNNING = "running"
+QUEUED = "queued"
+PAUSED = "paused"
+ACTIVE_STATES = (RUNNING, QUEUED, PAUSED)
+TERMINAL_STATES = ("done", "failed", "cancelled")
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
@@ -59,6 +63,7 @@ MAX_TASKS = 32
 
 _LABELS = {
     "download": "↓",
+    "upload": "↑",
     "install": "⊕",
     "update": "↻",
     "uninstall": "⊖",
@@ -134,6 +139,8 @@ class Task:
     #: the owner. Such a value is recomputed on the next byte update; a value the
     #: owner set itself always wins.
     _derived_progress: bool = False
+    pausable: bool = False
+    pause_requested: bool = False
 
     # ── owner API ────────────────────────────────────────────────────────────
 
@@ -146,6 +153,8 @@ class Task:
         owner only reports the numbers it actually has.
         """
         with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return self
             for key, value in fields.items():
                 if key in ("id", "kind", "state") or key.startswith("_"):
                     continue
@@ -173,6 +182,8 @@ class Task:
     def request_cancel(self) -> None:
         """Ask the owner to stop. The owner's loop polls :attr:`cancel_requested`."""
         with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return
             self.cancel_requested = True
             self.updated_at = time.time()
             _touch()
@@ -183,9 +194,76 @@ class Task:
             except Exception:
                 pass
 
+    def patch_meta(self, **fields) -> None:
+        """Merge owner metadata atomically, preserving concurrent attachment updates."""
+        with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return
+            self.meta = {**self.meta, **copy.deepcopy(fields)}
+            self.updated_at = time.time()
+            _touch()
+
+    def append_meta(self, key, value, limit=32) -> None:
+        with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return
+            entries = list(self.meta.get(key, []))
+            entries.append(copy.deepcopy(value))
+            self.meta = {**self.meta, key: entries[-max(1, limit):]}
+            self.updated_at = time.time()
+            _touch()
+
+    def discard_meta_item(self, key, ident) -> None:
+        """Remove revoked attachment context without overwriting concurrent updates."""
+        with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return
+            entries = self.meta.get(key, [])
+            self.meta = {**self.meta, key: [entry for entry in entries
+                         if not isinstance(entry, dict) or entry.get("id") != ident]}
+            self.updated_at = time.time()
+            _touch()
+
+    def request_pause(self) -> bool:
+        """Cooperative: PAUSED is published only when the owner reaches a checkpoint."""
+        with _LOCK:
+            if not self.pausable or self.state not in ACTIVE_STATES:
+                return False
+            self.pause_requested = True
+            _touch()
+            return True
+
+    def resume(self) -> bool:
+        with _LOCK:
+            if self.state not in ACTIVE_STATES:
+                return False
+            self.pause_requested = False
+            if self.state == PAUSED:
+                self.state = RUNNING
+            _touch()
+            return True
+
+    def checkpoint(self) -> bool:
+        """Owner-thread only. Wait without holding the registry lock; cancel wakes promptly."""
+        while True:
+            with _LOCK:
+                if self.cancel_requested or self.state in TERMINAL_STATES:
+                    return False
+                if not self.pause_requested:
+                    if self.state in (QUEUED, PAUSED):
+                        self.state = RUNNING
+                        _touch()
+                    return True
+                if self.state != PAUSED:
+                    self.state = PAUSED
+                    _touch()
+            time.sleep(0.05)
+
     def _close(self, state: str, detail: str = "", error: str = "",
                **fields: Any) -> "Task":
         with _LOCK:
+            if self.state in TERMINAL_STATES:
+                return self
             for key, value in fields.items():
                 if hasattr(self, key) and not key.startswith("_"):
                     setattr(self, key, value)
@@ -199,6 +277,9 @@ class Task:
                 # the owner reported was a little behind.
                 self.progress = 1.0
                 self._derived_progress = False
+            self.speed_bps = None
+            self.eta_seconds = None
+            self.pause_requested = False
             self.finished_at = time.time()
             self.updated_at = self.finished_at
             self._derive()
@@ -231,9 +312,17 @@ class Task:
 
     def snapshot(self) -> dict:
         """Plain-dict view for the UI/reporting layer (never the live object)."""
+        with _LOCK:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
         age = (self.finished_at or time.time()) - self.started_at
         return {
             "id": self.id,
+            "started_at": self.started_at,
+            "updated_at": self.updated_at,
+            "finished_at": self.finished_at,
+            "meta": copy.deepcopy(self.meta),
             "kind": self.kind,
             "label": _LABELS.get(self.kind, _LABELS["task"]),
             "title": self.title,
@@ -254,7 +343,9 @@ class Task:
             "elapsed_seconds": max(0.0, age),
             "elapsed_human": format_duration(age),
             "cancel_requested": self.cancel_requested,
-            "finished": self.state != RUNNING,
+            "pausable": self.pausable,
+            "pause_requested": self.pause_requested,
+            "finished": self.state in TERMINAL_STATES,
         }
 
     # ── convenience ──────────────────────────────────────────────────────────
@@ -298,18 +389,16 @@ def _prune() -> None:
         if task is None:
             _ORDER.remove(tid)
             continue
-        if (task.state != RUNNING and task.finished_at is not None
+        if (task.state not in ACTIVE_STATES and task.finished_at is not None
                 and now - task.finished_at > FINISHED_TTL):
             _TASKS.pop(tid, None)
             _ORDER.remove(tid)
-    while len(_ORDER) > MAX_TASKS:
-        oldest = _ORDER[0]
-        if _TASKS.get(oldest) and _TASKS[oldest].state == RUNNING:
-            # Never evict running work: the cap is a memory guard, and
-            # forgetting a live task is worse than a slightly longer list.
-            break
+    # A long-lived first task must not pin every finished task behind it.
+    finished = [tid for tid in _ORDER if _TASKS[tid].state in TERMINAL_STATES]
+    while len(_ORDER) > MAX_TASKS and finished:
+        oldest = finished.pop(0)
         _TASKS.pop(oldest, None)
-        _ORDER.pop(0)
+        _ORDER.remove(oldest)
 
 
 def start(kind: str, title: str, *, detail: str = "",
@@ -317,6 +406,7 @@ def start(kind: str, title: str, *, detail: str = "",
           done_bytes: Optional[int] = None,
           progress: Optional[float] = None,
           on_cancel: Optional[Callable[[], None]] = None,
+          pausable: bool = False, queued: bool = False,
           **meta: Any) -> Task:
     """Register a new running task and return it."""
     with _LOCK:
@@ -328,7 +418,9 @@ def start(kind: str, title: str, *, detail: str = "",
             total_bytes=total_bytes,
             done_bytes=done_bytes,
             progress=progress,
-            meta=dict(meta),
+            meta=copy.deepcopy(meta),
+            pausable=pausable,
+            state=QUEUED if queued else RUNNING,
         )
         task._on_cancel = on_cancel
         task._derive()
@@ -394,13 +486,14 @@ def snapshot(include_finished_for: float = FINISHED_TTL,
             task = _TASKS.get(tid)
             if task is None:
                 continue
-            if (task.state != RUNNING and task.finished_at is not None
+            if (task.state not in ACTIVE_STATES and task.finished_at is not None
                     and now - task.finished_at > include_finished_for):
                 continue
             rows.append((task.started_at, task.snapshot()))
-    running = [r for r in rows if r[1]["state"] == RUNNING]
-    finished = [r for r in rows if r[1]["state"] != RUNNING]
-    ordered = running + finished[-max(0, limit - len(running)):]
+    running = [r for r in rows if r[1]["state"] in ACTIVE_STATES]
+    finished = [r for r in rows if r[1]["state"] not in ACTIVE_STATES]
+    remaining = max(0, limit - len(running))
+    ordered = running + (finished[-remaining:] if remaining else [])
     return [row for _ts, row in ordered[:max(1, limit)]]
 
 
@@ -415,14 +508,14 @@ def active() -> list[Task]:
     with _LOCK:
         _prune()
         return [_TASKS[t] for t in _ORDER
-                if _TASKS.get(t) is not None and _TASKS[t].state == RUNNING]
+                if _TASKS.get(t) is not None and _TASKS[t].state in ACTIVE_STATES]
 
 
 def clear_finished() -> None:
     with _LOCK:
         for tid in list(_ORDER):
             task = _TASKS.get(tid)
-            if task is not None and task.state != RUNNING:
+            if task is not None and task.state not in ACTIVE_STATES:
                 _TASKS.pop(tid, None)
                 _ORDER.remove(tid)
         _touch()
@@ -453,7 +546,7 @@ def reset() -> None:
 
 
 __all__ = [
-    "Task", "RUNNING", "DONE", "FAILED", "CANCELLED",
+    "Task", "RUNNING", "QUEUED", "PAUSED", "ACTIVE_STATES", "TERMINAL_STATES", "DONE", "FAILED", "CANCELLED",
     "KIND_DOWNLOAD", "KIND_TIMER", "KIND_AGENT", "KIND_INSTALL", "KIND_UPDATE",
     "KIND_UNINSTALL", "KIND_TASK",
     "format_bytes", "format_speed", "format_duration",

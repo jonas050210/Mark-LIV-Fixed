@@ -206,7 +206,7 @@ _KOKORO_LANG_CODES = {
     "i": "i",   # Italian           (if_*, im_*)
     "p": "p",   # Brazilian Portuguese
     "r": "r",   # Russian           (rf_*, rm_*)
-    "e": "e",   # German            (ef_*, em_*)
+    # Kokoro does not provide a German acoustic voice; do not invent ef/em voices.
 }
 
 
@@ -401,11 +401,16 @@ class TTSPlayer:
 
 def create_tts_player(config: dict) -> TTSPlayer:
     engine_name = config.get("tts_engine", "edgetts").lower()
+    language = str(config.get("tts_language", "de-DE"))
+    if language.startswith("de") and engine_name == "kokoro":
+        raise ValueError("Kokoro has no Standard German voice. Use Edge de-DE or the offline Windows German voice.")
     if engine_name == "kokoro":
         voice  = config.get("tts_voice", "af_heart")
         speed  = float(config.get("tts_speed", 1.0))
         engine = KokoroTTSEngine(voice=voice, speed=speed)
     else:   # edgetts (default)
-        voice  = config.get("tts_voice", "en-US-GuyNeural")
+        voice  = config.get("tts_voice", "de-DE-ConradNeural")
+        if language.startswith("de") and not voice.startswith("de-DE-"):
+            voice = "de-DE-ConradNeural"
         engine = EdgeTTSEngine(voice=voice)
     return TTSPlayer(engine)

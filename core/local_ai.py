@@ -162,6 +162,7 @@ def plan_steps(
         goal[:800],
         system=(
             "You decompose a voice-assistant goal into tool calls. "
+            "Include depends_on as a list of zero-based earlier step indexes when a step requires their success. "
             f"Valid tools: {tools}. Reply with ONLY a JSON array like "
             '[{"tool": "open_app", "params": {"app_name": "Spotify"}}]. '
             "At most 6 steps. No prose, no markdown, no code fences."
@@ -182,16 +183,5 @@ def plan_steps(
         return None
     if not isinstance(steps, list) or not steps:
         return None
-    known = {t.lower(): t for t in tool_names}
-    grounded: list[dict] = []
-    for step in steps[:6]:
-        if not isinstance(step, dict):
-            return None
-        tool = str(step.get("tool", "")).strip().lower()
-        if tool not in known:
-            return None
-        params = step.get("params", {})
-        if not isinstance(params, dict):
-            return None
-        grounded.append({"tool": known[tool], "params": params})
-    return grounded or None
+    from core.plan_validation import ground_steps
+    return ground_steps(steps, tool_names) or None

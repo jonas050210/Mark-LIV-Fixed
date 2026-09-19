@@ -168,16 +168,21 @@ def browsers_installed(names: list[str]) -> bool:
     wanted = [str(n).strip().lower() for n in names if str(n).strip()]
     if not wanted:
         return True
-    for cache in _browser_cache_dirs():
-        try:
-            if not cache.is_dir():
-                continue
-            entries = [d.name.lower() for d in cache.iterdir() if d.is_dir()]
-        except OSError:
-            continue
-        if all(any(w in name for name in entries) for w in wanted):
-            return True
-    return False
+    try:
+        # Ask this installed Playwright version for its exact binaries. A folder
+        # named "chromium-..." can be a stale or interrupted download.
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as runtime:
+            for name in wanted:
+                if name not in ("chromium", "firefox", "webkit"):
+                    return False
+                binary = Path(getattr(runtime, name).executable_path)
+                if not binary.is_file() or binary.stat().st_size == 0:
+                    return False
+        return True
+    except Exception:
+        return False
+
 
 
 # ── download measurement ──────────────────────────────────────────────────
@@ -187,8 +192,8 @@ def estimate_bytes(size_text: str) -> "int | None":
     """Parse a human size label (``~225 MB``) into bytes, or None.
 
     The label is what setup.py shows the user, so it is the only estimate of a
-    download's size this program has. Used for a percentage and an ETA — never
-    for the completion check, which reads the browser directory.
+    download's size this program has. Use it for descriptive metadata only,
+    not a percentage, ETA or completion check.
     """
     match = re.search(r"([\d.]+)\s*(TB|GB|MB|KB)", str(size_text or ""), re.I)
     if not match:
@@ -225,9 +230,8 @@ class DownloadMeter:
 
     Playwright's installer prints nothing useful and writes into its browser
     cache, so the numbers the HUD shows are measured from the filesystem:
-    bytes written, speed from the growth between samples, and — only when an
-    expected size is known — a percentage and an ETA. The expected size is an
-    estimate and the task says so; the byte count is not.
+    bytes written and speed from cache growth. Only a measured total can
+    support percentage/ETA; download-size estimates stay in descriptive metadata.
     """
 
     def __init__(self, task, *, dirs: "list[Path] | None" = None,
@@ -396,7 +400,7 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
                     detail=("downloading from Playwright's CDN"
                             + (f" — about {_BROWSER_SIZES[choice]} expected"
                                if estimate else "")),
-                    total_bytes=estimate,
+                    expected_bytes=estimate,  # metadata only; not a measured transfer total
                     done_bytes=0,
                 )
                 meter = DownloadMeter(dl_task)
@@ -414,9 +418,8 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
                 # Verify the download against the browser cache: the exit code
                 # alone cannot tell a finished download from a half-written one.
                 on_disk, why = browser_cache_state(args)
-                if result.returncode == 0 and on_disk is not False:
-                    note = ("verified on disk" if on_disk
-                            else f"could not verify on disk — {why}")
+                if result.returncode == 0 and on_disk is True:
+                    note = "verified on disk"
                     wrote = tasks.format_bytes(meter.bytes_written)
                     if log:
                         log(f"SYS: Playwright browser ready ({note}"
@@ -426,7 +429,7 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
                                + (f" — {wrote} written" if wrote else ""))
                 else:
                     reason = ("browser binaries not found in the Playwright cache"
-                              if on_disk is False else f"exit code {result.returncode}")
+                              if on_disk is False else (f"unverified: {why}" if on_disk is None else f"exit code {result.returncode}"))
                     if log:
                         log("ERR: Playwright browser download failed — browser "
                             "automation is unavailable. Retry later with:")

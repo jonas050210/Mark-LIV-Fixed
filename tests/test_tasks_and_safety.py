@@ -12,6 +12,7 @@ No Qt, no network, no real downloads. Runnable with pytest or directly
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -335,7 +336,7 @@ def test_download_meter_reports_measured_bytes_and_speed():
     assert tasks.snapshot()[0]["percent"] is None
 
 
-# ── plugins: lazily loaded, telegram parked ──────────────────────────────────
+# ── plugins: lazily loaded, generic parking contract ──────────────────────────────────
 
 
 def test_plain_plugins_are_not_imported_at_discovery():
@@ -441,25 +442,35 @@ def test_plugin_names_cannot_shadow_a_core_tool_or_each_other():
     assert "already used by plugin" in records["b_twin.py"]["error"]
 
 
+@patch.dict(plugin_loader.PARKED_PLUGINS, {"fixture_parked": "temporarily disabled"})
 def test_parked_plugin_is_discovered_but_not_offered_or_run():
-    registry = plugin_loader.discover_plugins(
-        REPO / "plugins", set(), logger=lambda _m: None)
-    assert registry.has("telegram_remote"), "parking must not delete anything"
-    assert "telegram_remote" in [r["name"] for r in registry.list_for_ui()]
-    assert "telegram_remote" in {d["name"] for d in registry.get_tool_declarations()}
-    assert "telegram_remote" not in registry.names()
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_plugin(tmp, "fixture_parked.py", _PLUGIN_HEAD % "fixture_parked" +
+                      "def run(parameters=None, **kw):\n    return 'x'\n")
+        registry = plugin_loader.discover_plugins(tmp, set(), logger=lambda _m: None)
+    registry._plugins["fixture_parked"].enabled = True
+    assert registry.has("fixture_parked"), "parking must not delete anything"
+    assert "fixture_parked" in [r["name"] for r in registry.list_for_ui()]
+    assert "fixture_parked" in {d["name"] for d in registry.get_tool_declarations()}
+    assert "fixture_parked" not in registry.names()
     filtered = plugin_loader.filter_parked(registry.get_tool_declarations())
-    assert "telegram_remote" not in {d["name"] for d in filtered}
-    out = registry.run("telegram_remote", {})
+    assert "fixture_parked" not in {d["name"] for d in filtered}
+    out = registry.run("fixture_parked", {})
     assert "disabled" in out and "Nothing was run" in out
 
 
+@patch.dict(plugin_loader.PARKED_PLUGINS, {"fixture_parked": "temporarily disabled"})
 def test_parked_launch_hook_is_not_started():
     """The parked plugin's on_launch must not run — that is what starts bridges."""
     started: list[str] = []
-    registry = plugin_loader.discover_plugins(
-        REPO / "plugins", set(), logger=lambda _m: None)
-    rec = registry._plugins["telegram_remote"]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_plugin(tmp, "fixture_parked.py", _PLUGIN_HEAD % "fixture_parked" +
+                      "def run(parameters=None, **kw):\n    return 'x'\n")
+        registry = plugin_loader.discover_plugins(tmp, set(), logger=lambda _m: None)
+    registry._plugins["fixture_parked"].enabled = True
+    rec = registry._plugins["fixture_parked"]
     with patch.object(rec, "on_launch", lambda *a, **k: started.append("called")):
         registry.launch_enabled(player=None)
     assert started == [], "a parked plugin must not start anything"
@@ -479,8 +490,9 @@ def test_clipboard_detection_is_gone_from_the_hud():
 
 def test_ui_mounts_the_task_panel():
     source = (REPO / "ui.py").read_text(encoding="utf-8", errors="replace")
-    assert "class TaskPanel" in source and "class TaskRow" in source
-    assert "self._task_panel = TaskPanel()" in source
+    task_source = (REPO / "core/task_ui.py").read_text(encoding="utf-8")
+    assert "class TaskPanel" in task_source and "class TaskRow" in task_source
+    assert "self._task_panel = TaskPanel(C, scaled_font)" in source
     assert "core import tasks as _task_registry" in source
 
 

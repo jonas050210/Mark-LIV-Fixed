@@ -1411,8 +1411,10 @@ def diagnose_launch_error(exc: BaseException, tgt=None) -> str:
         return ""
 
 
-def launch(tgt: LaunchTarget) -> tuple[bool, str]:
-    """Start the target and return immediately. (ok, human message)."""
+def launch(tgt: LaunchTarget, *, background: bool = False) -> tuple[bool, str]:
+    """Start the target; optional documented no-activation startup hint."""
+    if background and tgt.kind not in ("exe", "roblox"):
+        return False, "Gaming Mode: this launcher cannot guarantee a background start. Focus JARVIS first or disable Gaming Mode to open it."
     try:
         if tgt.kind == "url":
             if not _valid_http_url(tgt.target):
@@ -1452,6 +1454,11 @@ def launch(tgt: LaunchTarget) -> tuple[bool, str]:
             flags: dict = {}
             if _IS_WIN:
                 flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if background:
+                    startup = subprocess.STARTUPINFO()
+                    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE; no focus restoration hacks
+                    flags["startupinfo"] = startup
                 # Roblox resolves its own DLLs and update files relative to the
                 # build directory, so it must be started WITH that directory as
                 # the working directory. Handing it the assistant's cwd is one

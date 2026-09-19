@@ -45,8 +45,9 @@ def window_control(parameters=None, response=None, player=None,
         return "Window control is unavailable (app_controller failed to load)."
 
     try:
+        geometry = {key: params[key] for key in ("monitor", "width", "height", "topmost") if key in params}
         ok, message = _ac.window_action(action, name=app_name, title=title,
-                                        limit=limit)
+                                        limit=limit, **geometry)
     except Exception as e:
         return f"Window control failed ({type(e).__name__}: {e})."
     return message
@@ -68,7 +69,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | focus | minimize | maximize | restore (default: focus)"
+                "description": "list | focus | minimize | maximize | restore | snap_left | snap_right | move_monitor | resize | always_on_top"
             },
             "app_name": {
                 "type": "STRING",
@@ -78,6 +79,10 @@ TOOL = {
                 "type": "STRING",
                 "description": "Exact/partial window title, when it is not just the app name"
             },
+            "monitor": {"type": "INTEGER", "description": "Target monitor, starting at 1"},
+            "width": {"type": "INTEGER", "description": "Requested width for resize"},
+            "height": {"type": "INTEGER", "description": "Requested height for resize"},
+            "topmost": {"type": "BOOLEAN", "description": "Enable always-on-top; false removes it"},
             "limit": {
                 "type": "INTEGER",
                 "description": "Maximum titles to list for action=list (default 40)"
