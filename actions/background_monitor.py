@@ -4,7 +4,6 @@ Checks DDG news once per day per topic; alerts JARVIS when a new headline appear
 No crypto, no finance, no uninvited tracking.
 """
 import hashlib
-import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -43,15 +42,14 @@ def _load() -> dict:
     return data if isinstance(data, dict) else {}
 
 def _save(monitors: dict) -> None:
-    from memory.memory_manager import load_memory, MEMORY_PATH, _lock
+    # Through the public API: atomic tmp+rename write with a backup, under
+    # the store lock — instead of reaching into the manager's privates and
+    # writing the file directly. Trim only drops {"value": ...} entries, so
+    # the monitors dict passes through untouched.
+    from memory.memory_manager import load_memory, save_memory
     memory = load_memory()
     memory["monitors"] = monitors
-    with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    save_memory(memory)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

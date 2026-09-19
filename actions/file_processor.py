@@ -21,12 +21,94 @@ import re
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from datetime import datetime
 
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
+
+_SAFE_ROOTS = (Path.home(), Path(tempfile.gettempdir()))
+
+
+def _safe_file(raw) -> Path | None:
+    """Resolve a model-supplied path, refusing anything outside the user's space.
+
+    file_processor reads, writes, extracts, and even executes: the same home
+    jail as file_controller/document_qa/summarize applies. Symlinks are
+    resolved *before* the boundary check.
+    """
+    text = str(raw or "").strip().strip('"').strip("'")
+    if not text:
+        return None
+    try:
+        resolved = Path(text).expanduser().resolve()
+    except Exception:
+        return None
+    for root in _SAFE_ROOTS:
+        try:
+            root_resolved = root.resolve()
+            if resolved == root_resolved or resolved.is_relative_to(root_resolved):
+                return resolved
+        except Exception:
+            continue
+    return None
+
+
+def _safe_unpack(path: Path, dest: Path) -> int:
+    """Unpack a zip/tar archive with zip-slip protection.
+
+    shutil.unpack_archive does not sanitize member names, so a hostile
+    archive could write outside `dest` ("../..") or drop absolute paths.
+    Only regular files are written, and every entry is resolved against
+    `dest` before a single byte lands on disk. Returns the file count.
+    """
+    import zipfile
+    import tarfile
+    dest_r = dest.resolve()
+
+    def _target(name: str) -> Path | None:
+        parts = Path(name).parts
+        if Path(name).is_absolute() or ".." in parts:
+            return None
+        candidate = (dest_r / name).resolve()
+        if candidate != dest_r and dest_r not in candidate.parents:
+            return None
+        return candidate
+
+    count = 0
+    ext = path.suffix.lower()
+    if ext == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                target = _target(info.filename)
+                if target is None:
+                    raise ValueError(f"Refusing unsafe archive entry: {info.filename}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as fh:
+                    shutil.copyfileobj(src, fh)
+                count += 1
+    elif ext in (".tar", ".gz", ".bz2", ".xz", ".tgz"):
+        with tarfile.open(path) as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue  # symlinks, hardlinks, devices: never extracted
+                target = _target(member.name)
+                if target is None:
+                    raise ValueError(f"Refusing unsafe archive entry: {member.name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                with src, open(target, "wb") as fh:
+                    shutil.copyfileobj(src, fh)
+                count += 1
+    else:
+        raise ValueError(f"Unsupported archive format: {ext}")
+    return count
 
 def _get_api_key() -> str:
     try:
@@ -85,7 +167,10 @@ def _file_size_str(path: Path) -> str:
 def _output_path(src: Path, suffix: str, new_ext: str = None) -> Path:
     ext  = new_ext or src.suffix
     name = f"{src.stem}_{suffix}{ext}"
-    return src.parent / name
+    # Containment guarantee: the extension may come from model input
+    # ("format": "../../x"), so only the final component is ever kept —
+    # outputs land next to the source, never up the tree.
+    return src.parent / Path(name).name
 
 def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
     try:
@@ -146,6 +231,8 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "convert":
         fmt = params.get("format", "png").lower().strip(".")
+        if not re.fullmatch(r"[a-z0-9]+", fmt):
+            return f"Unsupported format: '{params.get('format')}'."
         fmt_map = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG",
                    "webp": "WEBP", "bmp": "BMP", "tiff": "TIFF"}
         pil_fmt = fmt_map.get(fmt, fmt.upper())
@@ -373,6 +460,8 @@ def _process_data(path: Path, file_type: str, action: str,
             elif fmt == "json":
                 out = _output_path(path, "converted", ".json")
                 df.to_json(out, orient="records", force_ascii=False, indent=2)
+            else:
+                return f"Unsupported format: '{fmt}'. Use csv, xlsx or json."
             return f"Converted to {fmt.upper()}. Saved: {out.name}"
         except Exception as e:
             return f"Convert failed: {e}"
@@ -558,7 +647,9 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
             return f"Transcription failed: {e}"
 
     if action == "convert":
-        fmt = params.get("format", "mp3").lstrip(".")
+        fmt = str(params.get("format", "mp3")).lstrip(".")
+        if not re.fullmatch(r"[A-Za-z0-9]+", fmt):
+            return f"Unsupported format: '{params.get('format')}'."
         try:
             from pydub import AudioSegment
             audio = AudioSegment.from_file(path)
@@ -686,7 +777,11 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
     if action == "transcribe":
         if not _ffmpeg_available():
             return "ffmpeg not found. Needed for video transcription."
-        tmp_audio = Path(tempfile.mktemp(suffix=".mp3"))
+        # Created (not just named) up front: mktemp only reserves a name,
+        # leaving a symlink-race window before ffmpeg opens it.
+        _tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        _tmp.close()
+        tmp_audio = Path(_tmp.name)
         try:
             subprocess.run(
                 ["ffmpeg", "-i", str(path), "-q:a", "0", "-map", "a",
@@ -702,7 +797,9 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
                 tmp_audio.unlink()
 
     if action == "convert":
-        fmt = params.get("format", "mp4").lstrip(".")
+        fmt = str(params.get("format", "mp4")).lstrip(".")
+        if not re.fullmatch(r"[A-Za-z0-9]+", fmt):
+            return f"Unsupported format: '{params.get('format')}'."
         if not _ffmpeg_available():
             return "ffmpeg not found."
         out = _output_path(path, "converted", f".{fmt}")
@@ -739,11 +836,14 @@ def _process_archive(path: Path, action: str, params: dict, speak=None) -> str:
             return f"List failed: {e}"
 
     if action == "extract":
-        dest = Path(params.get("destination", str(path.parent / path.stem)))
+        raw_dest = params.get("destination") or str(path.parent / path.stem)
+        dest = _safe_file(raw_dest)
+        if dest is None:
+            return "That destination is outside the folders I am allowed to write."
         dest.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.unpack_archive(path, dest)
-            return f"Extracted to: {dest}"
+            count = _safe_unpack(path, dest)
+            return f"Extracted {count} file(s) to: {dest}"
         except Exception as e:
             return f"Extract failed: {e}"
 
@@ -784,11 +884,13 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
 def file_processor(parameters: dict, player=None, speak=None) -> str:
-    file_path_str = parameters.get("file_path", "").strip()
+    file_path_str = str(parameters.get("file_path") or "").strip()
     if not file_path_str:
         return "No file path provided."
 
-    path = Path(file_path_str)
+    path = _safe_file(file_path_str)
+    if path is None:
+        return "That path is outside the folders I am allowed to process."
     if not path.exists():
         return f"File not found: {file_path_str}"
     if not path.is_file():
@@ -852,7 +954,7 @@ TOOL = {
         "properties": {
             "file_path": {
                 "type": "STRING",
-                "description": "Full path to the uploaded file. Leave empty to use the currently uploaded file."
+                "description": "Full path to the file to process. Leave empty to use the file currently open in the interface."
             },
             "action": {
                 "type": "STRING",

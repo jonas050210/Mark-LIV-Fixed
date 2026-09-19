@@ -99,7 +99,13 @@ def band_energies(pcm, sr: int) -> np.ndarray:
     Left unnormalised on purpose: the decision below projects one of these onto
     another, and a projection needs real magnitudes.
     """
-    x = np.asarray(pcm, dtype=np.float32)
+    # The microphone callback hands over (n, 1) blocks while playback notes 1-D
+    # slices. Without the flatten, the window broadcast (n, 1) * (n,) into an
+    # (n, n) matrix and the band indexing below raised IndexError — caught
+    # inside is_user_speech, which then reported "not a voice" for EVERY
+    # audible block of the echo tail. The tail was effectively deaf: the first
+    # ~half second of any instant reply was dropped instead of streamed.
+    x = np.asarray(pcm, dtype=np.float32).reshape(-1)
     if x.size < 64:
         return np.zeros(len(_BAND_EDGES) - 1, dtype=np.float32)
     x = x - x.mean()

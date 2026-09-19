@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 import time
@@ -9,13 +10,17 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.06
     _PYAUTOGUI = True
-except ImportError:
+except Exception:
+    # ImportError when missing — but also KeyError('DISPLAY') / X errors on
+    # headless machines. Either way the action must load and degrade, not die.
+    pyautogui = None
     _PYAUTOGUI = False
 
 try:
     import pyperclip
     _PYPERCLIP = True
 except ImportError:
+    pyperclip = None
     _PYPERCLIP = False
 
 def _base_dir() -> Path:
@@ -35,7 +40,7 @@ def _get_os() -> str:
 
 def _require_pyautogui():
     if not _PYAUTOGUI:
-        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+        raise RuntimeError("PyAutoGUI is not available (not installed, or no display on a headless machine). Run: pip install pyautogui")
 
 
 def _paste_text(text: str) -> None:
@@ -69,6 +74,19 @@ def _open_app(app_name: str) -> bool:
 
     try:
         if os_name == "windows":
+            # Direct launch first (shared resolver: PATH, App Paths, Start Menu
+            # shortcuts, Store apps). Start-menu typing stays only as fallback.
+            try:
+                from core import app_finder as _af
+                _tgt = _af.resolve(app_name)
+                if _tgt is not None:
+                    _ok, _msg = _af.launch(_tgt)
+                    print(f"[SendMessage] app_finder: {_msg}")
+                    if _ok:
+                        time.sleep(2.5)
+                        return True
+            except Exception as e:
+                print(f"[SendMessage] app_finder failed ({e}), using Start menu")
             pyautogui.press("win")
             time.sleep(0.5)
             _paste_text(app_name)
@@ -90,12 +108,18 @@ def _open_app(app_name: str) -> bool:
             time.sleep(2.5)
             return result.returncode == 0
 
-        else: 
+        else:
             launched = False
-            for launcher in [
-                ["gtk-launch", app_name.lower()],
-                [app_name.lower()],
-            ]:
+            # app_name can arrive from the unknown-platform fallback, i.e. it
+            # is model-controlled. The bare exec below runs whatever it names,
+            # so only a plain executable name may reach it — no paths, no
+            # spaces, no flags. gtk-launch only looks up desktop entries and
+            # stays available for anything else.
+            simple = app_name.strip().lower()
+            candidates = [["gtk-launch", simple]]
+            if re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", simple):
+                candidates.append([simple])
+            for launcher in candidates:
                 try:
                     subprocess.Popen(
                         launcher,

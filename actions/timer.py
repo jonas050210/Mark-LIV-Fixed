@@ -191,6 +191,9 @@ def timer_action(parameters: dict, player=None, speak=None) -> str:
         _log(player, f"TIMER: cancelled {', '.join(names)}")
         return f"Cancelled {len(names)} timer(s): {', '.join(names)}."
 
+    if action not in ("start", "list", "cancel"):
+        return f"Unknown timer action: '{action}'. Available: start, list, cancel."
+
     seconds = _parse_duration(p.get("duration"))
     if not seconds:
         return ("I could not read that duration. Say something like '10m', "

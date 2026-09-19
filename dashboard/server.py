@@ -410,9 +410,11 @@ def _ensure_network_access(port: int) -> None:
             return
 
         # ── Try running directly (succeeds when already admin) ────────────────
+        # Explicit cmd.exe, no shell=True: the .bat path comes from mkstemp and
+        # is safe either way, but nothing here needs a shell's parsing.
         try:
             r = subprocess.run(
-                [bat_path], capture_output=True, timeout=8, shell=True
+                ["cmd.exe", "/c", bat_path], capture_output=True, timeout=8
             )
             if r.returncode == 0:
                 print(f"[Dashboard] Firewall configured for port {port}.")
@@ -1024,7 +1026,7 @@ class DashboardServer:
                     data = await websocket.receive_bytes()
                     try:
                         self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
+                            {"data": data, "mime_type": "audio/pcm;rate=16000"}
                         )
                     except asyncio.QueueFull:
                         pass  # drop frame rather than block

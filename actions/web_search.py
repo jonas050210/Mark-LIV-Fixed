@@ -352,10 +352,12 @@ def web_search(
     session_memory=None,
 ) -> str:
     params = parameters or {}
-    query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
+    query  = str(params.get("query") or "").strip()
+    mode   = str(params.get("mode") or "search").lower().strip()
     items  = params.get("items", [])
-    aspect = params.get("aspect", "general").strip() or "general"
+    if not isinstance(items, list):
+        items = []
+    aspect = str(params.get("aspect") or "general").strip() or "general"
 
     if not query and not items:
         return "Please provide a search query."

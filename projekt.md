@@ -18,19 +18,17 @@ Mark LIV (54) ist ein plattformübergreifender, echtzeitfähiger persönlicher K
                                │   Overlays, Settings & Events)  │
                                └───────────────┬─────────────────┘
                                                │
-                        ┌──────────────────────┴──────────────────────┐
-                        ▼                                             ▼
-          ┌───────────────────────────┐                 ┌───────────────────────────┐
-          │     Gemini Live Core      │                 │  Jev Ultrafast Agent Core │
-          │ (Realtime Audio, Vision,  │                 │ (CDP Harness, Speculative │
-          │  Continuous Tool Calls)   │                 │  Plan, DOM Tree Snapshot) │
-          └─────────────┬─────────────┘                 └─────────────┬─────────────┘
-                        │                                             │
-                        └──────────────────────┬──────────────────────┘
+                                               ▼
+                               ┌───────────────────────────┐
+                               │     Gemini Live Core      │
+                               │ (Realtime Audio, Vision,  │
+                               │  Continuous Tool Calls)   │
+                               └─────────────┬─────────────┘
+                                               │
                                                ▼
                                ┌───────────────────────────────┐
                                │ Action Loader & Tool Registry │
-                               │   (19 Aktive Bundled Skills)  │
+                               │   (20 Aktive Bundled Skills)  │
                                └───────────────┬───────────────┘
                                                │
                ┌───────────────────────────────┴───────────────────────────────┐
@@ -39,37 +37,39 @@ Mark LIV (54) ist ein plattformübergreifender, echtzeitfähiger persönlicher K
 │    Automatisierung & UI     │ │    Dokumente & Analyse      │ │    Medien, Web & System     │
 │ • computer_control (UIA)    │ │ • document_qa (PyMuPDF)     │ │ • youtube_video (yt-dlp)    │
 │ • open_app (Shortcut-Cache) │ │ • summarize (trafilatura)   │ │ • web_search (Dual Tier)    │
-│ • browser_agent (Jev)       │ │ • file_processor            │ │ • system_monitor            │
+│ • browser_control           │ │ • file_processor            │ │ • system_monitor            │
 │ • code_agent (Scaffold/Fix) │ │ • file_controller           │ │ • audio_device / settings   │
-│ • desktop_control / notify  │ │                             │ │ • timer / reminder          │
+│ • desktop_control / notify  │ │ • screen_vision (Find/Read) │ │ • timer / reminder          │
+│ • app_inventory (Index)     │ │                             │ │                             │
 └─────────────────────────────┘ └─────────────────────────────┘ └─────────────────────────────┘
 ```
 
 ---
 
-## 3. Die 19 aktiven Aktionen (`actions/`)
+## 3. Die 20 aktiven Aktionen (`actions/`)
 
-Alle 19 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur Laufzeit von `core/action_loader.py` automatisch geladen:
+Alle 20 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur Laufzeit von `core/action_loader.py` automatisch geladen:
 
-1. `audio_device`: Verwaltet und wechselt Ein- und Ausgabegeräte (Mikrofon/Lautsprecher) namentlich und prüft deren Hardware-Verfügbarkeit.
-2. `autonomous_browser_task` (`browser_agent.py`): Autonome Multi-Step-Browsersteuerung über die Jev Ultrafast Engine via direktes Chrome DevTools Protocol (CDP).
-3. `browser_control`: Deterministische, skriptbasierte Browserautomatisierung mittels Playwright (Recherche, Navigation, Formulareingabe).
-4. `code_agent`: Vollwertiger Entwicklungs-Agent. Konsolidiert Einzeldatei-Codebearbeitung und -Ausführung mit Multi-File-Projekt-Scaffolding und Fix-Loops.
+1. `app_inventory`: Beantwortet „Was ist installiert / wo liegt X / ist Y ein Spiel und wie startet es" aus dem gemeinsamen App-Index. Rein lesend.
+2. `audio_device`: Verwaltet und wechselt Ein- und Ausgabegeräte (Mikrofon/Lautsprecher) namentlich und prüft deren Hardware-Verfügbarkeit.
+3. `browser_control`: Deterministische, skriptbasierte Browserautomatisierung mittels Playwright (Recherche, Navigation, Formulareingabe). Nur `http(s)`-URLs; `file:`/`javascript:`/`data:` werden abgewiesen.
+4. `code_agent`: Vollwertiger Entwicklungs-Agent. Konsolidiert Einzeldatei-Codebearbeitung und -Ausführung mit Multi-File-Projekt-Scaffolding und Fix-Loops. Alle Pfade sind auf das Home-Verzeichnis begrenzt, Timeouts auf 5–300 s.
 5. `computer_control`: Direkte Eingabesteuerung. Nutzt primär Windows UI Automation (`uiautomation`) für semantische Interaktion mit Buttons, Feldern und Fenstern, mit nahtlosem `pyautogui`-Koordinaten-Fallback.
 6. `computer_settings`: Verwaltung von Systemeinstellungen (Lautstärke, Helligkeit, WLAN, Energieoptionen, Prozessverwaltung).
 7. `desktop_control` (`desktop.py`): Desktop-Organisation, Wallpaper-Wechsel, Bereinigung und Fensterverwaltung.
 8. `document_qa`: Fragestellungen zu PDF-, Word-, Excel- und PowerPoint-Dateien. Verwendet Tier 1 `PyMuPDF` (`pymupdf`) für bis zu 11-fach schnellere Textextraktion mit Fallbacks auf `pdfplumber` und `PyPDF2`.
-9. `file_controller`: Datei- und Verzeichnisoperationen (Erstellen, Verschieben, Löschen mit Papierkorb-Schutz, Auflisten).
-10. `file_processor`: Parsing, Formatkonvertierung und Tabellenanalyse für Arbeitsdateien.
-11. `game_updater`: Überprüfung und Verwaltung von Spielaktualisierungen auf Steam und Epic Games.
-12. `notify`: Desktop-Benachrichtigungen über das Betriebssystem mit mehrstufigen Rückfallpfaden.
-13. `open_app`: Starten beliebiger Programme. Nutzt einen In-Memory- und persistenten Cache (`~/.jarvis_app_cache.json`) für Auflösung unter 1 ms mit Startmenü-Indexierung.
-14. `reminder`: Zeitgesteuerte Erinnerungen über betriebssystemeigene Scheduler (Windows Taskplaner, macOS LaunchAgent, Linux systemd).
-15. `send_message`: Versand von Nachrichten über installierte Messenger wie WhatsApp oder Telegram.
-16. `summarize`: Komprimiert Texte, Zwischenablage, URLs oder Dokumente. Nutzt `trafilatura` für saubere HTML-Extraktion ohne Navigations- und Cookie-Müll mit BeautifulSoup-Fallback und SSRF-Schutz.
-17. `timer`: Gesprochene Countdown-Timer in Hintergrund-Daemon-Threads mit Sprachansage.
-18. `web_search`: Parallele Websuche über Gemini Grounded Search und DuckDuckGo (ddgs).
-19. `youtube_video`: Wiedergabe, Metadatenabruf und Transkript-Zusammenfassungen. Nutzt `yt-dlp` für robuste Video-Infos und automatischen Untertitel-Fallback.
+9. `file_controller`: Datei- und Verzeichnisoperationen (Erstellen, Verschieben, Löschen mit Papierkorb-Schutz, Auflisten). Quelle UND Ziel jeder Operation werden gegen die Home-Sandbox geprüft.
+10. `file_processor`: Parsing, Formatkonvertierung und Tabellenanalyse für Arbeitsdateien. Home-Sandbox, Zip-Slip-geschützte Archivextraktion, validierte Ausgabeformate.
+11. `game_updater`: Überprüfung und Verwaltung von Spielaktualisierungen auf Steam und Epic Games. „Herunterfahren wenn fertig" erfordert eine HUD-Bestätigung; geplante Tasks laufen ohne Admin-Rechte.
+12. `notify`: Desktop-Benachrichtigungen über das Betriebssystem mit mehrstufigen Rückfallpfaden (inkl. macOS AppleScript-Stufe mit entschärften Anführungszeichen).
+13. `open_app`: Starten beliebiger Programme über `core/app_finder.py` (Aliase, Startmenü-Index, persistenter Cache `~/.jarvis_app_cache.json`, CLI-Argumente unter Linux). Installiert oder lädt niemals etwas herunter.
+14. `reminder`: Zeitgesteuerte Erinnerungen über betriebssystemeigene Scheduler (Windows Taskplaner, macOS LaunchAgent, Linux systemd/`at`).
+15. `screen_vision`: Bildschirmverständnis auf Abruf (beschreiben/lesen/finden) mit Cooldown, Schwärzung von Zugangsdaten und normalisierten Koordinaten.
+16. `send_message`: Versand von Nachrichten über installierte Messenger wie WhatsApp oder Telegram.
+17. `summarize`: Komprimiert Texte, Zwischenablage, URLs oder Dokumente. Nutzt `trafilatura` für saubere HTML-Extraktion ohne Navigations- und Cookie-Müll mit BeautifulSoup-Fallback und SSRF-Schutz (inkl. Redirect-Prüfung pro Hop).
+18. `timer`: Gesprochene Countdown-Timer in Hintergrund-Daemon-Threads mit Sprachansage.
+19. `web_search`: Parallele Websuche über Gemini Grounded Search und DuckDuckGo (ddgs).
+20. `youtube_video`: Wiedergabe, Metadatenabruf und Transkript-Zusammenfassungen. Nutzt `yt-dlp` für robuste Video-Infos und automatischen Untertitel-Fallback.
 
 ---
 
@@ -87,8 +87,12 @@ Alle 19 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur L
 
 ## 5. Sicherheits- & Bestätigungsarchitektur
 
-- **Unumkehrbare Aktionen (`core/confirm.py`)**: Destruktive Systembefehle (Herunterfahren, Neustart, Trennen von Verbindungen) erfordern einen kryptografischen Token, der ausschließlich durch eine manuelle Benutzeraktion im HUD erzeugt wird. Das Sprachmodell kann diese Schranke niemals selbst bestätigen.
-- **SSRF-Schutz (`actions/summarize.py`)**: `_blocked_host` verhindert den Zugriff auf private IP-Bereiche (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`) und Cloud-Metadaten-Endpunkte (`169.254.169.254`).
+- **Unumkehrbare Aktionen (`core/confirm.py`)**: Herunterfahren, Neustart, WLAN-Umschaltung und das automatische Herunterfahren nach Spiele-Downloads (`game_updater`) legen einen Banner mit CONFIRM/CANCEL aufs HUD und kehren sofort zurück — die Aktion läuft nur, wenn ein Mensch CONFIRM drückt. Das Sprachmodell kann diese Schranke niemals selbst bestätigen; ohne gebundenes Interface wird fail-closed abgelehnt.
+- **SSRF-Schutz (`actions/summarize.py`)**: `_blocked_host` verhindert den Zugriff auf private IP-Bereiche (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`) und Cloud-Metadaten-Endpunkte (`169.254.169.254`). Redirects werden manuell verfolgt (max. 5 Hops) und jeder Hop erneut geprüft.
+- **URL-Schemata (`actions/browser_control.py`)**: Nur `http(s)` wird geöffnet; `file:`-, `javascript:`-, `data:`- und andere Schemata werden abgewiesen, damit keine lokalen Dateien ins Modellkontext gelesen und kein Seiten-JavaScript ausgeführt werden kann.
+- **Home-Sandbox für Dateien**: `file_controller`, `file_processor`, `document_qa`, `summarize` und `code_agent` lösen Pfade über Symlinks auf und verweigern alles außerhalb des Home-Verzeichnisses (plus Temp-Verzeichnis für Leseaktionen). Archive werden Zip-Slip-geprüft entpackt, Ausgabeformate validiert.
+- **Skript-Injektion**: Modelltexte, die in PowerShell/AppleScript-Quelltext interpoliert werden (Fensterfokus, Wallpaper, macOS-Benachrichtigungen), werden bei Anführungszeichen abgewiesen bzw. entschärft; Scheduler-XML wird escaped, `at`-Kommandos gequotet.
+- **Kein Shell-Start**: Kein modelgesteuerter String erreicht je eine Shell (`shell=True` kommt nur noch in Kommentaren vor); alle Subprozesse laufen als Argumentvektoren.
 - **Dashboard LAN-Schutz (`dashboard/server.py`)**: Das Web-Dashboard lauscht standardmäßig ausschließlich auf `127.0.0.1`. Die Freigabe ins lokale Netzwerk erfordert ein explizites Opt-in im Einstellungsmenü.
 
 ---
@@ -101,7 +105,6 @@ Alle 19 Aktionen deklarieren ein standardisiertes `TOOL`-Schema und werden zur L
 ---
 
 ## 7. Teststatus & Validierung
-- **Vollständige Validierung**: `python3 test_overall.py` $\to$ **8 Passed, 0 Failed, 1 Skipped** (`wake_word` optional).
-- **Backend-Tests**: `tests/test_modern_backends.py` $\to$ **5/5 PASS**.
-- **Fallback-Tests**: `tests/test_fallbacks_verification.py` $\to$ **4/4 PASS**.
-- **Jev Integration & Failure Tests**: `tests/test_jev_integration.py` & `tests/test_failures.py` $\to$ **15/15 PASS**.
+- **Vollständige Validierung**: `python3 test_overall.py` $\to$ **8 Passed, 0 Failed, 1 Skipped** (`wake_word` optional), 267 Checks grün.
+- **Unit-Tests**: `pytest tests/` $\to$ **12/12 PASS** (`test_bug_fixes` 3/3, `test_modern_backends` 5/5, `test_fallbacks_verification` 4/4).
+- **Aktions-Discovery**: 20/20 `TOOL`-Deklarationen aktiv, 0 zurückgewiesen, alle Schema-Namen valide.

@@ -1,364 +1,151 @@
-import os
-import re
-import time
-import subprocess
+"""
+Open applications by natural name — "open GD" just works.
+
+Resolution and launching live in core/app_finder.py (shared with the
+app_inventory action so both agree on what is installed). This action is only
+the voice-facing wrapper: resolve the name, launch the target, and report back
+in one spoken sentence.
+
+Launch order on Windows is always safest-first: validated URL → allow-listed
+system shortcut → PATH exe → App-Paths exe → Start Menu shortcut → Store app →
+installed Steam/Epic game → installed Roblox Player. Typing into the Start menu
+is the last resort, and even then only a verified installed shortcut name is
+typed — never raw model text.
+"""
+from __future__ import annotations
+
+import difflib
 import platform
-import shutil
-from pathlib import Path
+import time
 
 try:
-    import psutil
-    _PSUTIL = True
-except ImportError:
-    _PSUTIL = False
+    from core import app_finder as _af
+except ImportError:  # pragma: no cover — defensive; loader skips us instead
+    _af = None
 
 _SYSTEM = platform.system()
 
-_APP_ALIASES: dict[str, dict[str, str]] = {
 
-    "chrome":             {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
-    "google chrome":      {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
-    "firefox":            {"Windows": "firefox",                 "Darwin": "Firefox",              "Linux": "firefox"},
-    "edge":               {"Windows": "msedge",                  "Darwin": "Microsoft Edge",       "Linux": "microsoft-edge"},
-    "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
-    "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
-    "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
-    "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
-    "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
-    "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
-    "zoom":               {"Windows": "Zoom",                    "Darwin": "zoom.us",              "Linux": "zoom"},
-    "teams":              {"Windows": "msteams",                 "Darwin": "Microsoft Teams",      "Linux": "teams"},
-    "skype":              {"Windows": "skype",                   "Darwin": "Skype",                "Linux": "skype"},
-    "signal":             {"Windows": "signal",                  "Darwin": "Signal",               "Linux": "signal"},
-    "spotify":            {"Windows": "Spotify",                 "Darwin": "Spotify",              "Linux": "spotify"},
-    "vlc":                {"Windows": "vlc",                     "Darwin": "VLC",                  "Linux": "vlc"},
-    "netflix":            {"Windows": "Netflix",                 "Darwin": "Netflix",              "Linux": "firefox"},
-    "vscode":             {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "visual studio code": {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "code":               {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "x-terminal-emulator"},
-    "cmd":                {"Windows": "cmd.exe",                 "Darwin": "Terminal",             "Linux": "bash"},
-    "powershell":         {"Windows": "powershell.exe",          "Darwin": "Terminal",             "Linux": "bash"},
-    "postman":            {"Windows": "Postman",                 "Darwin": "Postman",              "Linux": "postman"},
-    "git":                {"Windows": "git-bash",                "Darwin": "Terminal",             "Linux": "bash"},
-    "figma":              {"Windows": "Figma",                   "Darwin": "Figma",                "Linux": "figma"},
-    "blender":            {"Windows": "blender",                 "Darwin": "Blender",              "Linux": "blender"},
-    "word":               {"Windows": "winword",                 "Darwin": "Microsoft Word",       "Linux": "libreoffice --writer"},
-    "excel":              {"Windows": "excel",                   "Darwin": "Microsoft Excel",      "Linux": "libreoffice --calc"},
-    "powerpoint":         {"Windows": "powerpnt",                "Darwin": "Microsoft PowerPoint", "Linux": "libreoffice --impress"},
-    "libreoffice":        {"Windows": "soffice",                 "Darwin": "LibreOffice",          "Linux": "libreoffice"},
-    "notepad":            {"Windows": "notepad.exe",             "Darwin": "TextEdit",             "Linux": "gedit"},
-    "textedit":           {"Windows": "notepad.exe",             "Darwin": "TextEdit",             "Linux": "gedit"},
-    "explorer":           {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "file explorer":      {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "finder":             {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "task manager":       {"Windows": "taskmgr.exe",             "Darwin": "Activity Monitor",     "Linux": "gnome-system-monitor"},
-    "settings":           {"Windows": "ms-settings:",            "Darwin": "System Preferences",   "Linux": "gnome-control-center"},
-    "calculator":         {"Windows": "calc.exe",                "Darwin": "Calculator",           "Linux": "gnome-calculator"},
-    "paint":              {"Windows": "mspaint.exe",             "Darwin": "Preview",              "Linux": "gimp"},
-    "instagram":          {"Windows": "Instagram",               "Darwin": "Instagram",            "Linux": "firefox"},
-    "tiktok":             {"Windows": "TikTok",                  "Darwin": "TikTok",               "Linux": "firefox"},
-    "notion":             {"Windows": "Notion",                  "Darwin": "Notion",               "Linux": "notion"},
-    "obsidian":           {"Windows": "Obsidian",                "Darwin": "Obsidian",             "Linux": "obsidian"},
-    "capcut":             {"Windows": "CapCut",                  "Darwin": "CapCut",               "Linux": "capcut"},
-    "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
-    "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
-    "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
-}
+def _start_menu_type_verified(name: str) -> bool:
+    """Type a VERIFIED installed shortcut name into Start and press Enter.
 
-
-def _normalize(raw: str) -> str:
-    key = raw.lower().strip()
-
-    if key in _APP_ALIASES:
-        return _APP_ALIASES[key].get(_SYSTEM, raw)
-
-    for alias_key, os_map in _APP_ALIASES.items():
-        if alias_key in key or key in alias_key:
-            return os_map.get(_SYSTEM, raw)
-
-    return raw  
-
-# A bare protocol handler such as "ms-settings:" and nothing else. Anchored, so
-# a string containing "://" or a space can never reach the shell-open path.
-_URI_ONLY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:$")
-
-# Persistent application shortcut cache (Windows) for sub-10ms lookup
-_APP_CACHE_FILE = Path.home() / ".jarvis_app_cache.json"
-_APP_CACHE: dict[str, str] = {}
-_APP_CACHE_LOADED = False
-
-
-def _load_app_cache() -> dict[str, str]:
-    global _APP_CACHE, _APP_CACHE_LOADED
-    if _APP_CACHE_LOADED:
-        return _APP_CACHE
-    if _APP_CACHE_FILE.exists():
-        try:
-            import json
-            _APP_CACHE = json.loads(_APP_CACHE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            _APP_CACHE = {}
-    _APP_CACHE_LOADED = True
-    return _APP_CACHE
-
-
-def _save_app_cache(cache: dict[str, str]) -> None:
-    try:
-        import json
-        _APP_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _index_windows_shortcuts() -> dict[str, str]:
-    """Index .lnk files from Start Menu and ProgramData."""
-    shortcuts = {}
-    if _SYSTEM != "Windows":
-        return shortcuts
-    roots = [
-        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
-        Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
-    ]
-    for root in roots:
-        if not root.exists():
-            continue
-        try:
-            for p in root.rglob("*.lnk"):
-                key = p.stem.lower().strip()
-                shortcuts[key] = str(p)
-        except Exception:
-            continue
-    return shortcuts
-
-
-def _resolve_windows_executable(name: str) -> str | None:
-    """Absolute path of a real executable on PATH or cached shortcut, or None.
-
-    Returns what `shutil.which()` or shortcut indexing actually found on disk,
-    never the caller's string.
+    The name must come from the local shortcut index (difflib-matched above a
+    high threshold by the caller), never from model text. Returns False when
+    anything about the environment refuses (non-Windows, no pyautogui).
     """
-    key = name.lower().strip()
-
-    # Fast path: in-memory / disk cache
-    cache = _load_app_cache()
-    if key in cache:
-        target = Path(cache[key])
-        if target.exists():
-            return str(target)
-        else:
-            cache.pop(key, None)
-
-    seen = set()
-    for candidate in (name, name.split(".")[0], name.lower()):
-        candidate = candidate.strip()
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        found = shutil.which(candidate)
-        if found:
-            cache[key] = found
-            _save_app_cache(cache)
-            return found
-
-    # Index shortcuts if not found on PATH
-    shortcuts = _index_windows_shortcuts()
-    for s_name, s_path in shortcuts.items():
-        if key == s_name or key in s_name or s_name in key:
-            cache[key] = s_path
-            _save_app_cache(cache)
-            return s_path
-
-    return None
-
-
-def _launch_windows(app_name: str) -> bool:
-
-    name = str(app_name or "").strip()
-    if not name:
+    if _SYSTEM != "Windows":
         return False
-
-    # 1) A registered protocol handler ("ms-settings:"). Handed to the shell as
-    #    something to *open*, not as a command line to parse, so nothing can be
-    #    appended to it. This replaces `Popen(f"start {app_name}", shell=True)`,
-    #    where "ms-settings: & calc.exe" would have run calc.exe.
-    if _URI_ONLY_RE.match(name):
-        try:
-            os.startfile(name)          # Windows-only, and this branch is too
-            time.sleep(1.0)
-            return True
-        except Exception as e:
-            print(f"[open_app] startfile({name}) failed: {e}")
-
-    # 2) A real executable on PATH, launched as an argument vector with no shell
-    #    in between. This replaces `Popen(app_name, shell=True)`.
-    resolved = _resolve_windows_executable(name)
-    if resolved:
-        try:
-            subprocess.Popen(
-                [resolved],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(1.5)
-            return True
-        except Exception as e:
-            print(f"[open_app] subprocess failed: {e}")
-
     try:
         import pyautogui
+    except ImportError:
+        return False
+    try:
         pyautogui.PAUSE = 0.1
         pyautogui.press("win")
         time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
+        pyautogui.write(name, interval=0.03)
         time.sleep(0.9)
         pyautogui.press("enter")
-        time.sleep(2.5)
         return True
     except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
+        print(f"[open_app] Start Menu fallback failed: {e}")
+        return False
 
-    return False
 
-
-def _launch_macos(app_name: str) -> bool:
-
+def _verified_shortcut_name(raw: str) -> str | None:
+    """Best indexed shortcut name for `raw`, or None below a strict threshold."""
+    if _SYSTEM != "Windows" or _af is None:
+        return None
+    want = _af.canonical_name(raw).lower()
     try:
-        result = subprocess.run(
-            ["open", "-a", app_name],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
+        pool = sorted({p.stem for p in
+                       ( __import__("pathlib").Path(v) for v in _af._scan_shortcuts().values())})
     except Exception:
-        pass
+        return None
+    best, score = None, 0.0
+    for cand in pool:
+        s = difflib.SequenceMatcher(None, want, cand.lower()).ratio()
+        if s > score:
+            best, score = cand, s
+    return best if (best and score >= 0.85) else None
 
-    try:
-        result = subprocess.run(
-            ["open", "-a", f"{app_name}.app"],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
-    except Exception:
-        pass
 
-    binary = shutil.which(app_name) or shutil.which(app_name.lower())
-    if binary:
+# Legacy flat cache view. The authoritative cache lives in app_finder now;
+# these names stay so resolution keeps a patchable seam and an in-memory
+# overlay for ad-hoc entries.
+_APP_CACHE: dict = {}
+_APP_CACHE_LOADED = False
+
+
+def _load_app_cache() -> dict:
+    """Flat {name: executable path} view over the shared app cache."""
+    view: dict[str, str] = {}
+    if _af is not None:
         try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(1.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
-
-    return False
-
-
-_LINUX_TERMINAL_FALLBACKS = [
-    "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal",
-    "xterm", "lxterminal", "mate-terminal", "tilix", "alacritty", "kitty",
-]
-
-def _launch_linux(app_name: str) -> bool:
-
-    # terminal emulators: try common ones in order
-    if app_name in ("x-terminal-emulator", "gnome-terminal", "terminal"):
-        for term in _LINUX_TERMINAL_FALLBACKS:
-            if shutil.which(term):
-                try:
-                    subprocess.Popen([term], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1.0)
-                    return True
-                except Exception:
+            targets = _af._load_cache().get("targets", {})
+            for key, entry in targets.items():
+                if not isinstance(entry, dict):
                     continue
-
-    # Handle commands with arguments (e.g. 'libreoffice --writer') safely via shlex
-    import shlex
-    parts = shlex.split(app_name) if app_name else []
-    if parts:
-        cmd_bin = shutil.which(parts[0]) or shutil.which(parts[0].lower())
-        if cmd_bin:
-            try:
-                subprocess.Popen(
-                    [cmd_bin] + parts[1:],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                time.sleep(1.0)
-                return True
-            except Exception:
-                pass
-
-    binary = (
-        shutil.which(app_name) or
-        shutil.which(app_name.lower()) or
-        shutil.which(app_name.lower().replace(" ", "-")) or
-        shutil.which(app_name.lower().replace(" ", "_"))
-    )
-    if binary:
-        try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
+                if entry.get("kind") not in ("exe", "roblox", "app"):
+                    continue
+                target = entry.get("target") or ""
+                if not target:
+                    continue
+                view[str(key)] = target
+                display = entry.get("display") or ""
+                if display:
+                    view.setdefault(str(display), target)
         except Exception:
             pass
+    view.update(_APP_CACHE)  # in-memory overlay wins over the file cache
+    return view
 
+
+def _resolve_windows_executable(name: str) -> str | None:
+    """Cached executable path for `name`, or None when not found.
+
+    Cache first (the patched seam in the regression test), then the shared
+    resolver for anything not yet cached.
+    """
+    want = (name or "").strip()
+    if not want:
+        return None
+    cache = _load_app_cache()
+    hit = cache.get(want) or cache.get(want.lower())
+    if hit:
+        return hit
+    if _af is None:
+        return None
     try:
-        subprocess.run(
-            ["xdg-open", app_name],
-            capture_output=True, timeout=5
-        )
-        return True
+        tgt = _af.resolve(want)
     except Exception:
-        pass
-
-    for desktop_name in [
-        app_name.lower(),
-        app_name.lower().replace(" ", "-"),
-        app_name.lower().replace(" ", ""),
-    ]:
-        try:
-            result = subprocess.run(
-                ["gtk-launch", desktop_name],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True
-        except Exception:
-            pass
-
-    return False
+        return None
+    if tgt is not None and tgt.kind in ("exe", "roblox", "app", "shortcut"):
+        return tgt.target
+    return None
 
 
-_OS_LAUNCHERS = {
-    "Windows": _launch_windows,
-    "Darwin":  _launch_macos,
-    "Linux":   _launch_linux,
-}
+def _launch_linux(raw: str) -> bool:
+    """Resolve + launch on Linux, honouring trailing CLI args.
+
+    Thin wrapper over the shared resolver: "libreoffice --writer" splits
+    into program + argv inside app_finder.resolve and is launched without a
+    shell. Returns True only when the process actually started.
+    """
+    if _af is None:
+        return False
+    try:
+        target = _af.resolve(raw)
+    except Exception:
+        return False
+    if target is None or target.kind not in ("exe", "app"):
+        return False
+    try:
+        ok, _message = _af.launch(target)
+    except Exception:
+        return False
+    return bool(ok)
+
 
 def open_app(
     parameters=None,
@@ -366,46 +153,79 @@ def open_app(
     player=None,
     session_memory=None,
 ) -> str:
-    app_name = (parameters or {}).get("app_name", "").strip()
-
+    app_name = str((parameters or {}).get("app_name") or "").strip()
     if not app_name:
         return "No application name provided."
 
-    launcher = _OS_LAUNCHERS.get(_SYSTEM)
-    if launcher is None:
-        return f"Unsupported operating system: {_SYSTEM}"
-
-    normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    if _af is None:
+        return "Application launching is unavailable (app_finder failed to load)."
 
     if player:
-        player.write_log(f"[open_app] {app_name}")
+        try:
+            player.write_log(f"[open_app] {app_name}")
+        except Exception:
+            pass
+
+    print(f"[open_app] Launching: '{app_name}' ({_SYSTEM})")
 
     try:
-        if launcher(normalized):
-            return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
-        return (
-            f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
-        )
+        target = _af.resolve(app_name)
     except Exception as e:
-        print(f"[open_app] Error: {e}")
-        return f"Failed to open {app_name}: {e}"
+        print(f"[open_app] resolve failed: {e}")
+        return f"I could not look up {app_name} ({type(e).__name__})."
+
+    if target is not None:
+        try:
+            ok, message = _af.launch(target)
+        except Exception as e:
+            print(f"[open_app] launch failed: {e}")
+            return f"Failed to open {app_name}: {type(e).__name__}."
+        print(f"[open_app] → {target.kind}:{target.display} ok={ok}")
+        return message
+
+    # Not installed (or not installed under a name we recognise). Never download
+    # or install anything — say so, and offer close matches when they exist.
+    canon = _af.canonical_name(app_name)
+    if canon.lower() in ("roblox player", "roblox"):
+        return ("Roblox Player does not seem to be installed, so I did not open "
+                "anything. Install it from roblox.com and I will open it for you.")
+
+    suggestions = []
+    try:
+        suggestions = _af.suggest(app_name)
+    except Exception:
+        pass
+
+    # Last resort: Start-menu typing of a VERIFIED installed name only.
+    verified = _verified_shortcut_name(app_name)
+    if verified and _start_menu_type_verified(verified):
+        print(f"[open_app] Start Menu fallback typed verified name '{verified}'")
+        return f"Opened {verified}."
+
+    if suggestions:
+        return (f"I could not find {canon or app_name} installed. "
+                f"Did you mean: {', '.join(suggestions)}?")
+    return (f"I could not find {canon or app_name} installed. "
+            f"If it is installed under a different name, tell me and I will open it.")
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens any application on the computer. Use this whenever the user asks to open, launch, or start any app, website, or program. Always call this tool — never just say you opened it.",
+    "description": (
+        "Opens any application, game, or website on the computer. Understands "
+        "natural names and aliases ('GD' → Geometry Dash, 'KSP2' → Kerbal Space "
+        "Program 2, 'Roblox' → Roblox Player, 'Chrome', 'Spotify', 'Steam' games "
+        "by name) and full http(s) URLs. Always call this tool — never just say "
+        "you opened it. If the app is not installed it says so and never "
+        "downloads anything."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "app_name": {
                 "type": "STRING",
-                "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
+                "description": "Natural name or alias of the app/game ('GD', 'Roblox', 'Spotify', 'Chrome') or a full https:// URL"
             }
         },
         "required": [

@@ -124,7 +124,6 @@ def save_initial_setup(gemini_api_key: str, os_system: str) -> bool:
 # credentials stay in the plugin settings namespace and are not duplicated here.
 _PROVIDER_API_KEYS = frozenset({
     "gemini_api_key",
-    "typesafe_api_key",
 })
 
 
@@ -148,9 +147,6 @@ def load_api_keys() -> dict:
 
 def get_gemini_key() -> str | None:
     return load_api_keys().get("gemini_api_key")
-
-def get_typesafe_key() -> str | None:
-    return load_api_keys().get("typesafe_api_key")
 
 def is_configured() -> bool:
     key = get_gemini_key()

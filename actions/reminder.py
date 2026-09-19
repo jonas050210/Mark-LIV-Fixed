@@ -1,11 +1,13 @@
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -160,8 +162,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         '    <Enabled>true</Enabled>\n'
         '  </TimeTrigger></Triggers>\n'
         '  <Actions><Exec>\n'
-        f'    <Command>{python_exe}</Command>\n'
-        f'    <Arguments>"{script_path}"</Arguments>\n'
+        f'    <Command>{_xml_escape(str(python_exe))}</Command>\n'
+        f'    <Arguments>"{_xml_escape(str(script_path))}"</Arguments>\n'
         '  </Exec></Actions>\n'
         '  <Settings>\n'
         '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
@@ -215,8 +217,8 @@ def _schedule_mac(target_dt: datetime, task_name: str,
   <key>Label</key>             <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{sys.executable}</string>
-    <string>{script_path}</string>
+    <string>{_xml_escape(sys.executable)}</string>
+    <string>{_xml_escape(str(script_path))}</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -270,8 +272,11 @@ def _schedule_linux(target_dt: datetime, task_name: str,
         print(f"[Reminder] ⚠️ systemd-run failed: {result.stderr.strip()}, trying 'at'")
 
     if shutil.which("at"):
+        # `at` runs its stdin through /bin/sh: quote both paths so a space
+        # in the home directory (or the interpreter path) cannot split the
+        # command or inject shell syntax.
         at_time = target_dt.strftime("%H:%M %Y-%m-%d")
-        cmd_str = f"{sys.executable} {script_path}\n"
+        cmd_str = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}\n"
         result  = subprocess.run(
             ["at", at_time],
             input=cmd_str, capture_output=True, text=True,
@@ -291,9 +296,9 @@ def reminder(
     session_memory=None,
 ) -> str:
 
-    date_str = parameters.get("date", "").strip()
-    time_str = parameters.get("time", "").strip()
-    message  = parameters.get("message", "Reminder").strip()
+    date_str = str(parameters.get("date") or "").strip()
+    time_str = str(parameters.get("time") or "").strip()
+    message  = str(parameters.get("message") or "Reminder").strip()
 
     if not date_str or not time_str:
         return "I need both a date and a time to set a reminder."

@@ -1522,12 +1522,6 @@ class ApiKeysOverlay(QWidget):
             "description": "Required for the normal Gemini Live audio session and text models.",
             "placeholder": "AIza…  (leave blank to keep the stored key)",
         },
-        {
-            "key": "typesafe_api_key",
-            "title": "TYPESAFE API KEY  ·  JEV ULTRAFAST BROWSER AGENT",
-            "description": "Required for the Jev Ultrafast autonomous browser agent.",
-            "placeholder": "ts_…  (leave blank to keep the stored key)",
-        },
     )
 
     def __init__(self, parent=None):
@@ -1706,13 +1700,6 @@ class ApiKeysOverlay(QWidget):
                     headers={"x-goog-api-key": value}, timeout=15,
                 )
                 service = "Gemini"
-            elif key == "typesafe_api_key":
-                # Validate TypeSafe API Key without performing heavy mutations
-                response = requests.get(
-                    "https://api.typesafe.ai/v1/models",
-                    headers={"Authorization": f"Bearer {value}"}, timeout=15,
-                )
-                service = "TypeSafe"
             else:
                 return False, "Unknown provider."
 
@@ -3222,7 +3209,8 @@ class RemoteKeyOverlay(QWidget):
             self._do_close()
 
     def mark_connected(self) -> None:
-        """Call from any thread when a phone successfully connects."""
+        """UI thread only — reached via MainWindow._phone_sig, never directly
+        from the dashboard thread."""
         self._ctimer.stop()
         self._key_lbl.setText("CONNECTED")
         self._key_lbl.setStyleSheet(f"""
@@ -3295,6 +3283,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _phone_sig      = pyqtSignal()           # phone connected (from dashboard thread)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3445,6 +3434,7 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
+        self._phone_sig.connect(self._on_phone_sig)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
@@ -4937,8 +4927,18 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def notify_phone_connected(self) -> None:
-        if self._remote_overlay and self._remote_overlay.isVisible():
-            self._remote_overlay.mark_connected()
+        # Called from the dashboard's websocket thread: emit and return. The
+        # overlay calls below are QWidget calls and must run on the UI thread —
+        # touching them from a foreign thread is undefined behaviour in Qt.
+        self._phone_sig.emit()
+
+    def _on_phone_sig(self) -> None:
+        # Runs on the UI thread (signal slot).
+        try:
+            if self._remote_overlay and self._remote_overlay.isVisible():
+                self._remote_overlay.mark_connected()
+        except Exception:
+            pass
 
     def _open_remote(self):
         if not self.on_remote_clicked:
