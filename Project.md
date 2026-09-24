@@ -77,10 +77,16 @@ The important requirements were:
 
 The implementation, documentation, verification runner, and several bug-hunt fixes are complete on the working branch.
 
-Latest commit at the time this document was written:
+Latest implementation commit before this document:
 
 ```text
 a81125c Check dashboard route contract in overall runner
+```
+
+Documentation commit for this file:
+
+```text
+7e3d55e Document complete project architecture and history
 ```
 
 The branch also contains the preceding implementation and hardening commits described later in this document.
