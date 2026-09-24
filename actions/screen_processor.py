@@ -13,7 +13,12 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+    _NUMPY = True
+except ImportError:
+    np = None
+    _NUMPY = False
 
 try:
     import cv2
@@ -152,6 +157,8 @@ def _get_camera_index() -> int:
 
 
 def _capture_camera() -> tuple[bytes, str]:
+    if not _NUMPY:
+        raise RuntimeError("NumPy is not installed. Run: pip install numpy")
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 

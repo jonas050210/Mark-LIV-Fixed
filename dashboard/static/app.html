@@ -153,6 +153,18 @@
     .admin-command { display:flex; gap:7px; margin-top:10px; }
     .admin-command input { flex:1; }
     .admin-command button { flex-shrink:0; }
+    .control-buttons { display:flex; flex-wrap:wrap; gap:5px; }
+    .control-buttons button, .undo-btn, .cancel-btn { background:#101629; color:#b9c7e0; border:1px solid #293451; border-radius:6px; padding:6px 8px; font-size:9px; font-weight:700; cursor:pointer; }
+    .control-buttons button:hover, .undo-btn:hover { color:var(--accent); border-color:var(--accent); }
+    .monitor-tile, .audio-tile, .action-run { border-top:1px solid var(--border); padding:7px 0; color:#aebbd0; font-size:10px; line-height:1.35; }
+    .status-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--green); margin-right:5px; }
+    .status-dot.warn { background:#fbbf24; }
+    .action-run { display:flex; align-items:center; gap:6px; }
+    .action-run-main { min-width:0; flex:1; }
+    .action-run-main b { color:var(--text); font:600 10px monospace; }
+    .action-run-main small { display:block; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .action-run progress { width:55px; height:6px; }
+    .cancel-btn { color:#fbbf24; padding:4px 6px; }
     @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } }
   </style>
 </head>
@@ -172,10 +184,24 @@
       <div class="admin-actions"><button onclick="loadAdmin()">REFRESH</button><button onclick="toggleAdmin()">CLOSE</button></div>
     </div>
     <div class="admin-grid">
-      <div class="admin-card"><h3>DESKTOP</h3><pre id="desktop-info">Loading…</pre></div>
+      <div class="admin-card"><h3>QUICK CONTROL</h3>
+        <div class="control-buttons">
+          <button onclick="quickCommand('list open windows')">WINDOWS</button>
+          <button onclick="quickCommand('list monitors')">MONITORS</button>
+          <button onclick="quickCommand('list audio devices')">AUDIO</button>
+          <button onclick="quickCommand('open file explorer')">EXPLORER</button>
+          <button onclick="quickCommand('open task manager')">TASK MANAGER</button>
+          <button onclick="quickCommand('restart MARK LIV')">RELAUNCH</button>
+          <button class="undo-btn" onclick="undoLast()">UNDO LAST</button>
+        </div>
+        <h3 style="margin-top:12px">MONITORS</h3><div id="monitor-tiles">Loading…</div>
+        <h3 style="margin-top:12px">AUDIO HEALTH</h3><div id="audio-info">Loading…</div>
+      </div>
+      <div class="admin-card"><h3>LIVE ACTIONS <span id="action-summary"></span></h3><div id="live-actions">No active actions.</div><h3 style="margin-top:12px">UNDO HISTORY</h3><div id="undo-history">Loading…</div></div>
       <div class="admin-card"><h3>ACTIONS</h3><input id="action-filter" placeholder="Filter actions…" oninput="renderCapabilities()"><div id="capabilities">Loading…</div></div>
+      <div class="admin-card"><h3>DESKTOP WINDOWS</h3><div id="window-tiles">Loading…</div><pre id="desktop-info" style="margin-top:8px"></pre></div>
     </div>
-    <div class="admin-command"><input id="admin-command-input" placeholder="Run a normal JARVIS command…"><button onclick="sendAdminCommand()">RUN</button></div>
+    <div class="admin-command"><input id="admin-command-input" placeholder="Command palette: open an app, move a named window, set audio…"><button onclick="sendAdminCommand()">RUN</button></div>
   </section>
   <main id="feed"></main>
   <footer>
@@ -255,6 +281,7 @@
       if (m.type === 'wake')          sys('Wake word detected — connecting…');
       if (m.type === 'sys')           sys(m.text);
       if (m.type === 'file_received') _onFileReceived(m);
+      if (m.type === 'action')        renderActionRuns([m]);
     };
 
     function setStatus(s) {
@@ -428,6 +455,8 @@
     }
 
     let _capabilities = [];
+    let _desktopWindows = [];
+    const _runs = {};
     function toggleAdmin() {
       const panel = document.getElementById('admin-panel');
       panel.hidden = !panel.hidden;
@@ -436,25 +465,76 @@
 
     async function loadAdmin() {
       try {
-        const [capRes, desktopRes] = await Promise.all([
-          _authFetch('/api/capabilities'), _authFetch('/api/desktop')
+        const [capRes, desktopRes, actionRes] = await Promise.all([
+          _authFetch('/api/capabilities'), _authFetch('/api/desktop'), _authFetch('/api/actions')
         ]);
         const caps = await capRes.json();
         const desktop = await desktopRes.json();
+        const actions = await actionRes.json();
         _capabilities = caps.actions || [];
         renderCapabilities();
-        const monitors = (desktop.monitors || []).map(m =>
-          `Monitor ${m.index}: ${m.width || (m.right-m.left)}x${m.height || (m.bottom-m.top)}${m.refresh_hz ? ', ' + m.refresh_hz + ' Hz' : ''} at ${m.left},${m.top}`
-        );
-        const windows = (desktop.windows || []).slice(0, 30).map(w =>
-          `${w.title}${w.process ? ' [' + w.process + ']' : ''}`
-        );
+        renderActionRuns(actions.actions || []);
+        const monitors = (desktop.monitors || []).map(m => {
+          const hz = m.refresh_hz ? ', ' + m.refresh_hz + ' Hz' : '';
+          return `<div class="monitor-tile"><span class="status-dot"></span><b>Monitor ${m.index}</b> ${m.width || (m.right-m.left)}×${m.height || (m.bottom-m.top)}${hz} · ${m.primary ? 'PRIMARY' : 'secondary'} · ${m.left},${m.top} · ${m.window_count || 0} windows</div>`;
+        });
+        document.getElementById('monitor-tiles').innerHTML = monitors.join('') || 'No monitor data';
+        const audio = desktop.audio || {};
+        document.getElementById('audio-info').innerHTML = ['input','output'].map(kind => {
+          const x = audio[kind] || {};
+          const cls = x.connected ? '' : ' warn';
+          return `<div class="audio-tile"><span class="status-dot${cls}"></span><b>${kind === 'input' ? 'MIC' : 'SPEAKERS'}</b> ${esc(x.selected || 'System default')} · ${x.connected ? 'connected' : 'fallback / disconnected'} · ${esc(String(x.host_api || 'unknown'))} · ${x.sample_rate || '?'} Hz</div>`;
+        }).join('') || 'Audio diagnostics unavailable';
+        _desktopWindows = (desktop.windows || []).slice(0, 30);
+        document.getElementById('window-tiles').innerHTML = _desktopWindows.map((w, i) =>
+          `<div class="monitor-tile"><b>${esc(w.title || 'Untitled')}</b>${w.process ? ' · ' + esc(w.process) : ''}<div class="control-buttons" style="margin-top:4px"><button onclick="windowCommand(${i},'focus')">FOCUS</button><button onclick="windowCommand(${i},'minimize')">MIN</button><button onclick="windowCommand(${i},'maximize')">MAX</button><button onclick="windowCommand(${i},'close')">CLOSE</button></div></div>`
+        ).join('') || 'No visible windows';
         document.getElementById('desktop-info').textContent =
-          (monitors.length ? monitors.join('\\n') : 'No monitor data') + '\\n\\n' +
-          (windows.length ? windows.join('\\n') : 'No visible windows');
+          (_desktopWindows.length ? _desktopWindows.map(w => `${w.title}${w.process ? ' [' + w.process + ']' : ''}`).join('\\n') : '');
+        renderUndo(desktop.undo || []);
       } catch (e) {
         document.getElementById('desktop-info').textContent = 'Admin data unavailable: ' + e;
       }
+    }
+
+    function renderUndo(items) {
+      const box = document.getElementById('undo-history');
+      box.innerHTML = (items || []).map((x, i) => `<div class="monitor-tile">${i + 1}. ${esc(x)}</div>`).join('') || 'Nothing reversible yet.';
+    }
+
+    function renderActionRuns(runs) {
+      (runs || []).forEach(x => { if (x && x.action_id) _runs[x.action_id] = x; });
+      const values = Object.values(_runs).slice(-20).reverse();
+      const box = document.getElementById('live-actions');
+      const active = values.filter(x => !x.finished_at);
+      document.getElementById('action-summary').textContent = active.length ? `(${active.length} active)` : '';
+      box.innerHTML = values.map(x => {
+        const cancel = x.finished_at ? '' : `<button class="cancel-btn" onclick="cancelAction('${esc(x.action_id)}')">CANCEL</button>`;
+        return `<div class="action-run"><div class="action-run-main"><b>${esc(x.action)}</b><small>${esc(x.message || x.status)}</small></div><progress max="100" value="${x.progress || 0}"></progress>${cancel}</div>`;
+      }).join('') || 'No actions yet.';
+    }
+
+    async function refreshRuntime() {
+      const response = await _authFetch('/api/actions');
+      if (response.ok) renderActionRuns((await response.json()).actions || []);
+    }
+    async function cancelAction(id) {
+      await _authFetch('/api/actions/' + encodeURIComponent(id) + '/cancel', {method:'POST'});
+      refreshRuntime();
+    }
+    async function undoLast() {
+      const response = await _authFetch('/api/undo', {method:'POST'});
+      if (response.ok) { const x = await response.json(); renderUndo(x.history || []); toast('Undone'); }
+      else toast('Undo unavailable');
+    }
+    function quickCommand(text) {
+      document.getElementById('admin-command-input').value = text;
+      sendAdminCommand();
+    }
+    function windowCommand(index, operation) {
+      const w = _desktopWindows[index];
+      if (!w) return;
+      quickCommand(operation + ' window ' + (w.title || w.process || 'active window'));
     }
 
     function renderCapabilities() {
@@ -489,6 +569,14 @@
 
     document.getElementById('inp').addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+    });
+    document.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        const panel = document.getElementById('admin-panel');
+        if (panel.hidden) toggleAdmin();
+        setTimeout(() => document.getElementById('admin-command-input').focus(), 0);
+      }
     });
 
     // ── Toast ─────────────────────────────────────────────────────────────────

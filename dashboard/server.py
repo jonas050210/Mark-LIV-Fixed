@@ -18,6 +18,9 @@ import string
 import time
 from pathlib import Path
 
+from core.action_runtime import runtime as action_runtime
+from core import undo as undo_stack
+
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -726,6 +729,35 @@ class DashboardServer:
                 return JSONResponse({"ok": True, **value})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @app.get("/api/actions")
+        async def action_runs(req: Request):
+            """Live action IDs/status for the admin panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"ok": True, "actions": action_runtime.snapshots()})
+
+        @app.post("/api/actions/{action_id}/cancel")
+        async def cancel_action(action_id: str, req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            cancelled = action_runtime.cancel(action_id)
+            return JSONResponse({"ok": cancelled, "action_id": action_id},
+                                status_code=200 if cancelled else 404)
+
+        @app.get("/api/undo")
+        async def undo_history(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"ok": True, "history": undo_stack.history()})
+
+        @app.post("/api/undo")
+        async def undo_action(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            result = await asyncio.to_thread(undo_stack.undo_last)
+            await self.broadcast({"type": "sys", "text": result})
+            return JSONResponse({"ok": True, "result": result, "history": undo_stack.history()})
 
         @app.post("/api/admin-command")
         async def admin_command(req: Request):

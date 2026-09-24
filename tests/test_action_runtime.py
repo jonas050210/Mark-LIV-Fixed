@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from core.action_loader import discover_actions
 from core.action_result import ActionResult
 from core import confirm
+from core.action_runtime import runtime as action_runtime
 
 
 class ActionRuntimeTests(unittest.TestCase):
@@ -61,6 +62,46 @@ class ActionRuntimeTests(unittest.TestCase):
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
             result = registry.execute("admin_only", {}, {})
             self.assertEqual(result.status, "forbidden")
+
+    def test_optional_import_is_exposed_as_unavailable_capability(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "optional_action.py"
+            path.write_text(
+                "import package_that_is_not_installed\n"
+                "def handler(parameters): return 'never'\n"
+                "TOOL = {'name': 'optional_action', 'description': 'optional', 'parameters': {'type': 'OBJECT'}, 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            record = registry.record("optional_action")
+            self.assertIsNotNone(record)
+            self.assertFalse(record.available)
+            self.assertEqual(registry.execute("optional_action", {}, {}).status, "unavailable")
+
+    def test_cancellation_event_stops_a_cooperative_handler(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "cooperative.py"
+            path.write_text(
+                "import time\n"
+                "def handler(parameters, cancel_event=None):\n"
+                "    while not cancel_event.is_set(): time.sleep(.01)\n"
+                "    return 'stopped'\n"
+                "TOOL = {'name': 'cooperative', 'description': 'cooperative', 'handler': handler, 'timeout_seconds': 5}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            run_id = action_runtime.start("cooperative", {})
+            result_box = []
+            import threading
+            worker = threading.Thread(target=lambda: result_box.append(
+                registry.execute("cooperative", {}, {"action_id": run_id, "trusted": True})
+            ))
+            worker.start()
+            time.sleep(.05)
+            self.assertTrue(action_runtime.cancel(run_id))
+            worker.join(1)
+            self.assertTrue(result_box)
+            self.assertEqual(result_box[0].status, "cancelled")
 
     def test_legacy_handler_gets_a_deadline(self) -> None:
         with TemporaryDirectory() as temp:

@@ -70,8 +70,28 @@ from memory.memory_manager import (
 # Only tools that are tied to live-session state stay inline in this file
 # (screen_process, close_camera, save_memory, manage_monitor, shutdown_jarvis,
 # system_status).
-from actions.screen_processor  import _capture_camera, _capture_screen
-from actions.system_monitor    import SystemMonitor, get_system_status
+try:
+    from actions.screen_processor import _capture_camera, _capture_screen
+    _VISION_IMPORT_ERROR = ""
+except Exception as _vision_exc:
+    _VISION_IMPORT_ERROR = str(_vision_exc)
+    def _capture_screen():
+        raise RuntimeError(f"Screen capture is unavailable: {_VISION_IMPORT_ERROR}")
+    def _capture_camera():
+        raise RuntimeError(f"Camera capture is unavailable: {_VISION_IMPORT_ERROR}")
+
+try:
+    from actions.system_monitor import SystemMonitor, get_system_status
+    _SYSTEM_IMPORT_ERROR = ""
+except Exception as _system_exc:
+    _SYSTEM_IMPORT_ERROR = str(_system_exc)
+    class SystemMonitor:
+        def __init__(self, *args, **kwargs):
+            self.available = False
+        def check(self):
+            return None
+    def get_system_status():
+        return {"available": False, "error": f"System metrics are unavailable: {_SYSTEM_IMPORT_ERROR}"}
 from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
@@ -87,6 +107,7 @@ from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
+from core.action_runtime       import runtime as action_runtime
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -107,7 +128,7 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000 
+SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
@@ -324,7 +345,7 @@ def _is_repeat_chunk(txt: str, buf: list) -> bool:
     joined = " ".join(buf)
     return txt in joined
 
-def _clean_transcript(text: str) -> str:    
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
@@ -549,6 +570,10 @@ def _keep_context_of(exc: BaseException) -> bool:
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
+        if _VISION_IMPORT_ERROR:
+            print(f"[JARVIS] Vision optional dependency unavailable: {_VISION_IMPORT_ERROR}")
+        if _SYSTEM_IMPORT_ERROR:
+            print(f"[JARVIS] System metrics optional dependency unavailable: {_SYSTEM_IMPORT_ERROR}")
         self._asst_name     = "JARVI    S"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -617,6 +642,11 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._active_action_ids: dict[int, str] = {}
+        # One live run registry is shared by voice dispatch, plugin/action
+        # handlers, and the authenticated dashboard. This replaces opaque
+        # hotkey-only control with observable, cancellable operations.
+        action_runtime.subscribe(self._on_action_event)
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -853,6 +883,19 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
+    def _on_action_event(self, event: dict) -> None:
+        """Forward action lifecycle events to the dashboard without blocking a worker."""
+        dashboard = getattr(self, "_dashboard", None)
+        loop = getattr(self, "_loop", None)
+        if dashboard is None or loop is None or not loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                dashboard.broadcast({"type": "action", **event}), loop
+            )
+        except Exception:
+            pass
+
     def _admin_capabilities(self) -> list[dict]:
         """One capability manifest shared by voice and the remote admin panel."""
         inline = []
@@ -878,9 +921,24 @@ class JarvisLive:
         """Read-only snapshot used by the admin panel; never executes a command."""
         from dataclasses import asdict
         from core.window_manager import list_monitors, list_windows
+        windows = list_windows()
+        monitors = list_monitors()
+        monitor_rows = []
+        for monitor in monitors:
+            occupied = 0
+            for window in windows:
+                center_x = (window.left + window.right) // 2
+                center_y = (window.top + window.bottom) // 2
+                if monitor.left <= center_x < monitor.right and monitor.top <= center_y < monitor.bottom:
+                    occupied += 1
+            row = asdict(monitor)
+            row["window_count"] = occupied
+            monitor_rows.append(row)
         return {
-            "windows": [asdict(item) for item in list_windows()],
-            "monitors": [asdict(item) for item in list_monitors()],
+            "windows": [asdict(item) for item in windows],
+            "monitors": monitor_rows,
+            "audio": audio_devices.diagnostics(get_input_device(), get_output_device()),
+            "undo": undo_stack.history(),
         }
 
     def _on_text_command(self, text: str):
@@ -1166,12 +1224,45 @@ class JarvisLive:
         return out
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
+        """Track every inline, discovered, and plugin tool call uniformly."""
+        action_id = action_runtime.start(
+            getattr(fc, "name", "unknown"), dict(getattr(fc, "args", {}) or {}),
+            source="voice",
+        )
+        self._active_action_ids[id(fc)] = action_id
+        action_runtime.update(action_id, status="running", progress=5,
+                              message=f"Running {getattr(fc, 'name', 'action')}")
+        try:
+            response = await self._execute_tool_impl(fc)
+            payload = getattr(response, "response", {}) or {}
+            message = str(payload.get("result", "Completed"))
+            ok = not any(token in message.casefold() for token in
+                         ("failed", "unavailable", "cancelled", "could not", "unknown tool"))
+            action_runtime.finish(action_id, ok=ok, message=message)
+            return response
+        except asyncio.CancelledError:
+            action_runtime.cancel(action_id)
+            action_runtime.finish(action_id, ok=False, message="Cancelled by the session")
+            raise
+        except Exception as exc:
+            action_runtime.finish(action_id, ok=False, message=str(exc))
+            raise
+        finally:
+            self._active_action_ids.pop(id(fc), None)
+
+    async def _execute_tool_impl(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
-
+        _run_id = self._active_action_ids.get(id(fc))
+        _cancel = action_runtime.cancellation_event(_run_id)
+        if _cancel is not None and _cancel.is_set():
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": f"Action '{name}' was cancelled."},
+            )
 
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -1249,7 +1340,10 @@ class JarvisLive:
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
-                result = str(r)
+                if isinstance(r, dict) and r.get("available") is False:
+                    result = str(r.get("error") or "System metrics are unavailable.")
+                else:
+                    result = str(r)
 
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
@@ -1353,6 +1447,9 @@ class JarvisLive:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None, "session_memory": None,
+                        "action_id": self._active_action_ids.get(id(fc)),
+                        "cancel_event": action_runtime.cancellation_event(
+                            self._active_action_ids.get(id(fc))),
                         # Voice commands and authenticated dashboard commands
                         # enter through this local dispatcher.  The registry
                         # uses this bit for actions that can administer the PC;
@@ -1390,12 +1487,21 @@ class JarvisLive:
                         r = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
-                                lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None),
+                                lambda: self._plugin_registry.run(
+                                    name, args, player=self.ui, session_memory=None,
+                                    cancel_event=action_runtime.cancellation_event(
+                                        self._active_action_ids.get(id(fc))),
+                                    action_id=self._active_action_ids.get(id(fc)),
+                                ),
                             ),
                             timeout=_plugin_timeout,
                         )
                         result = r or "Done."
                     except asyncio.TimeoutError:
+                        _plugin_cancel = action_runtime.cancellation_event(
+                            self._active_action_ids.get(id(fc)))
+                        if _plugin_cancel is not None:
+                            _plugin_cancel.set()
                         result = (f"Plugin '{name}' exceeded its {_plugin_timeout:.0f}-second "
                                   "time limit. Check the application before retrying.")
                         self.ui.write_log(f"ERR: Plugin timeout — {name}")

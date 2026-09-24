@@ -31,9 +31,15 @@ The assistant now has named window and monitor control. Examples:
 
 The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing another application requires confirmation; Windows administrator/UAC operations are never silently bypassed.
 
-The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It shows the live action list, risk/confirmation markers, open windows, monitor resolution/position, and a command box. It is a control surface, not an unrestricted way around Windows security.
+The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It is the primary control surface rather than a hotkey collection: press **Ctrl/Cmd-K** for the command palette, use quick cards for windows, monitors, audio, Explorer, Task Manager, and relaunch, and use the per-window FOCUS/MIN/MAX/CLOSE controls. It shows live action IDs, progress, cancellation, confirmations, named-window occupancy, monitor tiles, audio health, and undo history. It is a control surface, not an unrestricted way around Windows security.
 
-Audio can also be controlled by voice: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device.
+Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.
+
+On Windows, monitor enumeration opts into per-monitor DPI awareness before reading HWND coordinates and uses the current display mode for refresh rate. This keeps two 1920×1080 displays and high-refresh modes such as 180 Hz visible as physical pixel geometry rather than scaled logical coordinates. The native ctypes fallback still reports geometry when pywin32 is not installed.
+
+## Optional capabilities
+
+Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. Native browser opening and the rest of desktop control remain available.
 
 ## Action safety and reliability
 

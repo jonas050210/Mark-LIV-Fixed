@@ -19,6 +19,28 @@ from typing import Iterable
 _OS = platform.system()
 
 
+def _configure_windows_dpi() -> None:
+    """Make HWND and monitor coordinates physical/pixel accurate on Windows."""
+    if _OS != "Windows":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        # PER_MONITOR_AWARE_V2.  The call is safe to repeat and is ignored on
+        # older Windows versions; the shcore fallback covers Windows 8.1/10.
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware
+    except Exception:
+        pass
+
+
+_configure_windows_dpi()
+
+
 @dataclass(frozen=True)
 class WindowInfo:
     handle: int
@@ -236,6 +258,71 @@ def _parse_xrandr_monitors() -> list[MonitorInfo]:
     return out
 
 
+def _windows_refresh_native(device: str) -> int | None:
+    try:
+        user32 = ctypes.windll.user32
+        class DEVMODEW(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", ctypes.c_wchar * 32),
+                ("dmSpecVersion", ctypes.c_ushort), ("dmDriverVersion", ctypes.c_ushort),
+                ("dmSize", ctypes.c_ushort), ("dmDriverExtra", ctypes.c_ushort),
+                ("dmFields", ctypes.c_ulong), ("dmPositionX", ctypes.c_long),
+                ("dmPositionY", ctypes.c_long), ("dmDisplayOrientation", ctypes.c_ulong),
+                ("dmDisplayFixedOutput", ctypes.c_ulong), ("dmColor", ctypes.c_short),
+                ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                ("dmFormName", ctypes.c_wchar * 32), ("dmLogPixels", ctypes.c_ushort),
+                ("dmBitsPerPel", ctypes.c_ulong), ("dmPelsWidth", ctypes.c_ulong),
+                ("dmPelsHeight", ctypes.c_ulong), ("dmDisplayFlags", ctypes.c_ulong),
+                ("dmDisplayFrequency", ctypes.c_ulong),
+            ]
+        mode = DEVMODEW()
+        mode.dmSize = ctypes.sizeof(DEVMODEW)
+        if user32.EnumDisplaySettingsW(device, -1, ctypes.byref(mode)):
+            hz = int(mode.dmDisplayFrequency or 0)
+            return hz or None
+    except Exception:
+        pass
+    return None
+
+
+def _windows_monitors_native() -> list[MonitorInfo]:
+    """ctypes monitor fallback when pywin32 is not installed."""
+    out: list[MonitorInfo] = []
+    try:
+        user32 = ctypes.windll.user32
+        from ctypes import wintypes
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+        class MONITORINFOEX(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", ctypes.c_ulong),
+                        ("szDevice", ctypes.c_wchar * 32)]
+        callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+            ctypes.POINTER(RECT), wintypes.LPARAM,
+        )
+        def callback(handle, _dc, _rect, _data):
+            info = MONITORINFOEX()
+            info.cbSize = ctypes.sizeof(info)
+            if not user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+                return True
+            m = info.rcMonitor; w = info.rcWork
+            out.append(MonitorInfo(
+                index=len(out) + 1, name=info.szDevice or f"DISPLAY{len(out)+1}",
+                left=m.left, top=m.top, right=m.right, bottom=m.bottom,
+                work_left=w.left, work_top=w.top, work_right=w.right, work_bottom=w.bottom,
+                refresh_hz=_windows_refresh_native(info.szDevice), primary=bool(info.dwFlags & 1),
+            ))
+            return True
+        cb = callback_type(callback)
+        user32.EnumDisplayMonitors(0, 0, cb, 0)
+    except Exception:
+        return []
+    return out
+
+
 def _windows_monitors() -> list[MonitorInfo]:
     try:
         import win32api
@@ -267,7 +354,7 @@ def _windows_monitors() -> list[MonitorInfo]:
             )
         return out
     except Exception:
-        return []
+        return _windows_monitors_native()
 
 
 def list_monitors() -> list[MonitorInfo]:

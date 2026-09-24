@@ -6,7 +6,12 @@ import ctypes
 import platform
 import time
 
-import psutil
+try:
+    import psutil
+    _PSUTIL = True
+except ImportError:
+    psutil = None
+    _PSUTIL = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -112,6 +117,8 @@ def _get_cpu_temp() -> float:
 
 def get_system_status() -> dict:
     """Snapshot of current system metrics for the system_status tool."""
+    if not _PSUTIL:
+        return {"available": False, "error": "psutil is not installed. Run: pip install psutil"}
     cpu  = psutil.cpu_percent(interval=0.2)
     ram  = psutil.virtual_memory()
     temp = _get_cpu_temp()
@@ -152,6 +159,8 @@ class SystemMonitor:
         self._last_alert[key] = time.monotonic()
 
     def check(self) -> str | None:
+        if not _PSUTIL:
+            return None
         try:
             cpu  = psutil.cpu_percent(interval=None)
             ram  = psutil.virtual_memory().percent

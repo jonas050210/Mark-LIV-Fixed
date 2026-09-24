@@ -12,13 +12,14 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import (
-    async_playwright,
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeout,
-)
+# Playwright is optional: native URL navigation remains useful without it.
+# Import the automation package only when an interactive browser action is
+# requested, so startup and action discovery work on minimal installs.
+async_playwright = None
+BrowserContext = Page = Playwright = object
+PlaywrightTimeout = TimeoutError
+_PLAYWRIGHT_IMPORT_ERROR = ""
+
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
 
 def _normalize_url(url: str) -> str:
@@ -454,6 +455,7 @@ class _BrowserSession:
         self._loop:    asyncio.AbstractEventLoop | None = None
         self._thread:  threading.Thread | None          = None
         self._ready    = threading.Event()
+        self._startup_error: str | None = None
 
         self._pw:      Playwright     | None = None
         self._context: BrowserContext | None = None
@@ -469,15 +471,40 @@ class _BrowserSession:
         )
         self._thread.start()
         self._ready.wait(timeout=20)
+        if self._startup_error:
+            raise RuntimeError(self._startup_error)
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._async_init())
+        try:
+            self._loop.run_until_complete(self._async_init())
+        except Exception as exc:
+            self._startup_error = str(exc)
+            self._ready.set()
+            return
         self._ready.set()
         self._loop.run_forever()
 
     async def _async_init(self):
+        global async_playwright, BrowserContext, Page, Playwright, PlaywrightTimeout
+        if async_playwright is None:
+            try:
+                from playwright.async_api import (
+                    async_playwright as _async_playwright,
+                    BrowserContext as _BrowserContext,
+                    Page as _Page,
+                    Playwright as _Playwright,
+                    TimeoutError as _PlaywrightTimeout,
+                )
+                async_playwright = _async_playwright
+                BrowserContext, Page, Playwright = _BrowserContext, _Page, _Playwright
+                PlaywrightTimeout = _PlaywrightTimeout
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Playwright is not installed. Run: pip install playwright "
+                    "and then playwright install"
+                ) from exc
         self._pw = await async_playwright().start()
 
     def run(self, coro, timeout: int = 60) -> str:

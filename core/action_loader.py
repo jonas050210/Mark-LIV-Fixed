@@ -25,6 +25,7 @@ of discover_actions() and never abort the scan of the remaining files.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import re
@@ -37,10 +38,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.action_result import ActionResult
+from core.action_runtime import runtime as action_runtime
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
-_CTX_KEYS = ("player", "speak", "response", "session_memory", "cancel_event", "trusted")
+_CTX_KEYS = ("player", "speak", "response", "session_memory", "cancel_event", "action_id", "report_progress", "trusted")
 
 
 # A tool may declare that the model should NOT be held up waiting for it.
@@ -66,6 +68,7 @@ class ActionRecord:
     handler: Optional[Callable] = None
     file: str = ""
     valid: bool = False
+    available: bool = True
     error: str = ""
     behavior: Optional[str] = None     # None = the API's default (blocking)
     scheduling: Optional[str] = None   # None = the API's default (WHEN_IDLE)
@@ -121,7 +124,8 @@ class ActionRegistry:
                 "name": rec.name,
                 "description": rec.description,
                 "file": rec.file,
-                "valid": rec.valid,
+                "valid": rec.valid and rec.available,
+                "available": rec.available,
                 "error": rec.error,
                 "category": rec.category,
                 "risk": rec.risk,
@@ -189,7 +193,9 @@ class ActionRegistry:
         """
         done = threading.Event()
         box: dict[str, object] = {}
-        cancel = threading.Event()
+        cancel = ctx.get("cancel_event")
+        if cancel is None or not hasattr(cancel, "set") or not hasattr(cancel, "is_set"):
+            cancel = threading.Event()
         call_ctx = {**ctx, "cancel_event": cancel}
 
         def _worker() -> None:
@@ -201,13 +207,21 @@ class ActionRegistry:
                 done.set()
 
         threading.Thread(target=_worker, daemon=True, name=f"action-{rec.name}").start()
-        if not done.wait(rec.timeout_seconds):
-            cancel.set()
-            return ActionResult.failure(
-                rec.name,
-                f"Action '{rec.name}' exceeded its {rec.timeout_seconds:.0f}-second time limit.",
-                status="timed_out",
-            )
+        deadline = time.monotonic() + rec.timeout_seconds
+        while not done.wait(0.1):
+            if cancel.is_set():
+                return ActionResult.failure(
+                    rec.name, f"Action '{rec.name}' was cancelled.", status="cancelled"
+                )
+            if time.monotonic() >= deadline:
+                cancel.set()
+                return ActionResult.failure(
+                    rec.name,
+                    f"Action '{rec.name}' exceeded its {rec.timeout_seconds:.0f}-second time limit.",
+                    status="timed_out",
+                )
+        if cancel.is_set():
+            return ActionResult.failure(rec.name, f"Action '{rec.name}' was cancelled.", status="cancelled")
         if "error" in box:
             raise box["error"]  # type: ignore[misc]
         return box["result"]  # type: ignore[return-value]
@@ -224,11 +238,24 @@ class ActionRegistry:
         started = time.monotonic()
         ctx = dict(ctx or {})
         parameters = dict(parameters or {})
+        action_id = str(ctx.get("action_id") or "")
+        if action_id:
+            action_runtime.update(action_id, status="running", progress=10,
+                                  message=f"Running {name}")
+            external_cancel = action_runtime.cancellation_event(action_id)
+            if external_cancel is not None:
+                ctx["cancel_event"] = external_cancel
+            ctx["report_progress"] = lambda progress, message="": action_runtime.update(
+                action_id, progress=progress, message=message or f"Running {name}"
+            )
         rec = self._actions.get(name)
-        if rec is None or not rec.valid:
-            return ActionResult.failure(name, f"Action '{name}' is not available.", status="unavailable")
+        if rec is None or not rec.valid or not rec.available:
+            detail = rec.error if rec is not None and rec.error else "the action is not installed"
+            return ActionResult.failure(name, f"Action '{name}' is unavailable: {detail}", status="unavailable")
         if rec.requires_admin and not bool(ctx.get("trusted", False)):
             return ActionResult.failure(name, "This action is restricted to an authenticated local control session.", status="forbidden")
+        if ctx.get("cancel_event") is not None and ctx["cancel_event"].is_set():
+            return ActionResult.failure(name, f"Action '{name}' was cancelled.", status="cancelled")
 
         if self._needs_confirmation(rec, parameters) and not bool(ctx.get("confirmation_bypass", False)):
             try:
@@ -338,6 +365,78 @@ def _validate(module, filename: str) -> ActionRecord:
                         timeout_seconds=timeout_seconds)
 
 
+def _unavailable_handler(parameters: dict | None = None, **_ctx) -> str:
+    # Replaced per-record with a closure below; this fallback exists so a
+    # malformed optional action can never make discovery crash.
+    return "This action is unavailable because an optional dependency is missing."
+
+
+def _metadata_without_import(path: Path) -> dict | None:
+    """Read safe TOOL metadata from a module that could not be imported.
+
+    Optional native packages often fail at import time.  Literal AST parsing
+    lets the registry expose the action and return an actionable install message
+    instead of silently deleting the capability from the model's vocabulary.
+    The handler is intentionally never evaluated.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "TOOL" for target in node.targets
+            ):
+                if not isinstance(node.value, ast.Dict):
+                    return None
+                value = {}
+                for key_node, value_node in zip(node.value.keys, node.value.values):
+                    try:
+                        key = ast.literal_eval(key_node)
+                        if key == "handler":
+                            continue
+                        value[key] = ast.literal_eval(value_node)
+                    except Exception:
+                        # A dynamic optional field is not needed to expose the
+                        # action; skip only that field.
+                        continue
+                return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def _unavailable_record(path: Path, error: Exception) -> ActionRecord | None:
+    meta = _metadata_without_import(path)
+    if not isinstance(meta, dict):
+        return None
+    name = meta.get("name")
+    description = meta.get("description")
+    parameters = meta.get("parameters", _DEFAULT_PARAMS)
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        return None
+    if not isinstance(description, str) or not description.strip():
+        return None
+    if not isinstance(parameters, dict) or parameters.get("type") != "OBJECT":
+        parameters = dict(_DEFAULT_PARAMS)
+    reason = str(error)
+    if isinstance(error, ModuleNotFoundError):
+        missing = getattr(error, "name", "optional dependency") or "optional dependency"
+        reason = f"missing optional dependency '{missing}'"
+    def _missing_handler(parameters: dict | None = None, **_ctx) -> str:
+        return f"Action '{name}' is unavailable: {reason}. Install the dependency and restart MARK LIV."
+    return ActionRecord(
+        name=name, description=description.strip(), parameters=parameters,
+        handler=_missing_handler, file=path.name, valid=True, available=False,
+        error=reason, behavior=_opt_upper(meta.get("behavior"), _BEHAVIORS),
+        scheduling=_opt_upper(meta.get("scheduling"), _SCHEDULING),
+        category=str(meta.get("category") or "computer"),
+        risk=str(meta.get("risk") or "low"),
+        requires_confirmation=bool(meta.get("requires_confirmation", False)),
+        requires_admin=bool(meta.get("requires_admin", False)),
+        undoable=bool(meta.get("undoable", False)),
+        timeout_seconds=60.0,
+    )
+
+
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
                      logger: Callable[[str], None] = print) -> ActionRegistry:
     """
@@ -387,14 +486,23 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
                                    error=f"Name '{rec.name}' already used by action '{other}' — rejected.")
 
         except Exception as e:
-            rec = ActionRecord(name=path.stem, file=path.name,
-                               error=f"Failed to load: {e}")
-            traceback.print_exc()
+            rec = _unavailable_record(path, e)
+            if rec is None:
+                rec = ActionRecord(name=path.stem, file=path.name,
+                                   error=f"Failed to load: {e}")
+            # Optional dependency failures are expected on minimal installs;
+            # keep the traceback on the console for diagnostics without making
+            # the whole application fail to start.
+            if not (rec.valid and not rec.available):
+                traceback.print_exc()
 
         all_records.append(rec)
         if rec.valid:
             valid[rec.name] = rec
-            logger(f"Action loaded: {rec.name} ({path.name})")
+            if rec.available:
+                logger(f"Action loaded: {rec.name} ({path.name})")
+            else:
+                logger(f"Action unavailable: {rec.name} ({path.name}) — {rec.error}")
         else:
             # Only log a rejection if the file actually tried to be an action.
             logger(f"Action rejected: {path.name} — {rec.error}")

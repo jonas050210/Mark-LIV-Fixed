@@ -18,7 +18,17 @@ def audio_manager(parameters: dict | None = None, player=None) -> str:
         try:
             inputs = audio_devices.list_devices("input")
             outputs = audio_devices.list_devices("output")
-            return "Microphones:\n- " + "\n- ".join(inputs) + "\n\nSpeakers:\n- " + "\n- ".join(outputs)
+            status = audio_devices.diagnostics(get_input_device(), get_output_device())
+            inp = status.get("input", {})
+            out = status.get("output", {})
+            health = (
+                f"Current microphone: {inp.get('selected', 'System default')} "
+                f"({'connected' if inp.get('connected') else 'fallback'})\n"
+                f"Current speakers: {out.get('selected', 'System default')} "
+                f"({'connected' if out.get('connected') else 'fallback'})"
+            )
+            return (health + "\n\nMicrophones:\n- " + "\n- ".join(inputs or ['No tested microphones'])
+                    + "\n\nSpeakers:\n- " + "\n- ".join(outputs or ['No tested speakers']))
         except Exception as exc:
             return f"Could not list audio devices: {exc}"
     if action in {"input", "microphone", "set_input", "set_microphone"}:

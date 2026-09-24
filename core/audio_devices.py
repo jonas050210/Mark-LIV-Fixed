@@ -419,3 +419,38 @@ def resolve(name: str, kind: str):
     except Exception as e:
         print(f"[Audio] resolve({kind}) failed: {e} — using system default")
         return None
+
+
+def diagnostics(selected_input: str = "", selected_output: str = "") -> dict:
+    """Return a JSON-safe health snapshot for the control panel.
+
+    Names are resolved against the same cached/probed list used by stream
+    startup. A saved JBL Quantum 400 (or any USB headset) therefore shows
+    ``connected: false`` immediately after unplugging instead of appearing
+    healthy merely because its name remains in config.
+    """
+    result = {}
+    for kind, selected in (("input", selected_input), ("output", selected_output)):
+        try:
+            devices = list_devices(kind)
+            wanted = (selected or DEFAULT_LABEL).strip() or DEFAULT_LABEL
+            connected = wanted == DEFAULT_LABEL or any(
+                name == wanted or name.startswith(wanted[:24]) or wanted.startswith(name[:24])
+                for name in devices
+            )
+            result[kind] = {
+                "selected": wanted,
+                "connected": bool(connected),
+                "fallback": bool(wanted != DEFAULT_LABEL and not connected),
+                "host_api": _chosen_api.get(kind) or "system default",
+                "sample_rate": _RATES.get(kind),
+                "devices": devices,
+            }
+        except Exception as exc:
+            result[kind] = {
+                "selected": selected or DEFAULT_LABEL, "connected": False,
+                "fallback": True, "host_api": "unknown",
+                "sample_rate": _RATES.get(kind), "devices": [], "error": str(exc),
+            }
+    result["healthy"] = all(item.get("connected", False) for item in result.values())
+    return result

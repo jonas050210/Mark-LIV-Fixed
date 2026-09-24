@@ -1,6 +1,7 @@
 """Named window and multi-monitor control for MARK LIV."""
 from __future__ import annotations
 
+from core.undo import push_undo
 from core.window_manager import (
     describe_monitors,
     describe_windows,
@@ -18,6 +19,30 @@ def _target_label(window) -> str:
     return window.title or window.process or "the selected window"
 
 
+def _window_state(window) -> tuple[int, int, int, int, bool, bool]:
+    return (
+        int(window.left), int(window.top), int(window.width), int(window.height),
+        bool(window.minimized), bool(window.maximized),
+    )
+
+
+def _restore_window_state(window, state) -> str:
+    left, top, width, height, was_minimized, was_maximized = state
+    operate(window, "restore")
+    operate(window, "move", left, top, max(1, width), max(1, height))
+    if was_maximized:
+        operate(window, "maximize")
+    elif was_minimized:
+        operate(window, "minimize")
+    else:
+        operate(window, "focus")
+    return "The previous window position and state were restored."
+
+
+def _remember_window(window, label: str, state) -> None:
+    push_undo(f"window layout of {label}", lambda: _restore_window_state(window, state))
+
+
 def window_manager(parameters: dict | None = None, player=None) -> str:
     p = parameters or {}
     action = str(p.get("action") or "list_windows").strip().casefold().replace(" ", "_")
@@ -32,15 +57,20 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     if window is None:
         return f"I could not find a visible window matching '{target or 'the active window'}'."
 
+    label = _target_label(window)
+    before = _window_state(window)
     if action in {"minimize", "minimise"}:
         operate(window, "minimize")
-        return f"Minimized {_target_label(window)}."
+        _remember_window(window, label, before)
+        return f"Minimized {label}."
     if action in {"maximize", "maximise"}:
         operate(window, "maximize")
-        return f"Maximized {_target_label(window)}."
+        _remember_window(window, label, before)
+        return f"Maximized {label}."
     if action in {"restore", "unminimize", "unminimise"}:
         operate(window, "restore")
-        return f"Restored {_target_label(window)}."
+        _remember_window(window, label, before)
+        return f"Restored {label}."
     if action in {"focus", "switch", "activate"}:
         operate(window, "focus")
         return f"Switched to {_target_label(window)}."
@@ -53,12 +83,14 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     if action in {"move_to_monitor", "move_monitor", "send_to_monitor"}:
         monitor = monitor_for(p.get("monitor", 1))
         move_to_monitor(window, monitor)
-        return f"Moved {_target_label(window)} to monitor {monitor.index}."
+        _remember_window(window, label, before)
+        return f"Moved {label} to monitor {monitor.index}."
     if action in {"snap", "tile"}:
         monitor = monitor_for(p.get("monitor", 1))
         side = str(p.get("side") or "left")
         snap_window(window, monitor, side)
-        return f"Snapped {_target_label(window)} {side} on monitor {monitor.index}."
+        _remember_window(window, label, before)
+        return f"Snapped {label} {side} on monitor {monitor.index}."
     if action in {"move", "resize", "position"}:
         monitor = monitor_for(p.get("monitor", 1)) if p.get("monitor") else None
         left = int(p.get("x", monitor.work_left if monitor else window.left))
@@ -68,7 +100,8 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         operate(window, "restore")
         operate(window, "move", left, top, max(200, width), max(150, height))
         operate(window, "focus")
-        return f"Moved {_target_label(window)} to {left},{top} ({width}x{height})."
+        _remember_window(window, label, before)
+        return f"Moved {label} to {left},{top} ({width}x{height})."
 
     return (
         f"Unknown window action '{action}'. Use list_windows, list_monitors, "

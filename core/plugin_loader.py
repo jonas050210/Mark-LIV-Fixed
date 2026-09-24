@@ -89,14 +89,16 @@ class PluginRegistry:
         return rec.timeout_seconds if rec else 60.0
 
     # -- called by main.py from _execute_tool's else branch --
-    def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
+    def run(self, name: str, parameters: dict, player=None, session_memory=None,
+            cancel_event=None, action_id=None) -> str:
         rec = self._plugins.get(name)
         if rec is None or not rec.valid:
             return f"Plugin '{name}' is not available."
         if not get_plugin_enabled(name):
             return f"The '{name}' plugin is currently disabled."
         try:
-            return _call_run(rec.run, parameters, player, session_memory) or "Done."
+            return _call_run(rec.run, parameters, player, session_memory,
+                             cancel_event=cancel_event, action_id=action_id) or "Done."
         except Exception as e:
             self._logger(f"Plugin '{name}' crashed during run(): {e}")
             self._notify(f"Plugin '{name}' failed — see the console for details.")
@@ -144,7 +146,7 @@ class PluginRegistry:
         return out
 
 
-def _call_run(run_fn, parameters, player, session_memory):
+def _call_run(run_fn, parameters, player, session_memory, cancel_event=None, action_id=None):
     """Invoke run() passing only the kwargs it actually declares (or all of them
     if it has **kwargs), so a minimal `def run(parameters):` plugin still works."""
     sig = inspect.signature(run_fn)
@@ -154,6 +156,10 @@ def _call_run(run_fn, parameters, player, session_memory):
         kwargs["player"] = player
     if has_var_kw or "session_memory" in sig.parameters:
         kwargs["session_memory"] = session_memory
+    if has_var_kw or "cancel_event" in sig.parameters:
+        kwargs["cancel_event"] = cancel_event
+    if has_var_kw or "action_id" in sig.parameters:
+        kwargs["action_id"] = action_id
     return run_fn(parameters, **kwargs)
 
 
