@@ -1241,8 +1241,15 @@ class JarvisLive:
                 action_runtime.update(action_id, status="confirmation_pending", progress=25,
                                       message="Waiting for confirmation")
             else:
-                ok = not any(token in message.casefold() for token in
-                             ("failed", "unavailable", "cancelled", "could not", "unknown tool"))
+                status = str(payload.get("status") or "").casefold()
+                if status:
+                    ok = status in {"succeeded", "success", "ok", "completed"}
+                else:
+                    # Inline and legacy tools may only return text. Keep the
+                    # conservative fallback for those, but prefer the
+                    # structured registry status whenever it is available.
+                    ok = not any(token in message.casefold() for token in
+                                 ("failed", "unavailable", "cancelled", "could not", "unknown tool"))
                 action_runtime.finish(action_id, ok=ok, message=message)
             return response
         except asyncio.CancelledError:
