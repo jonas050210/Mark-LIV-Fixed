@@ -192,6 +192,27 @@ def _dashboard_assets() -> str:
     return f"{len(scripts)} dashboard script blocks are syntactically valid"
 
 
+def _dashboard_route_contract() -> str:
+    import dashboard.server as dashboard_server
+
+    if not dashboard_server._DEPS_OK:
+        raise SkipCheck("FastAPI/uvicorn are not installed; dashboard route construction was skipped")
+    dashboard = dashboard_server.DashboardServer()
+    routes = {getattr(route, "path", "") for route in dashboard.app.routes}
+    required = {
+        "/login",
+        "/api/capabilities",
+        "/api/desktop",
+        "/api/actions",
+        "/api/explorer/search",
+        "/api/explorer/open",
+    }
+    missing = required - routes
+    if missing:
+        raise RuntimeError("dashboard routes missing: " + ", ".join(sorted(missing)))
+    return f"dashboard constructed with {len(routes)} routes"
+
+
 def _setup_and_requirements() -> str:
     ast.parse((REPO / "setup.py").read_text(encoding="utf-8"), filename="setup.py")
     lines = (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines()
@@ -304,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     runner.run("action registry", _discover_actions)
     runner.run("subprocess safety", _subprocess_safety)
     runner.run("dashboard assets", _dashboard_assets)
+    runner.run("dashboard route contract", _dashboard_route_contract)
     runner.run("setup and requirements", _setup_and_requirements)
     runner.run("secret hygiene", _secret_hygiene)
     runner.run("unit test suite", _run_unit_tests)
