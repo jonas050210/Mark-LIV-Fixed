@@ -137,6 +137,27 @@ def _discover_actions() -> str:
     return f"{len(names)} active actions; {len(records)} records inspected"
 
 
+def _subprocess_safety() -> str:
+    """Reject Python-shell interpolation in normal application code."""
+    violations = []
+    for path in sorted(REPO.rglob("*.py")):
+        if any(part in {".git", ".venv", "venv", "__pycache__"} for part in path.parts):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            if function not in {"run", "Popen", "call", "check_call", "check_output"}:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
+                    violations.append(f"{path.relative_to(REPO)}:{node.lineno}")
+    if violations:
+        raise RuntimeError("shell=True subprocess calls: " + ", ".join(violations))
+    return "no shell=True subprocess calls found"
+
+
 def _dashboard_assets() -> str:
     html = (REPO / "dashboard/static/app.html").read_text(encoding="utf-8")
     required_fragments = (
@@ -281,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     runner.run("Python compilation", _compile_python)
     runner.run("Python AST contracts", _parse_python_contracts)
     runner.run("action registry", _discover_actions)
+    runner.run("subprocess safety", _subprocess_safety)
     runner.run("dashboard assets", _dashboard_assets)
     runner.run("setup and requirements", _setup_and_requirements)
     runner.run("secret hygiene", _secret_hygiene)
