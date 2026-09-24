@@ -687,10 +687,14 @@ def file_controller(
             )
 
         elif action == "find":
+            # Searching defaults to the user's home folder rather than Desktop:
+            # files downloaded, saved in Documents, or moved elsewhere should
+            # not disappear merely because the caller omitted `path`.
+            search_path = str(params.get("path") or "home")
             return find_files(
                 name=name or params.get("name", ""),
                 extension=params.get("extension", ""),
-                path=path,
+                path=search_path,
                 max_results=min(int(params.get("max_results", 20)), 50),
             )
 
@@ -754,6 +758,10 @@ TOOL = {
             "count": {
                 "type": "INTEGER",
                 "description": "Number of results for largest"
+            },
+            "max_results": {
+                "type": "INTEGER",
+                "description": "Maximum number of search candidates (1-50)"
             }
         },
         "required": [

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from core import explorer
 from core.window_manager import MonitorInfo, WindowInfo
-from actions import open_app
+from actions import file_controller, open_app
 
 
 class ExplorerTests(unittest.TestCase):
@@ -36,6 +36,14 @@ class ExplorerTests(unittest.TestCase):
             self.assertIn("1. " + str(first), result)
             self.assertIn("2. " + str(second), result)
             self.assertIn("exact path", result)
+
+
+class FileControllerTests(unittest.TestCase):
+    def test_file_search_defaults_to_home_not_desktop(self) -> None:
+        with patch.object(file_controller, "find_files", return_value="search result") as find:
+            result = file_controller.file_controller({"action": "find", "name": "report"})
+        self.assertEqual(result, "search result")
+        self.assertEqual(find.call_args.kwargs["path"], "home")
 
 
 class OpenAppTests(unittest.TestCase):
