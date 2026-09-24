@@ -1,5 +1,8 @@
-# ⚙️ MARK LIV (54)
-### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
+# ⚙️ MARK LIV — Extended Product Notes
+
+> **Current setup and supported behavior:** see [`README.md`](README.md). These extended notes describe the broader product and visual design; the live action registry and current README are authoritative when a feature claim differs.
+
+### The Cross-Platform Personal AI Assistant — By FatihMakes
 
 > 📺 **[Watch the full setup video on YouTube](https://www.youtube.com/@FatihMakes)**
 

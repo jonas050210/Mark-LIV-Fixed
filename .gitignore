@@ -50,3 +50,5 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+test-results/
+*.overall-report.json

@@ -76,6 +76,34 @@ class ActionRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(run.finished_at)
             self.assertEqual(run.message, "Cancelled by user")
 
+    def test_confirmed_action_crash_finishes_the_live_action(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "crashing_confirmed.py"
+            path.write_text(
+                "def handler(parameters): raise RuntimeError('boom')\n"
+                "TOOL = {'name': 'crashing_confirmed', 'description': 'danger', 'handler': handler, 'requires_confirmation': True}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            confirm.bind(lambda _title, _detail: None, lambda: None)
+            run_id = action_runtime.start("crashing_confirmed", {})
+            result = registry.execute(
+                "crashing_confirmed", {}, {"action_id": run_id, "trusted": True}
+            )
+            self.assertEqual(result.status, "confirmation_pending")
+
+            confirm.resolve(True)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                run = action_runtime.get(run_id)
+                if run and run.finished_at is not None:
+                    break
+                time.sleep(0.01)
+            run = action_runtime.get(run_id)
+            self.assertIsNotNone(run)
+            self.assertEqual(run.status, "failed")
+            self.assertIn("failed after confirmation", run.message)
+
     def test_confirmation_without_an_interface_fails_closed(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "headless_danger.py"

@@ -1,6 +1,10 @@
 """
 MARK LIV — one-time setup.
 
+Use ``python setup.py --check`` for an offline, non-destructive validation of
+Python compatibility, requirements, and shipped assets. Without ``--check``
+the script installs dependencies and optionally downloads Playwright browsers.
+
 Installs the Python dependencies for THIS operating system only: the OS-specific
 packages in requirements.txt carry `sys_platform` markers, so a macOS or Linux
 user never pulls Windows-only libraries (and vice-versa). Then it fetches the
@@ -18,6 +22,7 @@ import sys
 from pathlib import Path
 
 OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+CHECK_ONLY = "--check" in sys.argv[1:]
 HERE = Path(__file__).resolve().parent
 
 MIN_PY = (3, 11)        # hard floor: below this the syntax used here won't parse
@@ -66,10 +71,36 @@ def _check_assets() -> None:
         )
 
 
+def _check_install_inputs() -> None:
+    """Validate setup inputs without changing the environment.
+
+    This is intentionally separate from pip: it gives the overall test and a
+    user troubleshooting an install a safe, offline check that cannot download
+    packages or launch Playwright's browser installer.
+    """
+    requirements = HERE / "requirements.txt"
+    if not requirements.is_file():
+        raise FileNotFoundError(f"Missing {requirements}")
+    entries = [
+        line.strip() for line in requirements.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not entries:
+        raise ValueError("requirements.txt has no dependency entries")
+    _check_assets()
+    print(f"   requirements.txt: {len(entries)} dependency entries")
+    print("   setup inputs and shipped assets are present")
+
+
 def main() -> None:
     print(f"⚙  MARK LIV setup — detected OS: {OS or 'unknown'}, "
           f"Python {sys.version_info[0]}.{sys.version_info[1]}")
     _check_python()
+    if CHECK_ONLY:
+        print("\n🔎 Check-only mode — no packages or browsers will be installed.")
+        _check_install_inputs()
+        print("\n✅ Setup check complete!")
+        return
 
     # requirements.txt filters OS-specific extras by itself via pip markers.
     _run("Installing Python dependencies (OS-specific extras auto-filtered)…",

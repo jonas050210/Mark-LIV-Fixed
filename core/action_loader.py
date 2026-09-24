@@ -264,8 +264,11 @@ class ActionRegistry:
                             action_runtime.finish(action_id, ok=result.ok, message=result.as_text())
                         return result.as_text()
                     except Exception as exc:  # pragma: no cover - worker safety net
-                        self._logger(f"Action '{name}' failed after confirmation: {exc}")
-                        return f"Tool '{name}' failed: {exc}"
+                        message = f"Tool '{name}' failed after confirmation: {exc}"
+                        self._logger(message)
+                        if action_id:
+                            action_runtime.finish(action_id, ok=False, message=message)
+                        return message
                 def _confirmation_cancelled(reason: str) -> None:
                     if not action_id:
                         return
