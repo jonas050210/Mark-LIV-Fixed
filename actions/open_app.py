@@ -3,6 +3,8 @@ import subprocess
 import platform
 import shutil
 
+from core.shortcut_store import resolve as resolve_shortcut
+
 try:
     import psutil
     _PSUTIL = True
@@ -257,7 +259,10 @@ def open_app(
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
-    normalized = _normalize(app_name)
+    shortcut_target = resolve_shortcut(app_name)
+    normalized = _normalize(shortcut_target)
+    if shortcut_target.casefold() != app_name.casefold():
+        print(f"[open_app] Shortcut: '{app_name}' → '{shortcut_target}'")
     print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
 
     if player:
@@ -266,9 +271,8 @@ def open_app(
     try:
         if launcher(normalized):
             return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
+        if normalized.casefold() != shortcut_target.casefold() and launcher(shortcut_target):
+            return f"Opened {app_name}."
         return (
             f"Could not confirm that {app_name} launched. "
             f"It may still be loading, or it might not be installed."
@@ -281,7 +285,7 @@ def open_app(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens any application on the computer. Use this whenever the user asks to open, launch, or start any app, website, or program. Always call this tool — never just say you opened it.",
+    "description": "Opens an application, game, folder, or URL on the computer. Resolve remembered shortcuts first, so commands such as 'open gd' work after the user saves gd as Geometry Dash. Use this whenever the user asks to open, launch, or start something; always call the tool and do not claim success without attempting it.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

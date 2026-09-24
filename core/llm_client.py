@@ -336,7 +336,7 @@ def call_llm_text(
 ) -> str:
     """
     Simple text-only generation (no tools).
-    Used by planner, executor, error_handler, code_helper, dev_agent.
+    Used by the planner, executor, and error handler for bounded assistant work.
     """
     url, default_model = get_llm_settings()
     endpoint = f"{url}/api/chat"

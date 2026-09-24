@@ -10,7 +10,7 @@ PLUGIN = {
     "description": (
         "One or two sentences Gemini uses to decide when to call this tool. "
         "Be explicit about trigger phrases and, if it could be confused with "
-        "another tool, say which tool NOT to use instead (see game_updater's "
+        "another tool, say which tool NOT to use instead (see the action registry's "
         "description in main.py for the pattern)."
     ),
     "parameters": {

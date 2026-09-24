@@ -33,7 +33,6 @@ mss>=9,<11
 # ── System, files & documents ─────────────────────────────────────────────────
 psutil>=5.9,<8
 send2trash
-youtube-transcript-api
 python-pptx
 openpyxl
 

@@ -150,10 +150,6 @@ class ActionRegistry:
             operation = str((parameters or {}).get("action") or "").strip().casefold()
             if not operation and parameters.get("task"):
                 operation = "task"
-            if not operation and rec.name == "game_updater":
-                operation = "update"
-            if rec.name == "game_updater" and bool(parameters.get("shutdown_when_done")):
-                return True
             return operation in rec.confirmation_actions
         return rec.requires_confirmation
 
@@ -173,9 +169,6 @@ class ActionRegistry:
             "install": ("Install a game", "The game launcher will download and install files."),
             "update": ("Update games", "The game launcher will download and change installed files."),
             "schedule": ("Schedule game updates", "MARK LIV will create a recurring system task."),
-            "send_message": ("Send a message", "The message will be sent through the selected service."),
-            "code_helper": ("Run a code operation", "Code may be written to or executed from your home folder."),
-            "dev_agent": ("Build a project", "Files, dependencies, and generated code may be created and run."),
         }
         return titles.get(operation, (f"Run {rec.name}", f"MARK LIV is ready to run: {operation}."))
 
@@ -341,8 +334,8 @@ def _validate(module, filename: str) -> ActionRecord:
     # parameter.  Keep only genuinely high-impact defaults here; actions that
     # combine safe and destructive operations declare ``confirmation_actions``
     # in their TOOL metadata below.
-    inferred_confirmation = name in {"send_message", "dev_agent", "code_helper"}
-    inferred_admin = name in {"computer_settings", "desktop_control", "dev_agent"}
+    inferred_confirmation = False
+    inferred_admin = name in {"system_control"}
     raw_confirm_actions = tool.get("confirmation_actions", ())
     if isinstance(raw_confirm_actions, str):
         raw_confirm_actions = (raw_confirm_actions,)

@@ -514,7 +514,7 @@ TOOL_DECLARATIONS = [
             "language. "
             "Use action='list' when they ask what can be undone. "
             "This only covers your own actions — it is not the Ctrl+Z of whatever "
-            "application is on screen (that is computer_settings with action 'undo')."
+            "application is on screen (use system_control with action 'undo' for that)."
         ),
         "parameters": {
             "type": "OBJECT",

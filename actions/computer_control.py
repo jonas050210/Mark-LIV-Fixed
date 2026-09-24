@@ -3,16 +3,9 @@ import io
 import json
 import platform
 import re
-import string
-import subprocess
 import sys
 
-if platform.system() == "Windows":
-    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
-else:
-    _WIN_HIDE: dict = {}
 import time
-import random
 from pathlib import Path
 
 try:
@@ -37,7 +30,6 @@ def _base_dir() -> Path:
 
 _BASE         = _base_dir()
 _CONFIG_PATH  = _BASE / "config" / "api_keys.json"
-_MEMORY_PATH  = _BASE / "memory" / "long_term.json"
 
 def _load_config() -> dict:
     try:
@@ -78,81 +70,6 @@ def _safe_screenshot_path(requested: str | None) -> Path:
 def _require_pyautogui():
     if not _PYAUTOGUI:
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
-
-_FIRST_NAMES = [
-    "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",
-    "Avery", "Blake", "Cameron", "Dakota", "Emerson", "Finley", "Harper",
-]
-_LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
-    "Davis", "Wilson", "Moore", "Taylor", "Anderson", "Thomas", "Jackson",
-]
-_DOMAINS = ["gmail.com", "yahoo.com", "outlook.com", "proton.me", "mail.com"]
-
-
-def _random_data(data_type: str) -> str:
-    dt = data_type.lower().strip()
-
-    if dt == "first_name":
-        return random.choice(_FIRST_NAMES)
-
-    if dt == "last_name":
-        return random.choice(_LAST_NAMES)
-
-    if dt == "name":
-        return f"{random.choice(_FIRST_NAMES)} {random.choice(_LAST_NAMES)}"
-
-    if dt == "email":
-        first = random.choice(_FIRST_NAMES).lower()
-        last  = random.choice(_LAST_NAMES).lower()
-        num   = random.randint(10, 999)
-        return f"{first}.{last}{num}@{random.choice(_DOMAINS)}"
-
-    if dt == "username":
-        return f"{random.choice(_FIRST_NAMES).lower()}{random.randint(100, 9999)}"
-
-    if dt == "password":
-        chars = string.ascii_letters + string.digits + "!@#$%"
-        raw   = (
-            random.choice(string.ascii_uppercase)
-            + random.choice(string.digits)
-            + random.choice("!@#$%")
-            + "".join(random.choices(chars, k=9))
-        )
-        return "".join(random.sample(raw, len(raw)))
-
-    if dt == "phone":
-        return f"+1{random.randint(200,999)}{random.randint(1_000_000, 9_999_999)}"
-
-    if dt == "birthday":
-        y = random.randint(1980, 2000)
-        m = random.randint(1, 12)
-        d = random.randint(1, 28)
-        return f"{m:02d}/{d:02d}/{y}"
-
-    if dt == "address":
-        num    = random.randint(100, 9999)
-        street = random.choice(["Main St", "Oak Ave", "Park Blvd", "Elm St", "Cedar Ln"])
-        return f"{num} {street}"
-
-    if dt == "zip_code":
-        return str(random.randint(10000, 99999))
-
-    if dt == "city":
-        return random.choice(["New York", "Los Angeles", "Chicago", "Houston", "Phoenix"])
-
-    return f"random_{data_type}_{random.randint(1000, 9999)}"
-
-def _user_profile() -> dict:
-    """Read identity fields from long-term memory."""
-    try:
-        if _MEMORY_PATH.exists():
-            data     = json.loads(_MEMORY_PATH.read_text(encoding="utf-8"))
-            identity = data.get("identity", {})
-            return {k: v.get("value", "") for k, v in identity.items()}
-    except Exception:
-        pass
-    return {}
 
 def _type(text: str, interval: float = 0.03) -> str:
     _require_pyautogui()
@@ -256,59 +173,19 @@ def _clear_field() -> str:
     return "Field cleared"
 
 def _focus_window(title: str) -> str:
-    os_name = _get_os()
+    """Focus a named window through the shared cross-platform window layer."""
+    if not str(title or "").strip():
+        return "Tell me which window to focus."
+    try:
+        from core.window_manager import find_window, operate
+        window = find_window(str(title))
+        if window is None:
+            return f"I could not find a window matching '{title}'."
+        operate(window, "focus")
+        return f"Focused window: {window.title or title}"
+    except Exception as exc:
+        return f"focus_window failed: {exc}"
 
-    if os_name == "windows":
-        try:
-            script = f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")'
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, timeout=5, **_WIN_HIDE,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except Exception as e:
-            return f"focus_window (Windows) failed: {e}"
-
-    if os_name == "mac":
-        script = (
-            f'tell application "System Events" to '
-            f'set frontmost of (first process whose name contains "{title}") to true'
-        )
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except Exception as e:
-            return f"focus_window (macOS) failed: {e}"
-
-    if os_name == "linux":
-        try:
-            result = subprocess.run(
-                ["wmctrl", "-a", title],
-                capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                time.sleep(0.3)
-                return f"Focused window: {title}"
-        except FileNotFoundError:
-            pass
-        try:
-            result = subprocess.run(
-                ["xdotool", "search", "--name", title, "windowactivate"],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.3)
-            return f"Focused window: {title}"
-        except FileNotFoundError:
-            return "focus_window (Linux) requires wmctrl or xdotool"
-        except Exception as e:
-            return f"focus_window (Linux) failed: {e}"
-
-    return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
@@ -376,8 +253,6 @@ def computer_control(
       seconds       : wait duration
       title         : window title fragment for focus_window
       description   : natural-language element description for screen_find/click
-      type          : data type for random_data
-      field         : memory field name for user_data
       clear_first   : bool, clear field before typing (default: true)
       path          : save path for screenshot (must be inside home dir)
 
@@ -400,8 +275,6 @@ def computer_control(
       focus_window  — bring window to foreground
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
-      random_data   — generate fake form data
-      user_data     — pull real data from memory
     """
     params = parameters or {}
     action = params.get("action", "").lower().strip()
@@ -491,21 +364,6 @@ def computer_control(
         if action == "focus_window":
             return _focus_window(params.get("title", ""))
 
-        if action == "random_data":
-            dt     = params.get("type", "name")
-            result = _random_data(dt)
-            print(f"[ComputerControl] 🎲 random {dt} → {result}")
-            return result
-
-        if action == "user_data":
-            field   = params.get("field", "name")
-            profile = _user_profile()
-            value   = profile.get(field, "")
-            if not value:
-                value = _random_data(field)
-                print(f"[ComputerControl] ⚠️ No '{field}' in memory, using random: {value}")
-            return value
-
         return f"Unknown action: '{action}'"
 
     except Exception as e:
@@ -522,7 +380,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click"
             },
             "text": {
                 "type": "STRING",
@@ -563,14 +421,6 @@ TOOL = {
             "description": {
                 "type": "STRING",
                 "description": "Element description for screen_find/screen_click"
-            },
-            "type": {
-                "type": "STRING",
-                "description": "Data type for random_data"
-            },
-            "field": {
-                "type": "STRING",
-                "description": "Field for user_data: name|email|city"
             },
             "clear_first": {
                 "type": "BOOLEAN",

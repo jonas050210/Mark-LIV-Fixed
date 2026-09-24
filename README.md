@@ -37,6 +37,10 @@ Audio can also be controlled by voice or the dashboard: say `list audio devices`
 
 On Windows, monitor enumeration opts into per-monitor DPI awareness before reading HWND coordinates and uses the current display mode for refresh rate. This keeps two 1920×1080 displays and high-refresh modes such as 180 Hz visible as physical pixel geometry rather than scaled logical coordinates. The native ctypes fallback still reports geometry when pywin32 is not installed.
 
+### Spotify background control
+
+`media_control` uses the Spotify Web API and Spotify Connect rather than clicking the Spotify window. It can search, play, pause, skip, change volume, inspect the current track, and list devices while Spotify remains minimized or in the background. The one-time `connect` flow requires a Spotify developer client ID, the local redirect URI `http://127.0.0.1:8765/callback`, and a Spotify Premium account for playback control. Playback requires an active Spotify Connect device; MARK LIV does not falsely claim that a track started when Spotify has no available device.
+
 ## Optional capabilities
 
 Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. Native browser opening and the rest of desktop control remain available.
@@ -45,8 +49,8 @@ Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow)
 
 All discovered actions now pass through one registry contract. Results have explicit `succeeded`, `failed`, `forbidden`, `confirmation_pending`, `unavailable`, and `timed_out` states; handlers keep their old string API only at the Gemini boundary. The registry also owns per-action deadlines, trusted/admin checks, confirmation metadata, and the dashboard capability manifest.
 
-High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface, and is used for app/PC closing, file deletion, desktop changes, generated code, project builds, game installs/updates, messaging, and other declared risky operations. Reversible settings continue to use the shared undo stack.
+High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface and protects app/PC closing, file deletion, power actions, WiFi changes, and other risky operations. Reversible settings continue to use the shared undo stack.
 
-Generated desktop snippets run in a bounded child interpreter with an AST allowlist, no imports, no shell/registry/process access, and only restricted Desktop-folder path wrappers. Code-helper and dev-agent execution uses bounded process groups, home/project path restrictions, no shell interpolation, and an isolated project virtual environment for dependencies. A timeout stops child process trees where the platform supports it.
+The active action surface is intentionally small and PC-focused. Travel, weather, messaging, developer-agent, game-updater, generated-desktop-task, and YouTube-specific actions were removed instead of advertising unrelated or duplicated capabilities. Browser control covers normal websites; `media_control` uses Spotify Connect for playback without repeatedly foregrounding Spotify. `shortcut_manager` stores deterministic aliases such as `gd → Geometry Dash` and `roblox → Roblox Player`.
 
 Your API keys and runtime memory are intentionally ignored by Git. Never commit `config/api_keys.json` or personal data from `memory/`.
