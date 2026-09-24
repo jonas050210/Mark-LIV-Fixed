@@ -766,4 +766,6 @@ TOOL = {
         ]
     },
     "handler": file_controller,
+    "confirmation_actions": ["delete"],
+    "undoable": True,
 }

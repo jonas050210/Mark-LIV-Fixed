@@ -1,9 +1,12 @@
-import subprocess
-import sys
 import json
 import re
+import shlex
+import subprocess
+import sys
 import time
 from pathlib import Path
+
+from core.process_runner import run_bounded
 
 
 def get_base_dir():
@@ -16,6 +19,56 @@ BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
+_MAX_FILES       = 40
+_MAX_FILE_BYTES  = 2_000_000
+_MAX_RUN_SECONDS = 180
+
+
+def _safe_project_path(project_dir: Path, raw: str) -> Path:
+    """Return a project-relative path and reject traversal/absolute paths."""
+    candidate = Path(str(raw).replace("\\", "/"))
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ValueError(f"invalid project-relative path: {raw}")
+    resolved = (project_dir / candidate).resolve()
+    root = project_dir.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"path escapes project: {raw}")
+    return resolved
+
+
+def _safe_dependencies(dependencies) -> list[str]:
+    """Allow ordinary PyPI requirement strings, never pip options/URLs."""
+    if not isinstance(dependencies, list) or len(dependencies) > 20:
+        return []
+    out = []
+    requirement = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}(?:[<>=!~]=?[A-Za-z0-9.*+_-]{1,30})?(?:\[[A-Za-z0-9_,.-]+\])?$")
+    for raw in dependencies:
+        value = str(raw).strip()
+        if requirement.fullmatch(value):
+            out.append(value)
+    return out
+
+
+def _safe_run_command(command: str, entry_point: str, project_dir: Path | None = None) -> list[str]:
+    """Parse a model-provided command without a shell or redirection syntax."""
+    if not isinstance(command, str) or len(command) > 300:
+        raise ValueError("run command is missing or too long")
+    if any(token in command for token in (";", "&&", "||", "|", ">", "<", "`", "$(", "\\\\")):
+        raise ValueError("shell operators are not allowed in a generated run command")
+    parts = shlex.split(command, posix=(sys.platform != "win32"))
+    if not parts:
+        parts = ["python", entry_point]
+    allowed = {"python", "python3", "py", "node", "ruby"}
+    interpreter = Path(parts[0]).name.casefold()
+    if interpreter not in allowed:
+        raise ValueError(f"interpreter '{parts[0]}' is not allowlisted")
+    if project_dir and interpreter in {"python", "python3", "py", "node", "ruby"}:
+        script_index = 1
+        if len(parts) > 1 and parts[1] in {"-m", "-c", "--eval", "-e"}:
+            raise ValueError("inline/module code is not allowed; run a project file")
+        if len(parts) > script_index:
+            _safe_project_path(project_dir, parts[script_index])
+    return parts[:32]
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
 
@@ -165,9 +218,10 @@ def _write_file(
 ) -> str:
     model = _get_model(MODEL_WRITER)
 
-    file_path = file_info["path"]
-    file_desc = file_info.get("description", "")
-    file_imports = file_info.get("imports", [])
+    file_path = str(file_info.get("path", ""))
+    full_path = _safe_project_path(project_dir, file_path)
+    file_desc = str(file_info.get("description", ""))[:1000]
+    file_imports = file_info.get("imports", []) if isinstance(file_info.get("imports", []), list) else []
 
     file_list = "\n".join(
         f"  [{i+1}] {f['path']}: {f.get('description', '')}"
@@ -227,7 +281,8 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        if len(code) > _MAX_FILE_BYTES:
+            raise ValueError(f"generated file is larger than {_MAX_FILE_BYTES} bytes")
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -242,37 +297,31 @@ Code for {file_path}:"""
 def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
+    dependencies = _safe_dependencies(dependencies)
+    if not dependencies:
+        return "Dependency installation refused: only ordinary package names and versions are allowed."
 
-    to_install = []
-    for dep in dependencies:
-        pkg_name = re.split(r"[>=<!]", dep)[0].strip()
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", pkg_name],
-            capture_output=True, text=True
+    venv_dir = project_dir / ".venv"
+    venv_python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if not venv_python.exists():
+        created = run_bounded(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            cwd=str(project_dir), timeout=120, max_output=8_000,
         )
-        if result.returncode != 0:
-            to_install.append(dep)
-        else:
-            print(f"[DevAgent] ✓ Already installed: {pkg_name}")
+        if created.timed_out or created.returncode != 0:
+            return "Could not create the isolated project environment."
 
-    if not to_install:
-        return f"All dependencies already installed: {', '.join(dependencies)}"
-
-    print(f"[DevAgent] 📦 Installing: {to_install}")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install"] + to_install,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=120, cwd=str(project_dir)
-        )
-        if result.returncode == 0:
-            return f"Installed: {', '.join(to_install)}"
-        return f"Install warning (non-fatal): {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return "Dependency install timed out (non-fatal)."
-    except Exception as e:
-        return f"Install error (non-fatal): {e}"
+    pip = venv_dir / ("Scripts/pip.exe" if sys.platform == "win32" else "bin/pip")
+    print(f"[DevAgent] 📦 Installing into isolated .venv: {dependencies}")
+    result = run_bounded(
+        [str(pip), "install", "--disable-pip-version-check", *dependencies],
+        cwd=str(project_dir), timeout=120, max_output=12_000,
+    )
+    if result.timed_out:
+        return "Dependency install timed out (the isolated process was stopped)."
+    if result.returncode == 0:
+        return f"Installed in the project .venv: {', '.join(dependencies)}"
+    return f"Install warning (non-fatal): {result.stderr[:300]}"
 
 def _open_vscode(project_dir: Path) -> bool:
     vscode_candidates = [
@@ -284,9 +333,10 @@ def _open_vscode(project_dir: Path) -> bool:
         try:
             subprocess.Popen(
                 [cmd, str(project_dir)],
-                shell=True,
+                shell=False,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
+                close_fds=(sys.platform != "win32"),
             )
             time.sleep(1.5)
             print(f"[DevAgent] 💻 VSCode opened: {project_dir}")
@@ -298,57 +348,28 @@ def _open_vscode(project_dir: Path) -> bool:
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
-        parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
-
-        result = subprocess.run(
-            parts,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout,
-            cwd=str(project_dir)
+        entry = "main.py"
+        parts = _safe_run_command(run_command, entry, project_dir)
+        if Path(parts[0]).name.casefold() in {"python", "python3", "py"}:
+            venv_python = project_dir / (".venv/Scripts/python.exe" if sys.platform == "win32" else ".venv/bin/python")
+            parts[0] = str(venv_python if venv_python.exists() else sys.executable)
+        result = run_bounded(
+            parts, cwd=str(project_dir), timeout=max(1, min(int(timeout or 30), _MAX_RUN_SECONDS)),
+            max_output=24_000,
         )
-
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-
-        combined_parts = []
-        if stdout:
-            combined_parts.append(f"STDOUT:\n{stdout}")
-        if stderr:
-            combined_parts.append(f"STDERR:\n{stderr}")
-
-        return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
-
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
-    except FileNotFoundError as e:
-        return f"Command not found: {e}"
+        if result.timed_out:
+            return f"Timed out after {timeout}s — the process tree was stopped."
+        return result.combined
     except Exception as e:
         return f"Run error: {e}"
 
 def _try_auto_install(error_output: str, project_dir: Path) -> bool:
-    """If there is a ModuleNotFoundError, tries to auto-install the missing package."""
-    pattern = re.compile(
-        r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", re.IGNORECASE
-    )
-    match = pattern.search(error_output)
-    if not match:
-        return False
+    """Do not silently install packages discovered while running generated code.
 
-    pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=60, cwd=str(project_dir)
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    The planned dependency list is shown to the user and installed only in the
+    confirmed project virtual environment.  A traceback is not consent.
+    """
+    return False
 
 def _fix_files(
     error_output: str,
@@ -471,9 +492,20 @@ def _build_project(
     project_dir.mkdir(parents=True, exist_ok=True)
 
     files        = plan.get("files", [])
-    entry_point  = plan.get("entry_point", "main.py")
-    run_command  = plan.get("run_command", f"python {entry_point}")
-    dependencies = plan.get("dependencies", [])
+    entry_point  = str(plan.get("entry_point", "main.py"))
+    run_command  = str(plan.get("run_command", f"python {entry_point}"))
+    dependencies = _safe_dependencies(plan.get("dependencies", []))
+    if not isinstance(files, list) or not files or len(files) > _MAX_FILES:
+        return "The generated project plan was refused: too many or no files."
+    try:
+        for item in files:
+            if not isinstance(item, dict) or not item.get("path"):
+                raise ValueError("every project file needs a path")
+            _safe_project_path(project_dir, item["path"])
+        _safe_project_path(project_dir, entry_point)
+        _safe_run_command(run_command, entry_point, project_dir)
+    except (TypeError, ValueError) as exc:
+        return f"The generated project plan was refused for safety: {exc}"
 
     log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
 
@@ -636,4 +668,7 @@ TOOL = {
         ]
     },
     "handler": dev_agent,
+    "requires_confirmation": True,
+    "requires_admin": True,
+    "timeout_seconds": 600,
 }

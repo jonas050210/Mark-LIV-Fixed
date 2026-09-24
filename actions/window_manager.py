@@ -1,7 +1,6 @@
 """Named window and multi-monitor control for MARK LIV."""
 from __future__ import annotations
 
-from core import confirm
 from core.window_manager import (
     describe_monitors,
     describe_windows,
@@ -46,15 +45,11 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         operate(window, "focus")
         return f"Switched to {_target_label(window)}."
     if action in {"close", "quit"}:
-        label = _target_label(window)
-        if confirm.pending_title():
-            return "There is already a confirmation waiting on screen."
-        return confirm.request(
-            key="close_window",
-            title=f"Close {label}",
-            detail="The application may contain unsaved work.",
-            run=lambda: _close_confirmed(window, label),
-        )
+        # The action registry parks this operation behind the shared human
+        # confirmation gate.  Keeping the actual close here makes the policy
+        # impossible to bypass through a second caller.
+        operate(window, "close")
+        return f"Closed {_target_label(window)}."
     if action in {"move_to_monitor", "move_monitor", "send_to_monitor"}:
         monitor = monitor_for(p.get("monitor", 1))
         move_to_monitor(window, monitor)
@@ -127,6 +122,6 @@ TOOL = {
     },
     "handler": window_manager,
     "risk": "close requires confirmation; other window operations are reversible",
-    "requires_confirmation": True,
+    "confirmation_actions": ["close"],
     "undoable": True,
 }

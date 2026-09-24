@@ -46,6 +46,7 @@ class PluginRecord:
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
     behavior: Optional[str] = None    # None = the API's default (blocking)
     scheduling: Optional[str] = None  # None = the API's default (WHEN_IDLE)
+    timeout_seconds: float = 60.0
 
 
 class PluginRegistry:
@@ -82,6 +83,10 @@ class PluginRegistry:
         """How this plugin's result should re-enter the conversation, if it said."""
         rec = self._plugins.get(name)
         return rec.scheduling if rec else None
+
+    def timeout(self, name: str) -> float:
+        rec = self._plugins.get(name)
+        return rec.timeout_seconds if rec else 60.0
 
     # -- called by main.py from _execute_tool's else branch --
     def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
@@ -186,10 +191,15 @@ def _validate(module, filename: str) -> PluginRecord:
     if not (isinstance(settings, dict) and isinstance(settings.get("fields"), list)):
         settings = None
 
+    try:
+        timeout_seconds = max(1.0, min(float(plugin_meta.get("timeout_seconds", 60.0)), 900.0))
+    except (TypeError, ValueError):
+        timeout_seconds = 60.0
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
                          behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
-                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING))
+                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
+                         timeout_seconds=timeout_seconds)
 
 
 def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:

@@ -1098,4 +1098,6 @@ TOOL = {
         "required": []
     },
     "handler": game_updater,
+    "confirmation_actions": ["install", "update", "schedule"],
+    "timeout_seconds": 180,
 }

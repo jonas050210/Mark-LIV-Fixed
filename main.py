@@ -867,8 +867,10 @@ class JarvisLive:
                 "category": "core",
                 "risk": "confirmation" if name in {"shutdown_jarvis", "restart_jarvis"} else "low",
                 "requires_confirmation": name in {"shutdown_jarvis", "restart_jarvis"},
+                "confirmation_actions": [],
                 "requires_admin": False,
                 "undoable": name == "undo",
+                "timeout_seconds": 60.0,
             })
         return inline + self._action_registry.admin_manifest()
 
@@ -1306,7 +1308,17 @@ class JarvisLive:
                     await asyncio.sleep(0.5)
                     _os._exit(0)
 
-                asyncio.create_task(_do_restart())
+                if confirm_gate.pending_title():
+                    result = "There is already a confirmation waiting on screen. Ask the user to answer that one first."
+                else:
+                    result = confirm_gate.request(
+                        key="restart_jarvis",
+                        title="Restart MARK LIV",
+                        detail="The assistant will close and automatically open again.",
+                        run=lambda: (self._loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(_do_restart())
+                        ) or "Restarting MARK LIV."),
+                    )
 
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
@@ -1323,15 +1335,44 @@ class JarvisLive:
                     await asyncio.sleep(1.5)
                     import os as _os
                     _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+                if confirm_gate.pending_title():
+                    result = "There is already a confirmation waiting on screen. Ask the user to answer that one first."
+                else:
+                    result = confirm_gate.request(
+                        key="shutdown_jarvis",
+                        title="Close MARK LIV",
+                        detail="The assistant will save the session and close.",
+                        run=lambda: (self._loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(_do_shutdown())
+                        ) or "Closing MARK LIV."),
+                    )
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
-                r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
+                        "response": None, "session_memory": None,
+                        # Voice commands and authenticated dashboard commands
+                        # enter through this local dispatcher.  The registry
+                        # uses this bit for actions that can administer the PC;
+                        # an untrusted caller can never forge it in parameters.
+                        "trusted": True}
+                _action_timeout = self._action_registry.timeout(name)
+                try:
+                    structured = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: self._action_registry.execute(name, args, _ctx),
+                        ),
+                        timeout=_action_timeout,
+                    )
+                    r = structured.as_text()
+                except asyncio.TimeoutError:
+                    r = (f"Action '{name}' exceeded its {_action_timeout:.0f}-second "
+                         "time limit. It was stopped from the conversation; check "
+                         "the screen before trying again.")
+                    self.ui.write_log(f"ERR: Action timeout — {name}")
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
@@ -1344,11 +1385,20 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
-                    )
-                    result = r or "Done."
+                    _plugin_timeout = self._plugin_registry.timeout(name)
+                    try:
+                        r = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None),
+                            ),
+                            timeout=_plugin_timeout,
+                        )
+                        result = r or "Done."
+                    except asyncio.TimeoutError:
+                        result = (f"Plugin '{name}' exceeded its {_plugin_timeout:.0f}-second "
+                                  "time limit. Check the application before retrying.")
+                        self.ui.write_log(f"ERR: Plugin timeout — {name}")
                 else:
                     result = f"Unknown tool: {name}"
 

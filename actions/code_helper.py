@@ -1,9 +1,11 @@
-import subprocess
-import sys
 import json
 import re
+import shlex
+import sys
 import time
 from pathlib import Path
+
+from core.process_runner import run_bounded
 
 
 def get_base_dir():
@@ -15,6 +17,20 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
+_MAX_RUN_SECONDS = 120
+_MAX_OUTPUT = 32_000
+
+
+def _safe_user_path(raw: str, *, default: Path | None = None) -> Path:
+    """Resolve a code path without allowing it to escape the user's home."""
+    candidate = Path(raw).expanduser() if raw else (default or DESKTOP)
+    resolved = candidate.resolve()
+    home = Path.home().resolve()
+    if resolved != home and home not in resolved.parents:
+        raise PermissionError("code actions are limited to the user's home directory")
+    return resolved
+
+
 # Model choice lives in core/gemini.py, and so does the timeout and the
 # fallback ladder. Writing a model name here is what left this file hanging
 # forever whenever that one alias was unwell.
@@ -58,17 +74,22 @@ def _resolve_save_path(output_path: str, language: str) -> Path:
     }
     if output_path:
         p = Path(output_path)
-        return p if p.is_absolute() else DESKTOP / p
+        return _safe_user_path(str(p if p.is_absolute() else DESKTOP / p))
     ext = ext_map.get((language or "python").lower(), ".py")
-    return DESKTOP / f"jarvis_code{ext}"
+    return _safe_user_path(str(DESKTOP / f"jarvis_code{ext}"))
 
 
 def _read_file(file_path: str) -> tuple[str, str]:
     if not file_path:
         return "", "No file path provided."
-    p = Path(file_path)
+    try:
+        p = _safe_user_path(file_path)
+    except (OSError, ValueError) as exc:
+        return "", f"Access denied: {exc}"
     if not p.exists():
         return "", f"File not found: {file_path}"
+    if not p.is_file() or p.stat().st_size > 5_000_000:
+        return "", "The file is not a regular file or is too large for this action."
     try:
         return p.read_text(encoding="utf-8"), ""
     except Exception as e:
@@ -77,6 +98,9 @@ def _read_file(file_path: str) -> tuple[str, str]:
 
 def _save_file(path: Path, content: str) -> str:
     try:
+        path = _safe_user_path(str(path))
+        if len(content or "") > 5_000_000:
+            return "Could not save: generated code is too large."
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return f"Saved to: {path}"
@@ -183,8 +207,10 @@ Code:"""
 
     response = model.generate_content(prompt)
     code     = _clean_code(response.text)
-    path     = _resolve_save_path(output_path, lang)
-    _save_file(path, code)
+    path = _resolve_save_path(output_path, lang)
+    status = _save_file(path, code)
+    if status.startswith("Could not save"):
+        raise OSError(status)
     return code, path
 
 
@@ -208,7 +234,7 @@ Fixed code:"""
     return _clean_code(response.text)
 
 
-def _run_file(path: Path, args: list, timeout: int) -> str:
+def _run_file(path: Path, args: list | str, timeout: int) -> str:
     interpreters = {
         ".py":  [sys.executable],
         ".js":  ["node"],
@@ -221,23 +247,27 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
     interp = interpreters.get(path.suffix.lower())
     if not interp:
         return f"No interpreter for {path.suffix}."
-
     try:
-        result = subprocess.run(
-            interp + [str(path)] + (args or []),
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout, cwd=str(path.parent)
+        path = _safe_user_path(str(path))
+        if isinstance(args, str):
+            args = shlex.split(args)[:32]
+        else:
+            args = [str(x) for x in (args or [])][:32]
+        timeout = max(1, min(int(timeout or 30), _MAX_RUN_SECONDS))
+        result = run_bounded(
+            interp + [str(path)] + args,
+            cwd=str(path.parent), timeout=timeout, max_output=_MAX_OUTPUT,
         )
+        if result.timed_out:
+            return f"Timed out after {timeout}s; the process tree was stopped."
         output = result.stdout.strip()
-        error  = result.stderr.strip()
-        parts  = []
+        error = result.stderr.strip()
+        parts = []
         if output: parts.append(f"Output:\n{output}")
-        if error:  parts.append(f"Stderr:\n{error}")
+        if error: parts.append(f"Stderr:\n{error}")
+        if result.returncode not in (0, None) and not error:
+            parts.append(f"Exit code: {result.returncode}")
         return "\n\n".join(parts) if parts else "Executed with no output."
-
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s."
     except FileNotFoundError:
         return f"Interpreter not found: {interp[0]}."
     except Exception as e:
@@ -342,6 +372,8 @@ Updated code:"""
         return f"Could not edit code: {e}"
 
     status = _save_file(Path(file_path), edited)
+    if status.startswith("Could not save"):
+        return status
     print(f"[Code] ✅ Edited: {file_path}")
     return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
 
@@ -377,8 +409,11 @@ Explanation:"""
 def _run_action(file_path, args, timeout, player) -> str:
     if not file_path:
         return "Please provide a file path to run, sir."
-    p = Path(file_path)
-    if not p.exists():
+    try:
+        p = _safe_user_path(file_path)
+    except (OSError, ValueError) as exc:
+        return f"Access denied: {exc}"
+    if not p.exists() or not p.is_file():
         return f"File not found: {file_path}"
     if player:
         player.write_log(f"[Code] Running {p.name}...")
@@ -427,6 +462,8 @@ Optimized code:"""
         save_path = _resolve_save_path(output_path, lang)
 
     status = _save_file(save_path, optimized)
+    if status.startswith("Could not save"):
+        return status
     print(f"[Code] ✅ Optimized: {save_path}")
 
     original_lines  = len(code.splitlines())
@@ -550,7 +587,10 @@ def code_helper(
     file_path   = p.get("file_path", "").strip()
     code        = p.get("code", "").strip()
     args        = p.get("args", [])
-    timeout     = int(p.get("timeout", 30))
+    try:
+        timeout = max(1, min(int(p.get("timeout", 30)), _MAX_RUN_SECONDS))
+    except (TypeError, ValueError):
+        timeout = 30
 
     if action == "auto":
         action = _detect_intent(description, file_path, code)
@@ -630,4 +670,7 @@ TOOL = {
         ]
     },
     "handler": code_helper,
+    "confirmation_actions": ["auto", "write", "edit", "run", "build", "optimize", "screen_debug"],
+    "requires_admin": True,
+    "timeout_seconds": 180,
 }

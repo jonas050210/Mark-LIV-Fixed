@@ -29,14 +29,18 @@ import importlib.util
 import inspect
 import re
 import sys
+import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+from core.action_result import ActionResult
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
-_CTX_KEYS = ("player", "speak", "response", "session_memory")
+_CTX_KEYS = ("player", "speak", "response", "session_memory", "cancel_event", "trusted")
 
 
 # A tool may declare that the model should NOT be held up waiting for it.
@@ -68,8 +72,13 @@ class ActionRecord:
     category: str = "computer"
     risk: str = "low"
     requires_confirmation: bool = False
+    # Some bundled actions contain both safe and irreversible operations.  A
+    # list lets the registry enforce confirmation for only the risky operation
+    # instead of making harmless volume/list commands ask every time.
+    confirmation_actions: tuple[str, ...] = ()
     requires_admin: bool = False
     undoable: bool = False
+    timeout_seconds: float = 60.0
 
 
 class ActionRegistry:
@@ -117,26 +126,149 @@ class ActionRegistry:
                 "category": rec.category,
                 "risk": rec.risk,
                 "requires_confirmation": rec.requires_confirmation,
+                "confirmation_actions": list(rec.confirmation_actions),
                 "requires_admin": rec.requires_admin,
                 "undoable": rec.undoable,
+                "timeout_seconds": rec.timeout_seconds,
             }
             for rec in records
         ]
 
+    def record(self, name: str) -> Optional[ActionRecord]:
+        return self._actions.get(name)
+
+    def timeout(self, name: str) -> float:
+        rec = self._actions.get(name)
+        return rec.timeout_seconds if rec else 60.0
+
+    def _needs_confirmation(self, rec: ActionRecord, parameters: dict) -> bool:
+        if rec.confirmation_actions:
+            operation = str((parameters or {}).get("action") or "").strip().casefold()
+            if not operation and parameters.get("task"):
+                operation = "task"
+            if not operation and rec.name == "game_updater":
+                operation = "update"
+            if rec.name == "game_updater" and bool(parameters.get("shutdown_when_done")):
+                return True
+            return operation in rec.confirmation_actions
+        return rec.requires_confirmation
+
+    def _confirmation_title(self, rec: ActionRecord, parameters: dict) -> tuple[str, str]:
+        operation = str((parameters or {}).get("action") or ("task" if parameters.get("task") else rec.name)).strip().replace("_", " ")
+        titles = {
+            "delete": ("Delete a file or folder", "The item will be moved to the Recycle Bin / Trash."),
+            "close": ("Close an application", "The application may contain unsaved work."),
+            "close app": ("Close the active application", "The application may contain unsaved work."),
+            "close window": ("Close the active window", "The window may contain unsaved work."),
+            "restart": ("Restart the computer", "The computer will restart after the confirmation."),
+            "shutdown": ("Shut down the computer", "The computer will power off after the confirmation."),
+            "toggle wifi": ("Change Wi-Fi state", "The network connection may be interrupted."),
+            "clean": ("Clean the desktop", "Desktop files will be moved into an archive folder."),
+            "organize": ("Organize the desktop", "Desktop files will be moved into category folders."),
+            "task": ("Run a generated desktop task", "Generated automation can interact with files or the desktop."),
+            "install": ("Install a game", "The game launcher will download and install files."),
+            "update": ("Update games", "The game launcher will download and change installed files."),
+            "schedule": ("Schedule game updates", "MARK LIV will create a recurring system task."),
+            "send_message": ("Send a message", "The message will be sent through the selected service."),
+            "code_helper": ("Run a code operation", "Code may be written to or executed from your home folder."),
+            "dev_agent": ("Build a project", "Files, dependencies, and generated code may be created and run."),
+        }
+        return titles.get(operation, (f"Run {rec.name}", f"MARK LIV is ready to run: {operation}."))
+
+    def _invoke(self, rec: ActionRecord, parameters: dict, ctx: dict) -> ActionResult:
+        value = _call_handler(rec.handler, parameters, ctx)
+        return ActionResult.from_handler(rec.name, value)
+
+    def _invoke_bounded(self, rec: ActionRecord, parameters: dict, ctx: dict) -> ActionResult:
+        """Bound legacy Python handlers without pretending threads are killable.
+
+        The daemon worker prevents a stuck legacy library from blocking JARVIS;
+        actions that launch child processes use ``core.process_runner`` to kill
+        their entire child process group as well.  The cancellation event is
+        available to newly written actions for cooperative cancellation.
+        """
+        done = threading.Event()
+        box: dict[str, object] = {}
+        cancel = threading.Event()
+        call_ctx = {**ctx, "cancel_event": cancel}
+
+        def _worker() -> None:
+            try:
+                box["result"] = self._invoke(rec, parameters, call_ctx)
+            except Exception as exc:  # keep the action worker from escaping
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True, name=f"action-{rec.name}").start()
+        if not done.wait(rec.timeout_seconds):
+            cancel.set()
+            return ActionResult.failure(
+                rec.name,
+                f"Action '{rec.name}' exceeded its {rec.timeout_seconds:.0f}-second time limit.",
+                status="timed_out",
+            )
+        if "error" in box:
+            raise box["error"]  # type: ignore[misc]
+        return box["result"]  # type: ignore[return-value]
+
     # -- called by main.py from _execute_tool --
-    def run(self, name: str, parameters: dict, ctx: dict | None = None) -> str:
+    def execute(self, name: str, parameters: dict, ctx: dict | None = None) -> ActionResult:
+        """Apply registry policy and execute one action.
+
+        The handler compatibility layer still accepts plain strings, but every
+        path through the registry now has one status vocabulary and one place
+        for confirmation/admin policy.  The returned object is deliberately
+        JSON-safe for the dashboard and easily converted to the old tool text.
+        """
+        started = time.monotonic()
+        ctx = dict(ctx or {})
+        parameters = dict(parameters or {})
         rec = self._actions.get(name)
         if rec is None or not rec.valid:
-            return f"Action '{name}' is not available."
+            return ActionResult.failure(name, f"Action '{name}' is not available.", status="unavailable")
+        if rec.requires_admin and not bool(ctx.get("trusted", False)):
+            return ActionResult.failure(name, "This action is restricted to an authenticated local control session.", status="forbidden")
+
+        if self._needs_confirmation(rec, parameters) and not bool(ctx.get("confirmation_bypass", False)):
+            try:
+                from core import confirm
+                if confirm.pending_title():
+                    return ActionResult.failure(name, "There is already a confirmation waiting on screen. Ask the user to answer that one first.", status="confirmation_pending")
+                title, detail = self._confirmation_title(rec, parameters)
+                def _confirmed() -> str:
+                    try:
+                        result = self._invoke_bounded(rec, parameters, {**ctx, "confirmation_bypass": True})
+                        self._logger(f"Action '{name}' confirmed: {result.as_text()[:160]}")
+                        return result.as_text()
+                    except Exception as exc:  # pragma: no cover - worker safety net
+                        self._logger(f"Action '{name}' failed after confirmation: {exc}")
+                        return f"Tool '{name}' failed: {exc}"
+                message = confirm.request(name, title, detail, _confirmed)
+                return ActionResult(name, False, "confirmation_pending", message,
+                                    duration_ms=int((time.monotonic() - started) * 1000))
+            except Exception as exc:
+                return ActionResult.failure(name, f"Confirmation could not be requested: {exc}. Nothing was done.", error=str(exc), status="confirmation_failed")
+
         try:
-            return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
-        except Exception as e:
-            self._logger(f"Action '{name}' crashed during run(): {e}")
+            result = self._invoke_bounded(rec, parameters, ctx)
+            return ActionResult(
+                action=result.action, ok=result.ok, status=result.status,
+                message=result.message,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                data=result.data, error=result.error,
+            )
+        except Exception as exc:
+            self._logger(f"Action '{name}' crashed during execute(): {exc}")
             traceback.print_exc()
-            return f"Tool '{name}' failed: {e}"
+            return ActionResult.failure(name, f"Tool '{name}' failed: {exc}", error=str(exc))
+
+    def run(self, name: str, parameters: dict, ctx: dict | None = None) -> str:
+        """Compatibility wrapper for older callers and plugins."""
+        return self.execute(name, parameters, ctx).as_text()
 
 
-def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
+def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> Any:
     """Invoke the handler passing only the context kwargs it actually declares
     (or all of them if it has **kwargs), so each action's existing signature
     works unchanged."""
@@ -176,12 +308,23 @@ def _validate(module, filename: str) -> ActionRecord:
         return ActionRecord(name=name, file=filename,
                             error="TOOL['handler'] missing or not callable.")
 
-    inferred_confirmation = name in {
-        "send_message", "file_controller", "file_processor", "dev_agent",
-        "code_helper", "game_updater", "computer_settings", "window_manager",
-    }
+    # Confirmation is explicit policy, not a model-supplied ``confirmed``
+    # parameter.  Keep only genuinely high-impact defaults here; actions that
+    # combine safe and destructive operations declare ``confirmation_actions``
+    # in their TOOL metadata below.
+    inferred_confirmation = name in {"send_message", "dev_agent", "code_helper"}
     inferred_admin = name in {"computer_settings", "desktop_control", "dev_agent"}
-    risk = str(tool.get("risk") or ("high" if inferred_confirmation else "low"))
+    raw_confirm_actions = tool.get("confirmation_actions", ())
+    if isinstance(raw_confirm_actions, str):
+        raw_confirm_actions = (raw_confirm_actions,)
+    if not isinstance(raw_confirm_actions, (list, tuple, set)):
+        raw_confirm_actions = ()
+    confirm_actions = tuple(str(v).strip().casefold() for v in raw_confirm_actions if str(v).strip())
+    try:
+        timeout_seconds = max(1.0, min(float(tool.get("timeout_seconds", 60.0)), 900.0))
+    except (TypeError, ValueError):
+        timeout_seconds = 60.0
+    risk = str(tool.get("risk") or ("high" if inferred_confirmation or confirm_actions else "low"))
     return ActionRecord(name=name, description=description.strip(), parameters=parameters,
                         handler=handler, file=filename, valid=True, error="",
                         behavior=_opt_upper(tool.get("behavior"), _BEHAVIORS),
@@ -189,8 +332,10 @@ def _validate(module, filename: str) -> ActionRecord:
                         category=str(tool.get("category") or "computer"),
                         risk=risk,
                         requires_confirmation=bool(tool.get("requires_confirmation", inferred_confirmation)),
+                        confirmation_actions=confirm_actions,
                         requires_admin=bool(tool.get("requires_admin", inferred_admin)),
-                        undoable=bool(tool.get("undoable", False)))
+                        undoable=bool(tool.get("undoable", False)),
+                        timeout_seconds=timeout_seconds)
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,

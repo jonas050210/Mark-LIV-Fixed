@@ -35,4 +35,12 @@ The phone dashboard's **CONTROL** panel uses the same action registry as voice c
 
 Audio can also be controlled by voice: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device.
 
+## Action safety and reliability
+
+All discovered actions now pass through one registry contract. Results have explicit `succeeded`, `failed`, `forbidden`, `confirmation_pending`, `unavailable`, and `timed_out` states; handlers keep their old string API only at the Gemini boundary. The registry also owns per-action deadlines, trusted/admin checks, confirmation metadata, and the dashboard capability manifest.
+
+High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface, and is used for app/PC closing, file deletion, desktop changes, generated code, project builds, game installs/updates, messaging, and other declared risky operations. Reversible settings continue to use the shared undo stack.
+
+Generated desktop snippets run in a bounded child interpreter with an AST allowlist, no imports, no shell/registry/process access, and only restricted Desktop-folder path wrappers. Code-helper and dev-agent execution uses bounded process groups, home/project path restrictions, no shell interpolation, and an isolated project virtual environment for dependencies. A timeout stops child process trees where the platform supports it.
+
 Your API keys and runtime memory are intentionally ignored by Git. Never commit `config/api_keys.json` or personal data from `memory/`.

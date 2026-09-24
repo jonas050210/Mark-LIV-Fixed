@@ -21,7 +21,6 @@ try:
 except ImportError:
     _PYPERCLIP = False
 
-from core import confirm
 from core.undo import push_undo
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -196,13 +195,11 @@ def brightness_up():
                 capture_output=True).returncode == 0:
             subprocess.run(["brightnessctl", "set", "+10%"], capture_output=True)
         else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(min(1.0,b+0.1))")',
-                shell=True, capture_output=True
-            )
+            # Never fall back to a shell pipeline containing model-controlled
+            # input.  xbacklight is optional; if it is absent, report no change
+            # rather than executing a command string.
+            if subprocess.run(["which", "xbacklight"], capture_output=True).returncode == 0:
+                subprocess.run(["xbacklight", "-inc", "10"], capture_output=True, timeout=5)
     else:
         try:
             subprocess.run(
@@ -225,13 +222,8 @@ def brightness_down():
                 capture_output=True).returncode == 0:
             subprocess.run(["brightnessctl", "set", "10%-"], capture_output=True)
         else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(max(0.1,b-0.1))")',
-                shell=True, capture_output=True
-            )
+            if subprocess.run(["which", "xbacklight"], capture_output=True).returncode == 0:
+                subprocess.run(["xbacklight", "-dec", "10"], capture_output=True, timeout=5)
     else:
         try:
             subprocess.run(
@@ -833,23 +825,9 @@ def computer_settings(
     if player:
         player.write_log(f"[Settings] {action}")
 
-    # ── The gate ─────────────────────────────────────────────────────────────
-    # A human presses a button, or this does not happen. The model can no longer
-    # write its own permission slip, and the action itself is handed to the UI
-    # rather than performed here — so returning early is not "declining", it is
-    # "parked until someone says yes".
-    if action in _IRREVERSIBLE:
-        title, detail = _IRREVERSIBLE[action]
-        func = ACTION_MAP.get(action)
-        if func is None:
-            return f"Unknown action: '{raw_action}'."
-        if confirm.pending_title():
-            return ("There is already a confirmation waiting on screen. "
-                    "Ask the user to answer that one first.")
-        return confirm.request(
-            key=action, title=title, detail=detail,
-            run=lambda f=func, a=action: (f(), f"{a} done.")[1],
-        )
+    # Irreversible operations are parked by the central action registry before
+    # this legacy dispatcher is called.  This keeps confirmation policy out of
+    # the model-facing parameters and gives every caller the same gate.
 
     if action == "volume_set":
         try:
@@ -990,4 +968,6 @@ TOOL = {
         "required": []
     },
     "handler": computer_settings,
+    "confirmation_actions": ["close_app", "close_window", "restart", "shutdown", "toggle_wifi"],
+    "undoable": True,
 }

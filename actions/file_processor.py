@@ -28,6 +28,21 @@ from datetime import datetime
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
 
+_MAX_INPUT_BYTES = 500 * 1024 * 1024
+
+
+def _safe_input_path(raw: str) -> Path:
+    candidate = Path(raw).expanduser().resolve()
+    home = Path.home().resolve()
+    if candidate != home and home not in candidate.parents:
+        raise PermissionError("file processing is limited to files under the user's home directory")
+    if not candidate.is_file():
+        raise FileNotFoundError(raw)
+    if candidate.stat().st_size > _MAX_INPUT_BYTES:
+        raise ValueError("file is larger than the 500 MB processing limit")
+    return candidate
+
+
 def _get_api_key() -> str:
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
     with open(config_path, "r", encoding="utf-8") as f:
@@ -786,11 +801,12 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     if not file_path_str:
         return "No file path provided."
 
-    path = Path(file_path_str)
-    if not path.exists():
+    try:
+        path = _safe_input_path(file_path_str)
+    except FileNotFoundError:
         return f"File not found: {file_path_str}"
-    if not path.is_file():
-        return f"Path is not a file: {file_path_str}"
+    except (PermissionError, ValueError) as exc:
+        return f"Access denied: {exc}"
 
     file_type   = _detect_type(path)
     action      = (parameters.get("action") or "").lower().strip()
@@ -920,4 +936,6 @@ TOOL = {
         "required": []
     },
     "handler": file_processor,
+    "confirmation_actions": ["run", "extract"],
+    "timeout_seconds": 180,
 }

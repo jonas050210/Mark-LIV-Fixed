@@ -82,10 +82,11 @@ def _launch_windows(app_name: str) -> bool:
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [app_name],
+                shell=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                close_fds=(_SYSTEM != "Windows"),
             )
             time.sleep(1.5)
             return True
@@ -93,8 +94,10 @@ def _launch_windows(app_name: str) -> bool:
             print(f"[open_app] subprocess failed: {e}")
 
     if ":" in app_name:
+        # URI launch without a shell: never interpolate model text into cmd.exe.
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            import os
+            os.startfile(app_name)  # type: ignore[attr-defined]
             time.sleep(1.0)
             return True
         except Exception:
@@ -247,6 +250,8 @@ def open_app(
 
     if not app_name:
         return "No application name provided."
+    if len(app_name) > 160 or any(ord(ch) < 32 for ch in app_name):
+        return "That application name is invalid or too long."
 
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:

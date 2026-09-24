@@ -82,7 +82,11 @@ def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
     """Decrypt base64(IV[16] ‖ ciphertext) with AES-256-CBC + PKCS7."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as sym_pad
-    raw      = base64.b64decode(enc_b64)
+    if not isinstance(enc_b64, str) or len(enc_b64) > 2_000_000:
+        raise ValueError("encrypted payload is too large")
+    raw      = base64.b64decode(enc_b64, validate=True)
+    if len(raw) < 32 or len(raw[16:]) % 16:
+        raise ValueError("invalid encrypted payload")
     iv, ct   = raw[:16], raw[16:]
     dec      = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
     padded   = dec.update(ct) + dec.finalize()
@@ -773,9 +777,17 @@ class DashboardServer:
         # ── File sharing ──────────────────────────────────────────────────────
 
         def _safe_filename(raw: str) -> str:
-            name = Path(raw).name                          # strip path components
+            name = Path(str(raw)).name                    # strip path components
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
             return name or "upload"
+
+        def _safe_upload_path(raw: str) -> tuple[str, Path]:
+            safe = _safe_filename(raw)
+            root = self._uploads_dir.resolve()
+            path = (root / safe).resolve()
+            if path.parent != root:
+                raise ValueError("invalid upload path")
+            return safe, path
 
         if _UPLOAD_OK:
             @app.post("/api/upload")
@@ -783,12 +795,14 @@ class DashboardServer:
                 if not _auth(req):
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-                safe = _safe_filename(file.filename or "upload")
-                dest = self._uploads_dir / safe
+                try:
+                    safe, dest = _safe_upload_path(file.filename or "upload")
+                except ValueError:
+                    return JSONResponse({"error": "Invalid filename"}, status_code=400)
                 stem, suffix = Path(safe).stem, Path(safe).suffix
                 counter = 1
-                while dest.exists():
-                    dest = self._uploads_dir / f"{stem}_{counter}{suffix}"
+                while dest.exists() or dest.is_symlink():
+                    safe, dest = _safe_upload_path(f"{stem}_{counter}{suffix}")
                     counter += 1
 
                 size = 0
@@ -852,9 +866,12 @@ class DashboardServer:
             tok = token.strip()
             if not tok or tok not in self._tokens:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            safe = re.sub(r'[/\\]', '', filename)
-            path = self._uploads_dir / safe
-            if not path.exists() or not path.is_file():
+            try:
+                safe, path = _safe_upload_path(filename)
+            except ValueError:
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            root = self._uploads_dir.resolve()
+            if path.parent != root or path.is_symlink() or not path.exists() or not path.is_file():
                 return JSONResponse({"error": "Not found"}, status_code=404)
             return FileResponse(str(path), filename=safe)
 

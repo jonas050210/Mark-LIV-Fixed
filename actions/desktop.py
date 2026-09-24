@@ -9,11 +9,7 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+from core.sandbox import UnsafeCode, run_generated_code
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -35,70 +31,32 @@ def _get_desktop() -> Path:
             return Path(xdg)
     return Path.home() / "Desktop"
 
-def _build_sandbox() -> dict:
-    import time
-
-    safe_builtins = {
-        "print": print,
-        "len": len, "str": str, "int": int, "float": float,
-        "bool": bool, "list": list, "dict": dict, "tuple": tuple,
-        "range": range, "enumerate": enumerate, "sorted": sorted,
-        "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
-        "max": max, "min": min, "sum": sum, "abs": abs,
-        "zip": zip, "map": map, "filter": filter,
-    }
-
-    sandbox = {
-        "__builtins__": safe_builtins,
-        "Path": Path,
-        "time": time,
-        "shutil": type("shutil", (), {
-            "copy2":      shutil.copy2,
-            "copytree":   shutil.copytree,
-            "disk_usage": shutil.disk_usage,
-        })(),
-        "os_path": os.path,  
-    }
-
-    if _PYAUTOGUI:
-        sandbox["pyautogui"] = pyautogui
-
-    if _OS == "Windows":
-        try:
-            import ctypes
-            import winreg
-            sandbox["ctypes"] = ctypes
-            sandbox["winreg"] = type("winreg", (), {
-                # Sadece okuma
-                "OpenKey":      winreg.OpenKey,
-                "QueryValueEx": winreg.QueryValueEx,
-                "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
-            })()
-        except ImportError:
-            pass
-
-    return sandbox
-
-
 def _execute_generated_code(code: str, player=None) -> str:
+    """Run generated desktop code in a bounded, deny-by-default child.
+
+    The old in-process dictionary sandbox exposed real ``Path``, ``ctypes`` and
+    registry objects.  Python objects can walk back to the interpreter from
+    those references, so that was isolation in name only.  The new runner has
+    no imports, no real filesystem classes, an AST allowlist, and a process
+    boundary with a hard timeout.  It intentionally refuses UI automation and
+    arbitrary writes; those belong in purpose-built actions.
+    """
     if not code or code.strip() == "UNSAFE":
         return "This action cannot be performed safely."
-
-    # Kod temizleme
     if code.startswith("```"):
         lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
+        code = "\n".join(lines[1:-1]).strip()
     try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+        root = _get_desktop()
+        if not root.exists() or not root.is_dir():
+            return "The Desktop folder does not exist on this system."
+        return run_generated_code(code, root=root, timeout=15)
+    except UnsafeCode as exc:
+        print(f"[Desktop] Generated code rejected: {exc}")
+        return f"This desktop task was refused by the safety policy: {exc}"
+    except Exception as exc:
+        print(f"[Desktop] Generated code failed: {exc}")
+        return f"Execution error: {exc}"
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
@@ -107,33 +65,24 @@ def _ask_gemini_for_desktop_action(task: str) -> str:
 
     desktop = str(_get_desktop())
 
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-
     prompt = f"""You are a desktop automation assistant.
 Current OS: {_OS}
 Desktop path: {desktop}
 
 Generate safe Python code to accomplish the task below.
-Allowed modules ONLY:
-- pyautogui (mouse, keyboard — if needed)
-- pathlib.Path (file/folder inspection only, no deletion)
-- shutil.copy2, shutil.copytree, shutil.disk_usage (NO move, NO rmtree)
-- os_path (os.path equivalent, read-only)
+Allowed objects ONLY (pre-injected; imports are forbidden):
+- Path (a restricted path wrapper rooted under the Desktop folder; inspection only)
+- shutil.copy2, shutil.copytree, shutil.disk_usage (copy destinations must stay under Desktop)
+- os_path (read-only path queries)
 - time.sleep
-{os_specific}
 
 Hard rules:
+- NO mouse, keyboard, registry, shell, network, or process control
 - NO file deletion (no unlink, no rmtree, no remove)
 - NO subprocess calls
 - NO exec() or eval() inside the code
-- NO import statements (modules are pre-injected)
-- NO file write operations except explicitly requested
+- NO import statements
+- NO file write operations except the explicitly allowlisted copy helpers
 - If task cannot be done safely with these tools, output exactly: UNSAFE
 
 Output ONLY the Python code. No explanation, no markdown, no backticks.
@@ -485,7 +434,7 @@ def desktop_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "desktop_control",
-    "description": "Controls the desktop: wallpaper, organize, clean, list, stats.",
+    "description": "Controls the desktop: wallpaper, organize, clean, list, stats, or a confirmed restricted inspection/copy task. Generated tasks cannot use the shell, registry, network, or arbitrary code.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -515,4 +464,7 @@ TOOL = {
         ]
     },
     "handler": desktop_control,
+    "confirmation_actions": ["wallpaper", "wallpaper_url", "organize", "clean", "task"],
+    "requires_admin": True,
+    "timeout_seconds": 45,
 }
