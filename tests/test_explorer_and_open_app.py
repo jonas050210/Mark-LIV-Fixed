@@ -37,6 +37,18 @@ class ExplorerTests(unittest.TestCase):
             self.assertIn("2. " + str(second), result)
             self.assertIn("exact path", result)
 
+    def test_windows_file_selection_uses_argument_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "report.pdf"
+            target.write_text("report", encoding="utf-8")
+            with patch.object(explorer, "_OS", "Windows"), \
+                 patch.object(explorer.subprocess, "Popen") as popen:
+                result = explorer.open_in_explorer(target, select=True)
+        self.assertIn("selected report.pdf", result)
+        popen.assert_called_once_with(
+            ["explorer.exe", f"/select,{target}"], creationflags=0
+        )
+
 
 class FileControllerTests(unittest.TestCase):
     def test_file_search_defaults_to_home_not_desktop(self) -> None:
@@ -85,6 +97,15 @@ class OpenAppTests(unittest.TestCase):
             handle=202, title="Roblox", process="RobloxPlayerBeta.exe", pid=22,
             left=0, top=0, right=800, bottom=600,
         )
+
+    def test_window_matching_uses_process_name_when_title_is_unhelpful(self) -> None:
+        process_window = WindowInfo(
+            handle=303, title="Game session", process="RobloxPlayerBeta.exe", pid=33,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch("core.window_manager.list_windows", return_value=[process_window]):
+            matches = open_app._matching_windows("Roblox", "RobloxPlayerBeta.exe")
+        self.assertEqual(matches, [process_window])
 
     def test_normal_open_focuses_existing_window_without_launching(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[self.window]), \
