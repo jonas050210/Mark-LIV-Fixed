@@ -44,6 +44,8 @@ BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
+LOGIN_ATTEMPT_WINDOW = 300.0
+MAX_LOGIN_ATTEMPTS = 10
 
 
 def _make_uploads_dir() -> Path:
@@ -509,6 +511,7 @@ class DashboardServer:
         self._capabilities_callback       = None
         self._desktop_callback            = None
         self._pending_keys: dict[str, float] = {}
+        self._login_attempts: dict[str, list[float]] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
@@ -524,6 +527,35 @@ class DashboardServer:
         key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
         self._pending_keys[key] = now + expiry_secs
         return key
+
+    def _login_identity(self, req) -> str:
+        """Use the peer address for the short-lived PIN rate limit."""
+        client = getattr(req, "client", None)
+        host = getattr(client, "host", None)
+        return str(host or "unknown")[:128]
+
+    def _allow_login_attempt(self, identity: str) -> bool:
+        now = time.time()
+        recent = [
+            stamp for stamp in self._login_attempts.get(identity, [])
+            if now - stamp < LOGIN_ATTEMPT_WINDOW
+        ]
+        if len(recent) >= MAX_LOGIN_ATTEMPTS:
+            self._login_attempts[identity] = recent
+            return False
+        recent.append(now)
+        self._login_attempts[identity] = recent
+        # Keep this bounded even when many clients probe the login endpoint.
+        if len(self._login_attempts) > 256:
+            cutoff = now - LOGIN_ATTEMPT_WINDOW
+            self._login_attempts = {
+                key: values for key, values in self._login_attempts.items()
+                if values and values[-1] >= cutoff
+            }
+        return True
+
+    def _reset_login_attempts(self, identity: str) -> None:
+        self._login_attempts.pop(identity, None)
 
     @staticmethod
     def _ssl_enabled() -> bool:
@@ -618,10 +650,21 @@ class DashboardServer:
 
         @app.post("/login")
         async def login(req: Request):
-            body    = await req.json()
-            entered = str(body.get("pin", "")).strip().upper()
+            identity = self._login_identity(req)
+            if not self._allow_login_attempt(identity):
+                return JSONResponse(
+                    {"ok": False, "error": "Too many login attempts. Try again later."},
+                    status_code=429,
+                    headers={"Retry-After": str(int(LOGIN_ATTEMPT_WINDOW))},
+                )
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid login request"}, status_code=400)
+            entered = str(body.get("pin", "")).strip().upper()[:32]
             now     = time.time()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
+                self._reset_login_attempts(identity)
                 del self._pending_keys[entered]          # one-time use
                 tok = secrets.token_urlsafe(32)
                 self._tokens.add(tok)
@@ -638,10 +681,17 @@ class DashboardServer:
                                 status_code=401)
 
         @app.get("/auto-login")
-        async def auto_login(key: str = ""):
+        async def auto_login(req: Request, key: str = ""):
             """QR code target — validates one-time key, creates session, redirects phone."""
+            identity = self._login_identity(req)
+            if not self._allow_login_attempt(identity):
+                return JSONResponse(
+                    {"ok": False, "error": "Too many login attempts. Try again later."},
+                    status_code=429,
+                    headers={"Retry-After": str(int(LOGIN_ATTEMPT_WINDOW))},
+                )
             now = time.time()
-            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+            if not key or len(key) > 32 or key not in self._pending_keys or self._pending_keys[key] <= now:
                 return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -653,6 +703,7 @@ class DashboardServer:
 <p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
 </div></body></html>""")
 
+            self._reset_login_attempts(identity)
             del self._pending_keys[key]
             tok     = secrets.token_urlsafe(32)
             dev_tok = secrets.token_urlsafe(32)
