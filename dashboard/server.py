@@ -20,6 +20,7 @@ from pathlib import Path
 
 from core.action_runtime import runtime as action_runtime
 from core import undo as undo_stack
+from core import confirm as confirm_gate
 
 _DEPS_OK = False
 try:
@@ -742,6 +743,10 @@ class DashboardServer:
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             cancelled = action_runtime.cancel(action_id)
+            if cancelled:
+                # If this run is waiting on the shared confirmation banner,
+                # cancelling its dashboard card must also dismiss that banner.
+                confirm_gate.resolve(False)
             return JSONResponse({"ok": cancelled, "action_id": action_id},
                                 status_code=200 if cancelled else 404)
 

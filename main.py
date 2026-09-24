@@ -1236,9 +1236,14 @@ class JarvisLive:
             response = await self._execute_tool_impl(fc)
             payload = getattr(response, "response", {}) or {}
             message = str(payload.get("result", "Completed"))
-            ok = not any(token in message.casefold() for token in
-                         ("failed", "unavailable", "cancelled", "could not", "unknown tool"))
-            action_runtime.finish(action_id, ok=ok, message=message)
+            pending = payload.get("status") == "confirmation_pending" or "[CONFIRMATION_PENDING]" in message
+            if pending:
+                action_runtime.update(action_id, status="confirmation_pending", progress=25,
+                                      message="Waiting for confirmation")
+            else:
+                ok = not any(token in message.casefold() for token in
+                             ("failed", "unavailable", "cancelled", "could not", "unknown tool"))
+                action_runtime.finish(action_id, ok=ok, message=message)
             return response
         except asyncio.CancelledError:
             action_runtime.cancel(action_id)
@@ -1280,6 +1285,7 @@ class JarvisLive:
 
         loop   = asyncio.get_event_loop()
         result = "Done."
+        _result_status = ""
 
         try:
             if name == "recall_memory":
@@ -1465,6 +1471,7 @@ class JarvisLive:
                         timeout=_action_timeout,
                     )
                     r = structured.as_text()
+                    _result_status = structured.status
                 except asyncio.TimeoutError:
                     r = (f"Action '{name}' exceeded its {_action_timeout:.0f}-second "
                          "time limit. It was stopped from the conversation; check "
@@ -1527,9 +1534,12 @@ class JarvisLive:
         _sched = (self._action_registry.scheduling(name)
                   or self._plugin_registry.scheduling(name))
         _extra = {"scheduling": _sched} if _sched else {}
+        _response = {"result": result}
+        if _result_status:
+            _response["status"] = _result_status
         return types.FunctionResponse(
             id=fc.id, name=name,
-            response={"result": result},
+            response=_response,
             **_extra
         )
 
