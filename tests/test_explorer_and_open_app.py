@@ -58,6 +58,22 @@ class FileControllerTests(unittest.TestCase):
         self.assertIn("exact path", result)
         open_in_explorer.assert_not_called()
 
+    def test_explorer_candidate_number_can_select_a_reported_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "one" / "notes.txt"
+            second = root / "two" / "notes.txt"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_text("one", encoding="utf-8")
+            second.write_text("two", encoding="utf-8")
+            with patch.object(explorer, "open_in_explorer", return_value="selected") as open_in_explorer:
+                result = file_controller.open_explorer(
+                    str(root), "notes.txt", select=True, match_index=2
+                )
+        self.assertEqual(result, "selected")
+        open_in_explorer.assert_called_once_with(second, select=True)
+
 
 class OpenAppTests(unittest.TestCase):
     def setUp(self) -> None:

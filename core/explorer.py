@@ -214,6 +214,10 @@ def search(query: str, root: str | Path = "home", extension: str = "",
                 seen.add(str(path).casefold())
             if len(results) >= limit:
                 break
+    # Everything and os.walk do not necessarily return the same order. Keep
+    # candidate numbering stable so a follow-up such as "open candidate 2"
+    # refers to the same file after the search is repeated.
+    results.sort(key=lambda path: (-_score(path, query)[0], str(path).casefold()))
     return results[:limit]
 
 

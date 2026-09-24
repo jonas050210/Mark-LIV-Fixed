@@ -615,7 +615,12 @@ def get_file_info(path: str, name: str = "") -> str:
     except Exception as e:
         return f"Could not get file info: {e}"
 
-def open_explorer(path: str = "home", name: str = "", select: bool = False) -> str:
+def open_explorer(
+    path: str = "home",
+    name: str = "",
+    select: bool = False,
+    match_index: int | None = None,
+) -> str:
     target = explorer.resolve_location(path)
     if name:
         candidate = target / name
@@ -623,9 +628,14 @@ def open_explorer(path: str = "home", name: str = "", select: bool = False) -> s
             target = candidate
         else:
             matches = explorer.search(name, root=target, limit=20)
-            if len(matches) != 1:
+            if match_index is not None:
+                if not 1 <= match_index <= len(matches):
+                    return f"Choose a candidate number between 1 and {len(matches)}."
+                target = matches[match_index - 1]
+            elif len(matches) != 1:
                 return explorer.format_matches(matches, name)
-            target = matches[0]
+            else:
+                target = matches[0]
     try:
         return explorer.open_in_explorer(target, select=select)
     except FileNotFoundError:
@@ -644,16 +654,22 @@ def file_controller(
     action = params.get("action", "").lower().strip()
     path   = params.get("path") or ("home" if action == "find" else "desktop")
     name   = params.get("name", "")
+    match_index = params.get("match_index")
+    if match_index is not None:
+        try:
+            match_index = int(match_index)
+        except (TypeError, ValueError):
+            return "The Explorer candidate number must be an integer."
 
     if player:
         player.write_log(f"[file] {action} {name or path}")
 
     try:
         if action in {"open", "open_folder", "explorer"}:
-            return open_explorer(path, name=name, select=False)
+            return open_explorer(path, name=name, select=False, match_index=match_index)
 
         elif action in {"select", "show_in_explorer", "reveal"}:
-            return open_explorer(path, name=name, select=True)
+            return open_explorer(path, name=name, select=True, match_index=match_index)
 
         elif action == "list":
             return list_files(path)
@@ -762,6 +778,10 @@ TOOL = {
             "max_results": {
                 "type": "INTEGER",
                 "description": "Maximum number of search candidates (1-50)"
+            },
+            "match_index": {
+                "type": "INTEGER",
+                "description": "1-based candidate number to open or select after a search returned multiple matches"
             }
         },
         "required": [
