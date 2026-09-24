@@ -165,6 +165,16 @@
     .action-run-main small { display:block; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .action-run progress { width:55px; height:6px; }
     .cancel-btn { color:#fbbf24; padding:4px 6px; }
+    .explorer-form { display:grid; grid-template-columns:1fr 1.5fr .8fr auto; gap:5px; margin-bottom:7px; }
+    .explorer-form input, .explorer-form select { min-width:0; background:#07090f; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px; outline:none; font-size:10px; }
+    .explorer-form button, .explorer-result button { background:#101629; color:#b9c7e0; border:1px solid #293451; border-radius:6px; padding:6px 8px; font-size:9px; font-weight:700; cursor:pointer; }
+    .explorer-form button:hover, .explorer-result button:hover { color:var(--accent); border-color:var(--accent); }
+    .explorer-result { border-top:1px solid var(--border); padding:7px 0; }
+    .explorer-result b { display:block; color:var(--text); font:600 10px monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .explorer-result small { display:block; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:2px 0 5px; }
+    .explorer-result-actions { display:flex; gap:5px; }
+    .explorer-result button { padding:4px 6px; }
+    @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } .explorer-form { grid-template-columns:1fr 1fr; } }
     @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } }
   </style>
 </head>
@@ -199,6 +209,15 @@
       </div>
       <div class="admin-card"><h3>LIVE ACTIONS <span id="action-summary"></span></h3><div id="live-actions">No active actions.</div><h3 style="margin-top:12px">UNDO HISTORY</h3><div id="undo-history">Loading…</div></div>
       <div class="admin-card"><h3>ACTIONS</h3><input id="action-filter" placeholder="Filter actions…" oninput="renderCapabilities()"><div id="capabilities">Loading…</div></div>
+      <div class="admin-card"><h3>FILE EXPLORER</h3>
+        <div class="explorer-form">
+          <select id="explorer-location" aria-label="Explorer location"><option value="home">HOME</option><option value="desktop">DESKTOP</option><option value="downloads">DOWNLOADS</option><option value="documents">DOCUMENTS</option><option value="pictures">PICTURES</option></select>
+          <input id="explorer-query" placeholder="Search filename…" aria-label="Search filename">
+          <input id="explorer-extension" placeholder=".pdf" aria-label="File extension">
+          <button onclick="searchExplorer()">SEARCH</button>
+        </div>
+        <div id="explorer-results">Search Home for a file.</div>
+      </div>
       <div class="admin-card"><h3>DESKTOP WINDOWS</h3><div id="window-tiles">Loading…</div><pre id="desktop-info" style="margin-top:8px"></pre></div>
     </div>
     <div class="admin-command"><input id="admin-command-input" placeholder="Command palette: open an app, move a named window, set audio…"><button onclick="sendAdminCommand()">RUN</button></div>
@@ -312,7 +331,9 @@
     }
 
     function esc(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return String(s ?? '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
     // ── File helpers ──────────────────────────────────────────────────────────
@@ -496,6 +517,70 @@
         document.getElementById('desktop-info').textContent = 'Admin data unavailable: ' + e;
       }
     }
+
+    async function searchExplorer() {
+      const query = document.getElementById('explorer-query').value.trim();
+      const extension = document.getElementById('explorer-extension').value.trim();
+      const location = document.getElementById('explorer-location').value;
+      const box = document.getElementById('explorer-results');
+      if (!query && !extension) {
+        box.textContent = 'Enter a filename or extension.';
+        return;
+      }
+      box.textContent = 'Searching…';
+      const params = new URLSearchParams({ query, extension, location, limit: '20' });
+      try {
+        const response = await _authFetch('/api/explorer/search?' + params.toString());
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          box.textContent = payload.error || 'Explorer search failed.';
+          return;
+        }
+        renderExplorerResults(payload.matches || []);
+      } catch (error) {
+        box.textContent = 'Explorer search unavailable: ' + error;
+      }
+    }
+
+    function renderExplorerResults(matches) {
+      const box = document.getElementById('explorer-results');
+      if (!matches.length) {
+        box.textContent = 'No matching files found.';
+        return;
+      }
+      box.innerHTML = matches.map((item, index) => {
+        const meta = item.is_file ? _fmtSize(item.size || 0) : 'folder';
+        return `<div class="explorer-result">
+          <b>${index + 1}. ${esc(item.name)}</b>
+          <small title="${esc(item.path)}">${esc(item.path)} · ${meta}</small>
+          <div class="explorer-result-actions">
+            <button data-path="${esc(item.path)}" onclick="explorerAction(this.dataset.path, false)">OPEN</button>
+            ${item.is_file ? `<button data-path="${esc(item.path)}" onclick="explorerAction(this.dataset.path, true)">SELECT</button>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    async function explorerAction(path, select) {
+      try {
+        const response = await _authFetch('/api/explorer/open', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path, select})
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (select ? 'Selected in Explorer' : 'Opened in Explorer') : (payload.error || 'Explorer operation failed'));
+      } catch (error) {
+        toast('Explorer operation unavailable: ' + error);
+      }
+    }
+
+    document.getElementById('explorer-query').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); searchExplorer(); }
+    });
+    document.getElementById('explorer-extension').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); searchExplorer(); }
+    });
 
     function renderUndo(items) {
       const box = document.getElementById('undo-history');

@@ -21,6 +21,7 @@ from pathlib import Path
 from core.action_runtime import runtime as action_runtime
 from core import undo as undo_stack
 from core import confirm as confirm_gate
+from core import explorer as explorer_core
 
 _DEPS_OK = False
 try:
@@ -459,6 +460,25 @@ def _read(name: str) -> str:
     return (STATIC_DIR / name).read_text(encoding="utf-8")
 
 
+def _explorer_row(path: Path) -> dict:
+    """Return a JSON-safe, read-only Explorer result row."""
+    try:
+        stat = path.stat()
+        size = int(stat.st_size) if path.is_file() else 0
+        modified = float(stat.st_mtime)
+    except OSError:
+        size = 0
+        modified = None
+    return {
+        "name": path.name or str(path),
+        "path": str(path),
+        "extension": path.suffix,
+        "is_file": path.is_file(),
+        "size": size,
+        "modified": modified,
+    }
+
+
 # ── DashboardServer ───────────────────────────────────────────────────────────
 
 class DashboardServer:
@@ -730,6 +750,65 @@ class DashboardServer:
                 return JSONResponse({"ok": True, **value})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @app.get("/api/explorer/search")
+        async def explorer_search(
+            req: Request,
+            query: str = "",
+            location: str = "home",
+            extension: str = "",
+            limit: int = 20,
+        ):
+            """Search known folders without modifying files."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            query = str(query or "").strip()[:240]
+            extension = str(extension or "").strip()[:32]
+            if not query and not extension:
+                return JSONResponse({"ok": False, "error": "Enter a filename or extension."}, status_code=400)
+            try:
+                matches = await asyncio.to_thread(
+                    explorer_core.search,
+                    query,
+                    root=str(location or "home")[:260],
+                    extension=extension,
+                    limit=max(1, min(int(limit), 50)),
+                )
+                return JSONResponse({
+                    "ok": True,
+                    "query": query,
+                    "location": str(location or "home"),
+                    "extension": extension,
+                    "matches": [_explorer_row(path) for path in matches],
+                })
+            except (TypeError, ValueError) as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Explorer search failed: {exc}"}, status_code=500)
+
+        @app.post("/api/explorer/open")
+        async def explorer_open(req: Request):
+            """Open or reveal one already-resolved filesystem path."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            raw_path = str(body.get("path") or "").strip()
+            if not raw_path or len(raw_path) > 400:
+                return JSONResponse({"ok": False, "error": "A valid path is required."}, status_code=400)
+            target = Path(raw_path).expanduser()
+            if not target.exists():
+                return JSONResponse({"ok": False, "error": f"Path not found: {target}"}, status_code=404)
+            try:
+                select = bool(body.get("select", False))
+                message = await asyncio.to_thread(
+                    explorer_core.open_in_explorer, target, select=select
+                )
+                return JSONResponse({"ok": True, "path": str(target), "select": select, "message": message})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Could not open Explorer: {exc}"}, status_code=500)
 
         @app.get("/api/actions")
         async def action_runs(req: Request):
