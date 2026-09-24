@@ -115,6 +115,15 @@ def _ensure_network_access(port: int) -> None:
     macOS   : osascript admin dialog if the Application Firewall is on.
     Linux   : pkexec GUI → sudo -n → prints manual command as fallback.
     """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        print(f"[Dashboard] Invalid firewall port: {port!r}")
+        return
+    if not 1 <= port <= 65_535:
+        print(f"[Dashboard] Firewall port out of range: {port}")
+        return
+
     import sys, subprocess, os, tempfile, threading
 
     # ── Windows ──────────────────────────────────────────────────────────────
@@ -123,7 +132,9 @@ def _ensure_network_access(port: int) -> None:
 
         port_rule = f"JARVIS Dashboard Port {port}"
         prog_rule  = "JARVIS Dashboard Python"
-        py_exe     = sys.executable
+        # Double quotes are escaped for the generated batch file. The path is
+        # still passed to subprocess without a Python shell.
+        py_exe     = str(sys.executable).replace('"', '""')
 
         def _netsh_rule_exists(name: str) -> bool:
             try:
@@ -191,8 +202,10 @@ def _ensure_network_access(port: int) -> None:
 
         # ── Try running directly (succeeds when already admin) ────────────────
         try:
+            comspec = os.environ.get("COMSPEC", "cmd.exe")
             r = subprocess.run(
-                [bat_path], capture_output=True, timeout=8, shell=True
+                [comspec, "/d", "/c", bat_path],
+                capture_output=True, timeout=8, shell=False,
             )
             if r.returncode == 0:
                 print(f"[Dashboard] Firewall configured for port {port}.")
