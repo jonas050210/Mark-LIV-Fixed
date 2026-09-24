@@ -45,6 +45,19 @@ class FileControllerTests(unittest.TestCase):
         self.assertEqual(result, "search result")
         self.assertEqual(find.call_args.kwargs["path"], "home")
 
+    def test_explorer_does_not_guess_between_duplicate_file_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in (root / "one", root / "two"):
+                folder.mkdir()
+                (folder / "notes.txt").write_text("notes", encoding="utf-8")
+            with patch.object(explorer, "open_in_explorer") as open_in_explorer:
+                result = file_controller.open_explorer(str(root), "notes.txt")
+        self.assertIn("1. ", result)
+        self.assertIn("2. ", result)
+        self.assertIn("exact path", result)
+        open_in_explorer.assert_not_called()
+
 
 class OpenAppTests(unittest.TestCase):
     def setUp(self) -> None:

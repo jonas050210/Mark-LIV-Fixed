@@ -642,7 +642,7 @@ def file_controller(
 ) -> str:
     params = parameters or {}
     action = params.get("action", "").lower().strip()
-    path   = params.get("path", "desktop")
+    path   = params.get("path") or ("home" if action == "find" else "desktop")
     name   = params.get("name", "")
 
     if player:
