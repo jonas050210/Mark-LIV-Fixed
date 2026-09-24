@@ -11,6 +11,7 @@ except ImportError:
     _SEND2TRASH = False
 
 from core.undo import push_undo
+from core import explorer
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -453,41 +454,10 @@ def write_file(path: str, name: str = "", content: str = "",
 def find_files(name: str = "", extension: str = "",
                path: str = "home", max_results: int = 20) -> str:
     try:
-        search_path = _resolve_path(path)
-        if not _is_safe_path(search_path):
-            return f"Access denied: {search_path}"
-        if not search_path.exists():
-            return f"Search path not found: {path}"
-
-        results    = []
-        dir_count  = 0
-        max_dirs   = 500  # performance + safety limit
-
-        for item in search_path.rglob("*"):
-            if item.is_dir():
-                dir_count += 1
-                if dir_count > max_dirs:
-                    break
-                continue
-            if not item.is_file():
-                continue
-            if extension and item.suffix.lower() != extension.lower():
-                continue
-            if name and name.lower() not in item.name.lower():
-                continue
-            size = _format_size(item.stat().st_size)
-            results.append(f"📄 {item.name} ({size}) — {item.parent}")
-            if len(results) >= max_results:
-                break
-
-        if not results:
-            query = name or extension or "files"
-            return f"No {query} found in {search_path.name}/"
-
-        return f"Found {len(results)} file(s):\n" + "\n".join(results)
-
-    except Exception as e:
-        return f"Search error: {e}"
+        matches = explorer.search(name, root=path, extension=extension, limit=max_results)
+        return explorer.format_matches(matches, name or extension or "files")
+    except Exception as exc:
+        return f"Search error: {exc}"
 
 
 def get_largest_files(path: str = "downloads", count: int = 10) -> str:
@@ -645,6 +615,25 @@ def get_file_info(path: str, name: str = "") -> str:
     except Exception as e:
         return f"Could not get file info: {e}"
 
+def open_explorer(path: str = "home", name: str = "", select: bool = False) -> str:
+    target = explorer.resolve_location(path)
+    if name:
+        candidate = target / name
+        if candidate.exists():
+            target = candidate
+        else:
+            matches = explorer.search(name, root=target, limit=20)
+            if len(matches) != 1:
+                return explorer.format_matches(matches, name)
+            target = matches[0]
+    try:
+        return explorer.open_in_explorer(target, select=select)
+    except FileNotFoundError:
+        return f"Explorer is not available on this operating system."
+    except Exception as exc:
+        return f"Could not open Explorer: {exc}"
+
+
 def file_controller(
     parameters: dict = None,
     response=None,
@@ -660,7 +649,13 @@ def file_controller(
         player.write_log(f"[file] {action} {name or path}")
 
     try:
-        if action == "list":
+        if action in {"open", "open_folder", "explorer"}:
+            return open_explorer(path, name=name, select=False)
+
+        elif action in {"select", "show_in_explorer", "reveal"}:
+            return open_explorer(path, name=name, select=True)
+
+        elif action == "list":
             return list_files(path)
 
         elif action == "create_file":
@@ -724,13 +719,13 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+    "description": "Reliable Windows Explorer and file control: open folders, reveal exact files, search known folders, list, create, delete, move, copy, rename, read, write, and disk usage.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
+                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
             },
             "path": {
                 "type": "STRING",
@@ -750,7 +745,7 @@ TOOL = {
             },
             "name": {
                 "type": "STRING",
-                "description": "File name to search for"
+                "description": "Exact file name, file query, or file name to reveal in Explorer"
             },
             "extension": {
                 "type": "STRING",

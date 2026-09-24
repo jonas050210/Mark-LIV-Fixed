@@ -62,6 +62,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "obsidian":           {"Windows": "Obsidian",                "Darwin": "Obsidian",             "Linux": "obsidian"},
     "capcut":             {"Windows": "CapCut",                  "Darwin": "CapCut",               "Linux": "capcut"},
     "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
+    "roblox":             {"Windows": "RobloxPlayerBeta.exe",     "Darwin": "Roblox",              "Linux": "roblox"},
     "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
     "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
 }
@@ -242,13 +243,133 @@ _OS_LAUNCHERS = {
     "Linux":   _launch_linux,
 }
 
+def _normalised_window_text(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else " " for ch in str(value or "")).strip()
+
+
+def _is_roblox(value: str) -> bool:
+    return "roblox" in _normalised_window_text(value)
+
+
+def _matching_windows(requested: str, normalized: str):
+    """Return visible windows belonging to an application, without launching it."""
+    try:
+        from core.window_manager import list_windows
+        windows = list_windows()
+    except Exception as exc:
+        print(f"[open_app] window detection unavailable: {exc}")
+        return []
+
+    requested_text = _normalised_window_text(requested)
+    normalized_text = _normalised_window_text(normalized)
+    terms = {
+        term for value in (requested_text, normalized_text)
+        for term in value.split()
+        if len(term) >= 3 and term not in {"open", "launch", "start", "application", "app"}
+    }
+    matches = []
+    for window in windows:
+        title = _normalised_window_text(getattr(window, "title", ""))
+        process = _normalised_window_text(getattr(window, "process", ""))
+        if _is_roblox(requested) or _is_roblox(normalized):
+            matched = "roblox" in title or "roblox" in process
+        else:
+            matched = any(term in title or term in process for term in terms)
+        if matched:
+            matches.append(window)
+    return matches
+
+
+def _focus_window(window) -> bool:
+    try:
+        from core.window_manager import operate
+        operate(window, "focus")
+        return True
+    except Exception as exc:
+        print(f"[open_app] could not focus existing window: {exc}")
+        return False
+
+
+def _window_key(window):
+    return (
+        int(getattr(window, "handle", 0) or 0),
+        int(getattr(window, "pid", 0) or 0),
+        str(getattr(window, "title", "")),
+    )
+
+
+def _wait_for_windows(requested: str, normalized: str, minimum: int,
+                      existing_keys: set[tuple] | None = None, timeout: float = 8.0):
+    """Wait briefly for a launched app's window, returning the newest matches."""
+    deadline = time.monotonic() + timeout
+    existing_keys = existing_keys or set()
+    latest = []
+    while time.monotonic() < deadline:
+        latest = _matching_windows(requested, normalized)
+        new_windows = [window for window in latest if _window_key(window) not in existing_keys]
+        if len(latest) >= minimum and (not existing_keys or new_windows):
+            return latest, new_windows
+        time.sleep(0.25)
+    latest = _matching_windows(requested, normalized)
+    return latest, [window for window in latest if _window_key(window) not in existing_keys]
+
+
+def _window_on_monitor(window, monitor) -> bool:
+    center_x = (int(window.left) + int(window.right)) // 2
+    center_y = (int(window.top) + int(window.bottom)) // 2
+    return (
+        monitor.left <= center_x < monitor.right and
+        monitor.top <= center_y < monitor.bottom
+    )
+
+
+def _opposite_monitor(window):
+    """Pick a monitor other than the one containing the supplied window."""
+    from core.window_manager import list_monitors
+    monitors = list_monitors()
+    if len(monitors) < 2:
+        return None
+    center_x = (int(window.left) + int(window.right)) // 2
+    center_y = (int(window.top) + int(window.bottom)) // 2
+    current = None
+    for monitor in monitors:
+        if monitor.left <= center_x < monitor.right and monitor.top <= center_y < monitor.bottom:
+            current = monitor
+            break
+    for monitor in monitors:
+        if current is None or monitor.index != current.index:
+            return monitor
+    return None
+
+
+def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
+    if bool(parameters.get("new_instance") or parameters.get("second_instance") or
+            parameters.get("another_instance")):
+        return True
+    text = _normalised_window_text(app_name)
+    phrases = (
+        "another roblox", "second roblox", "new roblox", "roblox instance",
+        "another instance of roblox", "second instance of roblox",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _launch(launcher, normalized: str, shortcut_target: str) -> bool:
+    if launcher(normalized):
+        return True
+    if normalized.casefold() != shortcut_target.casefold() and launcher(shortcut_target):
+        return True
+    return False
+
+
 def open_app(
     parameters=None,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
-    app_name = (parameters or {}).get("app_name", "").strip()
+    parameters = parameters or {}
+    app_name = str(parameters.get("app_name", "")).strip()
 
     if not app_name:
         return "No application name provided."
@@ -261,37 +382,87 @@ def open_app(
 
     shortcut_target = resolve_shortcut(app_name)
     normalized = _normalize(shortcut_target)
-    if shortcut_target.casefold() != app_name.casefold():
-        print(f"[open_app] Shortcut: '{app_name}' → '{shortcut_target}'")
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    explicit_second = _explicit_second_instance(parameters, app_name)
+    is_roblox = _is_roblox(app_name) or _is_roblox(shortcut_target) or _is_roblox(normalized)
+    existing = _matching_windows(app_name, normalized)
 
     if player:
         player.write_log(f"[open_app] {app_name}")
 
+    # A normal open is idempotent.  In particular, do not create a duplicate
+    # Roblox client just because the launcher was called a second time.
+    if existing and not explicit_second:
+        if _focus_window(existing[0]):
+            return f"{app_name} is already open; switched to it."
+        return f"{app_name} is already open, but I could not focus its window."
+
+    if shortcut_target.casefold() != app_name.casefold():
+        print(f"[open_app] Shortcut: '{app_name}' → '{shortcut_target}'")
+    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+
+    existing_keys = {_window_key(window) for window in existing}
     try:
-        if launcher(normalized):
-            return f"Opened {app_name}."
-        if normalized.casefold() != shortcut_target.casefold() and launcher(shortcut_target):
-            return f"Opened {app_name}."
-        return (
-            f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
-        )
-    except Exception as e:
-        print(f"[open_app] Error: {e}")
-        return f"Failed to open {app_name}: {e}"
+        if not _launch(launcher, normalized, shortcut_target):
+            return (
+                f"Could not confirm that {app_name} launched. "
+                f"It may still be loading, or it might not be installed."
+            )
+
+        if is_roblox and explicit_second:
+            desired_count = max(1, len(existing) + 1)
+            matches, new_windows = _wait_for_windows(
+                app_name, normalized, desired_count, existing_keys
+            )
+            if len(matches) < desired_count or not new_windows:
+                return (
+                    "Roblox did not open a second window. It may prevent multiple "
+                    "instances, so I did not claim that a second client started."
+                )
+            new_window = new_windows[-1]
+            try:
+                from core.window_manager import move_to_monitor
+                target_monitor = _opposite_monitor(existing[0] if existing else matches[0])
+                if target_monitor is None:
+                    return "A second Roblox window opened, but no opposite monitor was available."
+                move_to_monitor(new_window, target_monitor)
+            except Exception as exc:
+                return f"A second Roblox window opened, but I could not move it: {exc}"
+            verified, _ = _wait_for_windows(
+                app_name, normalized, desired_count, set()
+            )
+            moved = next(
+                (window for window in verified if _window_key(window) == _window_key(new_window)),
+                None,
+            )
+            if len(verified) < desired_count or moved is None:
+                return "A second Roblox window was launched, but I could not verify it after moving it."
+            if not _window_on_monitor(moved, target_monitor):
+                return "A second Roblox window opened, but I could not verify its opposite-monitor placement."
+            return f"Opened a second Roblox window on monitor {target_monitor.index}."
+
+        # For ordinary launches, report success only when the launcher accepted
+        # the request.  Roblox receives the stricter second-window verification
+        # above; existing applications are handled before launch.
+        return f"Opened {app_name}."
+    except Exception as exc:
+        print(f"[open_app] Error: {exc}")
+        return f"Failed to open {app_name}: {exc}"
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens an application, game, folder, or URL on the computer. Resolve remembered shortcuts first, so commands such as 'open gd' work after the user saves gd as Geometry Dash. Use this whenever the user asks to open, launch, or start something; always call the tool and do not claim success without attempting it.",
+    "description": "Opens or focuses an application, game, folder, or URL. Ordinary opens focus an existing app instead of duplicating it. Set new_instance true only when the user explicitly asks for another instance; for Roblox this attempts a second window, moves it to the opposite monitor when possible, and verifies the result.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "app_name": {
                 "type": "STRING",
-                "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
+                "description": "Name of the application (e.g. 'WhatsApp', 'Chrome', 'Roblox')"
+            },
+            "new_instance": {
+                "type": "BOOLEAN",
+                "description": "Only set true when the user explicitly asks for another or second instance."
             }
         },
         "required": [
