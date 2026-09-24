@@ -266,7 +266,43 @@ class ActionRegistry:
                     except Exception as exc:  # pragma: no cover - worker safety net
                         self._logger(f"Action '{name}' failed after confirmation: {exc}")
                         return f"Tool '{name}' failed: {exc}"
-                message = confirm.request(name, title, detail, _confirmed)
+                def _confirmation_cancelled(reason: str) -> None:
+                    if not action_id:
+                        return
+                    # A dashboard cancellation already sets the event. A HUD
+                    # cancel must set it here so the live-action card cannot
+                    # remain stuck at confirmation_pending forever.
+                    if reason == "cancelled":
+                        action_runtime.cancel(action_id)
+                    label = "Confirmation expired" if reason == "expired" else "Cancelled by user"
+                    action_runtime.finish(action_id, ok=False, message=label)
+
+                message = confirm.request(
+                    name,
+                    title,
+                    detail,
+                    _confirmed,
+                    on_cancel=_confirmation_cancelled,
+                )
+                if not confirm.pending_title():
+                    if action_id:
+                        action_runtime.finish(
+                            action_id,
+                            ok=False,
+                            message="Confirmation could not be shown",
+                        )
+                    return ActionResult.failure(
+                        name,
+                        message,
+                        status="confirmation_failed",
+                    )
+                if action_id:
+                    action_runtime.update(
+                        action_id,
+                        status="confirmation_pending",
+                        progress=25,
+                        message="Waiting for confirmation",
+                    )
                 return ActionResult(name, False, "confirmation_pending", message,
                                     duration_ms=int((time.monotonic() - started) * 1000))
             except Exception as exc:
@@ -452,9 +488,20 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
             continue
         try:
             module_name = f"actions.{path.stem}"
-            # Reuse the already-imported module when present so handlers are the
-            # same objects the rest of the app holds.
+            # Reuse the already-imported module when it came from this exact
+            # file so handlers are the same objects the rest of the app holds.
+            # Test registries and plugin reloads can scan another directory
+            # with the same filename, though; reusing that stale module would
+            # silently expose the previous TOOL metadata.
             module = sys.modules.get(module_name)
+            loaded_from = getattr(module, "__file__", "") if module is not None else ""
+            try:
+                same_file = bool(loaded_from) and Path(loaded_from).resolve() == path.resolve()
+            except OSError:
+                same_file = False
+            if module is not None and not same_file:
+                sys.modules.pop(module_name, None)
+                module = None
             if module is None:
                 spec = importlib.util.spec_from_file_location(module_name, path)
                 if spec is None or spec.loader is None:

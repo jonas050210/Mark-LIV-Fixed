@@ -50,6 +50,50 @@ class ActionRuntimeTests(unittest.TestCase):
             self.assertTrue(shown)
             confirm.resolve(False)
 
+    def test_confirmation_cancel_finishes_the_live_action(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "danger.py"
+            path.write_text(
+                "def handler(parameters): return 'executed'\n"
+                "TOOL = {'name': 'danger_live', 'description': 'danger', 'handler': handler, 'requires_confirmation': True}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            confirm.bind(lambda _title, _detail: None, lambda: None)
+            run_id = action_runtime.start("danger_live", {})
+            result = registry.execute(
+                "danger_live", {}, {"action_id": run_id, "trusted": True}
+            )
+            self.assertEqual(result.status, "confirmation_pending")
+            self.assertIsNotNone(action_runtime.get(run_id))
+            self.assertEqual(action_runtime.get(run_id).status, "confirmation_pending")
+
+            confirm.resolve(False)
+
+            run = action_runtime.get(run_id)
+            self.assertIsNotNone(run)
+            self.assertEqual(run.status, "cancelled")
+            self.assertIsNotNone(run.finished_at)
+            self.assertEqual(run.message, "Cancelled by user")
+
+    def test_confirmation_without_an_interface_fails_closed(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "headless_danger.py"
+            path.write_text(
+                "def handler(parameters): return 'executed'\n"
+                "TOOL = {'name': 'headless_danger', 'description': 'danger', 'handler': handler, 'requires_confirmation': True}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            confirm.bind(None, None)
+            run_id = action_runtime.start("headless_danger", {})
+            result = registry.execute(
+                "headless_danger", {}, {"action_id": run_id, "trusted": True}
+            )
+            self.assertEqual(result.status, "confirmation_failed")
+            self.assertEqual(action_runtime.get(run_id).status, "failed")
+            self.assertNotEqual(result.as_text(), "executed")
+
     def test_admin_capability_requires_trusted_dispatch_context(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "admin_only.py"

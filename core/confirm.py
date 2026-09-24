@@ -53,6 +53,7 @@ class _Pending:
     detail:  str
     run:     Callable[[], str]
     at:      float
+    on_cancel: Optional[Callable[[str], None]] = None
 
 
 _pending: Optional[_Pending] = None
@@ -79,7 +80,13 @@ def _log(msg: str) -> None:
             pass
 
 
-def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
+def request(
+    key: str,
+    title: str,
+    detail: str,
+    run: Callable[[], str],
+    on_cancel: Optional[Callable[[str], None]] = None,
+) -> str:
     """Park an irreversible action behind the on-screen gate.
 
     Returns the sentence the tool should hand back to the model — phrased as an
@@ -94,8 +101,14 @@ def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
                 f"not available, so I have not done it.")
 
     with _lock:
-        _pending = _Pending(key=key, title=title, detail=detail,
-                            run=run, at=time.monotonic())
+        _pending = _Pending(
+            key=key,
+            title=title,
+            detail=detail,
+            run=run,
+            at=time.monotonic(),
+            on_cancel=on_cancel,
+        )
 
     try:
         _show_cb(title, detail)
@@ -133,10 +146,20 @@ def resolve(accepted: bool) -> None:
         return
 
     if time.monotonic() - p.at > TIMEOUT_SECONDS:
+        if p.on_cancel:
+            try:
+                p.on_cancel("expired")
+            except Exception:
+                pass
         _log(f"SYS: Confirmation expired — {p.title}")
         return
 
     if not accepted:
+        if p.on_cancel:
+            try:
+                p.on_cancel("cancelled")
+            except Exception:
+                pass
         _log(f"SYS: Cancelled — {p.title}")
         return
 
