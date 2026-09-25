@@ -23,7 +23,18 @@ playwright>=1.40,<2
 # ── Automation / input control ────────────────────────────────────────────────
 pyautogui
 pyperclip
+# PyWinCtl is the maintained successor to PyGetWindow and additionally reports
+# the owning process id, which the launcher uses to verify what it started.
+# PyGetWindow stays as a fallback for environments where PyWinCtl cannot load.
+pywinctl>=0.3,<1
 pygetwindow
+
+# ── Matching and shortcut resolution ──────────────────────────────────────────
+# RapidFuzz accelerates application and window name matching; pylnk3 resolves
+# Windows Start-menu shortcuts to their real executable so a launch reports a
+# process id and can open a document. Both degrade gracefully when absent.
+rapidfuzz>=3,<4
+pylnk3>=0.4,<1; sys_platform == 'win32'
 
 # ── Vision & media ────────────────────────────────────────────────────────────
 pillow>=10,<13

@@ -215,7 +215,9 @@ rebuild before the request is reported as a failure, which is what makes a
 freshly installed application work without a manual step.
 
 Matching is ordered: exact key, whole-name prefix/suffix, full token subset, and
-only then a bounded `difflib` ratio above 0.62. The previous substring test
+only then a bounded similarity ratio above 0.62 (RapidFuzz when installed,
+`difflib` otherwise — the same ordering either way, but fast enough to re-score
+several thousand applications on every keystroke). The previous substring test
 matched `code` inside `vscode` and `git` inside `digital`, and resolved to the
 first alias in declaration order rather than the best one. When two candidates
 are within 15 points of each other, MARK LIV asks which one is meant instead of
@@ -315,7 +317,9 @@ This shared module provides:
 - visible window enumeration;
 - process and title matching;
 - native Windows HWND support;
-- fallback support through `pygetwindow` or `wmctrl` where available;
+- cross-platform enumeration through `pywinctl`, falling back to
+  `pygetwindow` and then to `wmctrl`; `pywinctl` also reports the owning
+  process id, so a window can be tied to the process MARK LIV started;
 - monitor enumeration;
 - DPI-aware Windows geometry;
 - refresh-rate information where exposed;
@@ -371,7 +375,6 @@ Relevant actions include:
 - `write`
 - `largest`
 - `disk_usage`
-- `organize_desktop`
 - `info`
 
 Search behavior:
@@ -1022,6 +1025,25 @@ The project avoids saying an action succeeded merely because a command was sent.
 ---
 
 ## 15. Important implementation decisions
+
+### Removed sub-actions and why
+
+An action is a liability when it answers confidently from nothing, or when a
+second tool already does the same job properly. Five sub-actions were removed
+for those reasons. None of them fails silently: each returns a sentence naming
+the tool that replaces it, so the model recovers within the same turn instead of
+reporting an unknown action to the user.
+
+| Removed | Reason | Use instead |
+| --- | --- | --- |
+| `web_search.price` | Prices came from the model, not from the search results, and were stated with full confidence while being months out of date. | `web_search.search` — a price question is an ordinary search, answered from what the sources actually say. |
+| `web_search.compare` | Same failure, one step worse: two invented specification sheets set side by side read as research. | `web_search.research` |
+| `computer_control.screen_find` | Screenshot to the vision model to a pixel coordinate: seconds per call, and wrong whenever a theme, scale factor, or scroll position changed. | `browser_control.smart_click`, which addresses elements through the DOM. |
+| `computer_control.screen_click` | The same guess, but it clicked on it. A wrong coordinate is not a failed action, it is an action performed on the wrong thing. | `browser_control.smart_click` |
+| `computer_control.focus_window` | Duplicate of `window_manager.focus`, with a weaker title match and no monitor awareness. Two tools for one job means the model picks the worse one half the time. | `window_manager` with `action: focus` |
+| `file_controller.organize_desktop` | Moved every desktop file into six category folders in a single step. It was reversible through the undo journal, but a user who cannot see where anything went does not know to ask for undo. | Ask for specific files to be moved. |
+
+
 
 1. **No duplicate normal Roblox launch**
    - Normal open is idempotent.

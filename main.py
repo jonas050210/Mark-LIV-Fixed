@@ -1076,7 +1076,7 @@ class JarvisLive:
     def _admin_desktop(self) -> dict:
         """Read-only snapshot used by the admin panel; never executes a command."""
         from dataclasses import asdict
-        from core.window_manager import list_monitors, list_windows
+        from core.window_manager import backend_name, list_monitors, list_windows
         windows = list_windows()
         monitors = list_monitors()
         monitor_rows = []
@@ -1093,6 +1093,7 @@ class JarvisLive:
         return {
             "windows": [asdict(item) for item in windows],
             "monitors": monitor_rows,
+            "window_backend": backend_name(),
             "audio": audio_devices.diagnostics(get_input_device(), get_output_device()),
             "undo": undo_stack.history(),
         }

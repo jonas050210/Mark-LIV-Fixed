@@ -315,57 +315,6 @@ def _research(query: str) -> str:
         return _format_ddg(query, results)
 
 
-def _price(query: str) -> str:
-    """Product price lookup — searches for current market prices."""
-    price_query = f"current price of {query} — how much does it cost today"
-    try:
-        return _gemini_search(price_query)
-    except Exception as e:
-        _log_gemini_failure("Gemini price", e)
-        results = _run_bounded(
-            lambda: _ddg_search(f"{query} price buy", max_results=6),
-            timeout=5.0,
-            label="DDG price",
-        ) or []
-        return _format_ddg(query, results)
-
-
-def _compare(items: list[str], aspect: str) -> str:
-    query = (
-        f"Compare {', '.join(items)} in terms of {aspect}. "
-        "Give specific facts and data."
-    )
-    try:
-        return _gemini_search(query)
-    except Exception as e:
-        _log_gemini_failure("Gemini compare", e)
-
-    all_results: dict[str, list] = {}
-    for item in items:
-        try:
-            all_results[item] = _run_bounded(
-                lambda item=item: _ddg_search(f"{item} {aspect}", max_results=3),
-                timeout=5.0,
-                label="DDG comparison",
-            ) or []
-        except Exception:
-            all_results[item] = []
-
-    lines = [f"Comparison — {_clean_result(aspect, 200).upper()}", "─" * 40]
-    for item in items:
-        lines.append(f"\n▸ {_clean_result(item, 200)}")
-        for r in all_results.get(item, [])[:2]:
-            snippet = _clean_result(r.get("snippet"), 1_500)
-            if snippet:
-                lines.append(f"  • {snippet}")
-            url = _clean_result(r.get("url"), 2_048)
-            if url.startswith(("http://", "https://")):
-                lines.append(f"    {url}")
-    return "\n".join(lines)[:30_000]
-
-
-# ── Public entry point ─────────────────────────────────────────────────────────
-
 def web_search(
     parameters:     dict,
     response=None,
@@ -375,19 +324,12 @@ def web_search(
     params = parameters if isinstance(parameters, dict) else {}
     raw_query = params.get("query", "")
     raw_mode = params.get("mode", "search")
-    raw_items = params.get("items", [])
-    raw_aspect = params.get("aspect", "general")
     query = raw_query[:500].strip() if isinstance(raw_query, str) else ""
     mode = raw_mode[:16].lower().strip() if isinstance(raw_mode, str) else "search"
-    items = [str(item)[:200] for item in raw_items[:10]] if isinstance(raw_items, list) else []
-    aspect = raw_aspect[:200].strip() if isinstance(raw_aspect, str) else "general"
-    aspect = aspect or "general"
-
-    if not query and not items:
+    if mode not in {"search", "news", "research"}:
+        mode = "search"
+    if not query:
         return "Please provide a search query."
-
-    if items and mode not in ("compare",):
-        mode = "compare"
 
     if player:
         player.write_log(f"[Search:{mode}] request received")
@@ -395,14 +337,10 @@ def web_search(
     print(f"[WebSearch] 🔍 mode={mode!r}  query_length={len(query)}")
 
     try:
-        if mode == "compare" and items:
-            return _compare(items, aspect)
         if mode == "news":
             return _news(query)
         if mode == "research":
             return _research(query)
-        if mode == "price":
-            return _price(query)
         return _search(query)
 
     except Exception as e:
@@ -413,7 +351,7 @@ def web_search(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "web_search",
-    "description": "Searches the web. Use for ANY question about current facts, events, prices, or topics — always prefer this over guessing. Modes: 'search' (default), 'news' (latest headlines on a topic), 'research' (deep comprehensive answer), 'price' (product cost lookup), 'compare' (side-by-side comparison of items).",
+    "description": "Searches the web. Use for ANY question about current facts, events, prices, or topics — always prefer this over guessing. Modes: 'search' (default), 'news' (latest headlines on a topic), 'research' (deep comprehensive answer covering several sources). Price and comparison questions are ordinary searches: they must come from real results, not from the model's own estimate.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -424,23 +362,9 @@ TOOL = {
             },
             "mode": {
                 "type": "STRING",
-                "enum": ["search", "news", "research", "price", "compare"],
+                "enum": ["search", "news", "research"],
                 "maxLength": 16,
-                "description": "search | news | research | price | compare"
-            },
-            "items": {
-                "type": "ARRAY",
-                "maxItems": 10,
-                "items": {
-                    "type": "STRING",
-                    "maxLength": 200
-                },
-                "description": "Items to compare (compare mode)"
-            },
-            "aspect": {
-                "type": "STRING",
-                "maxLength": 100,
-                "description": "Comparison aspect: price | specs | reviews | features"
+                "description": "search | news | research"
             }
         },
         "required": []

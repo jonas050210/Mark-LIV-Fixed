@@ -846,105 +846,6 @@ def get_disk_usage(path: str = "home") -> str:
         return f"Could not get disk usage: {type(e).__name__}"
 
 
-def organize_desktop() -> str:
-    type_map = {
-        "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".heic"},
-        "Documents": {".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".odt", ".ods", ".odp"},
-        "Videos": {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"},
-        "Music": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"},
-        "Archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
-        "Code": {".py", ".js", ".ts", ".html", ".css", ".json", ".xml", ".cpp", ".java", ".cs", ".go", ".rs", ".sh"},
-    }
-
-    desktop = _get_desktop().resolve(strict=False)
-    if not _is_safe_path(desktop, mutation=True) or not desktop.is_dir():
-        return f"Could not organize desktop: unavailable or outside the safe file roots ({desktop})."
-
-    moved: list[str] = []
-    skipped: list[str] = []
-    errors: list[str] = []
-    journal: list[tuple[Path, Path, object]] = []
-
-    try:
-        candidates = []
-        for index, candidate in enumerate(desktop.iterdir(), 1):
-            if index > 500:
-                return (
-                    "Desktop has more than 500 entries; organize was refused "
-                    "to keep the operation reviewable."
-                )
-            candidates.append(candidate)
-    except OSError as exc:
-        return f"Could not organize desktop: {type(exc).__name__}"
-
-    for item in candidates:
-        try:
-            if _path_is_link(item) or item.is_dir() or item.name.startswith("."):
-                continue
-            target_folder = next(
-                (folder for folder, extensions in type_map.items() if item.suffix.lower() in extensions),
-                "Others",
-            )
-            target_dir = desktop / target_folder
-            new_path = target_dir / item.name
-            if not _is_safe_path(new_path, mutation=True):
-                errors.append(f"{item.name}: unsafe destination")
-                continue
-            if new_path.exists():
-                skipped.append(item.name)
-                continue
-            target_dir.mkdir(exist_ok=True)
-            origin = item.resolve()
-            move_no_replace(item, new_path)
-            final = new_path.resolve()
-            journal.append((origin, final, fingerprint(final)))
-            moved.append(f"{item.name} → {target_dir.name}/")
-        except Exception as exc:
-            errors.append(f"{item.name}: {type(exc).__name__}")
-
-    if journal:
-        def undo_organize(entries=tuple(journal)):
-            restored = 0
-            refused = 0
-            for origin, moved_to, expected in reversed(entries):
-                try:
-                    if not moved_to.exists():
-                        continue
-                    if origin.exists() or not unchanged(moved_to, expected):
-                        refused += 1
-                        continue
-                    move_no_replace(moved_to, origin)
-                    restored += 1
-                except Exception as exc:
-                    refused += 1
-                    print(f"[file] undo organize conflict ({type(exc).__name__}).")
-            for folder in {moved.parent for _origin, moved, _expected in entries}:
-                try:
-                    if folder.is_dir() and not any(folder.iterdir()):
-                        folder.rmdir()
-                except OSError:
-                    pass
-            if refused:
-                refuse(
-                    f"{restored} file(s) were restored, but {refused} changed or "
-                    "conflicting file(s) were left alone"
-                )
-            return f"{restored} file(s) put back on the desktop."
-
-        push_undo(f"organized the desktop ({len(journal)} files)", undo_organize)
-
-    result = f"Desktop organized: {len(moved)} files moved."
-    if moved:
-        result += "\n" + "\n".join(moved[:8])
-        if len(moved) > 8:
-            result += f"\n... and {len(moved) - 8} more."
-    if skipped:
-        result += f"\n{len(skipped)} file(s) skipped (name conflict)."
-    if errors:
-        result += f"\n{len(errors)} file(s) failed and were left in place: " + "; ".join(errors[:3])
-    return result
-
-
 def get_file_info(path: str, name: str = "") -> str:
     try:
         base = _resolve_path(path)
@@ -1110,7 +1011,11 @@ def file_controller(
             return get_disk_usage(path)
 
         elif action == "organize_desktop":
-            return organize_desktop()
+            return (
+                "Bulk desktop reorganisation was removed: it moved every file "
+                "into six folders in one step, which is hard to reason about "
+                "and easy to regret. Ask me to move specific files instead."
+            )
 
         elif action == "info":
             return get_file_info(path, name=name)
@@ -1131,9 +1036,9 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["open", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "organize_desktop", "info"],
+                "enum": ["open", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "info"],
                 "maxLength": 32,
-                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
+                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | info"
             },
             "path": {
                 "type": "STRING",
@@ -1197,6 +1102,6 @@ TOOL = {
         ]
     },
     "handler": file_controller,
-    "confirmation_actions": ["delete", "write", "organize_desktop"],
+    "confirmation_actions": ["delete", "write"],
     "undoable": True,
 }

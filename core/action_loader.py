@@ -347,7 +347,6 @@ class ActionRegistry:
             "shutdown": ("Shut down the computer", "The computer will power off after the confirmation."),
             "toggle wifi": ("Change Wi-Fi state", "The network connection may be interrupted."),
             "clean": ("Clean the desktop", "Desktop files will be moved into an archive folder."),
-            "organize": ("Organize the desktop", "Desktop files will be moved into category folders."),
             "task": ("Run a generated desktop task", "Generated automation can interact with files or the desktop."),
             "install": ("Install a game", "The game launcher will download and install files."),
             "update": ("Update games", "The game launcher will download and change installed files."),

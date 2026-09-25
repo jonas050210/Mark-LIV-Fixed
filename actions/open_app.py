@@ -1,4 +1,3 @@
-import difflib
 import platform
 import time
 
@@ -18,6 +17,7 @@ from core.app_index import (
     score_entry,
 )
 from core.shortcut_store import resolve as resolve_shortcut
+from core.text_match import ratio as _text_ratio
 
 try:
     import psutil
@@ -116,9 +116,9 @@ def _alias_target(raw: str) -> str:
 
     best_key, best_ratio = "", 0.0
     for alias_key in _APP_ALIASES:
-        ratio = difflib.SequenceMatcher(None, key, normalize_key(alias_key)).ratio()
-        if ratio > best_ratio:
-            best_key, best_ratio = alias_key, ratio
+        score = _text_ratio(key, normalize_key(alias_key))
+        if score > best_ratio:
+            best_key, best_ratio = alias_key, score
     if best_ratio >= 0.82:
         return _APP_ALIASES[best_key].get(_SYSTEM, raw)
     return raw
@@ -554,7 +554,7 @@ def _nearby_names(*queries: str, limit: int = 3) -> str:
         return ""
     scored = []
     for entry in entries:
-        best = max((difflib.SequenceMatcher(None, normalize_key(query), entry.key).ratio()
+        best = max((_text_ratio(normalize_key(query), entry.key)
                     for query in queries if str(query or "").strip()), default=0.0)
         if best >= 0.45:
             scored.append((best, entry.name))

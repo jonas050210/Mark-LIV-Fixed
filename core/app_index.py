@@ -22,7 +22,6 @@ cached so a launch is a dictionary lookup rather than a filesystem scan.
 """
 from __future__ import annotations
 
-import difflib
 import os
 import platform
 import re
@@ -33,6 +32,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from core.json_store import JsonStore, JsonStoreCorruptError
+from core.text_match import ratio as _text_ratio
 
 _OS = platform.system()
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -241,6 +241,40 @@ def _windows_registry_entries() -> list[AppEntry]:
     return entries
 
 
+def _resolve_shortcut_target(path: Path) -> tuple[str, str]:
+    """Read a Windows ``.lnk`` and return its (executable, working name).
+
+    Resolving the shortcut matters for more than tidiness: a ``.lnk`` launched
+    through ``os.startfile`` reports no process id and cannot carry arguments,
+    so the launcher can neither verify the window by pid nor open a document
+    with the application. Pointing at the real executable restores both.
+
+    ``pylnk3`` is optional; without it the shortcut is still launchable, just
+    without pid tracking.
+    """
+    try:
+        import pylnk3  # type: ignore
+    except ImportError:
+        return "", ""
+    try:
+        link = pylnk3.parse(str(path))
+    except Exception:
+        return "", ""
+    for attribute in ("path", "local_base_path"):
+        candidate = str(getattr(link, attribute, "") or "").strip().strip('"')
+        if not candidate:
+            continue
+        if not candidate.casefold().endswith(".exe"):
+            continue
+        try:
+            resolved = Path(os.path.expandvars(candidate))
+            if resolved.is_file():
+                return str(resolved), resolved.stem
+        except OSError:
+            continue
+    return "", ""
+
+
 def _windows_start_menu_entries() -> list[AppEntry]:
     entries: list[AppEntry] = []
     roots = []
@@ -260,12 +294,21 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                 name = path.stem
                 if not name or name.casefold().startswith(("uninstall", "remove ")):
                     continue
-                entries.append(AppEntry(
-                    name=name,
-                    kind=_KIND_LNK,
-                    target=str(path),
-                    source="startmenu",
-                ))
+                executable, _ = _resolve_shortcut_target(path)
+                if executable:
+                    entries.append(AppEntry(
+                        name=name,
+                        kind=_KIND_EXEC,
+                        target=executable,
+                        source="startmenu",
+                    ))
+                else:
+                    entries.append(AppEntry(
+                        name=name,
+                        kind=_KIND_LNK,
+                        target=str(path),
+                        source="startmenu",
+                    ))
         except OSError:
             continue
     return entries
@@ -409,13 +452,19 @@ _SCANNERS = {"Windows": _scan_windows, "Darwin": _scan_macos, "Linux": _scan_lin
 def _deduplicate(entries: list[AppEntry]) -> list[AppEntry]:
     """Keep one entry per name, preferring the most directly launchable source."""
     rank = {"registry": 0, "builtin": 0, "bundle": 1, "desktop": 1, "startmenu": 2, "appsfolder": 3}
+
+    def _rank(item: AppEntry) -> int:
+        # A Start-menu entry that pylnk3 resolved to a real executable is as
+        # good as a registry hit, so it should not lose to an AppsFolder id.
+        base = rank.get(item.source, 9)
+        return base - 1 if item.source == "startmenu" and item.kind == _KIND_EXEC else base
     best: dict[str, AppEntry] = {}
     for entry in entries:
         key = entry.key
         if not key:
             continue
         current = best.get(key)
-        if current is None or rank.get(entry.source, 9) < rank.get(current.source, 9):
+        if current is None or _rank(entry) < _rank(current):
             best[key] = entry
     return sorted(best.values(), key=lambda item: item.key)[:MAX_ENTRIES]
 
@@ -479,9 +528,9 @@ def score_entry(query: str, entry: AppEntry) -> float:
     if wanted_terms and wanted_terms <= key_terms:
         # Every requested word appears; prefer the entry with least extra noise.
         return 85.0 - min(10.0, len(key_terms - wanted_terms))
-    ratio = difflib.SequenceMatcher(None, wanted, key).ratio()
-    if ratio >= FUZZY_THRESHOLD:
-        return 40.0 + ratio * 30.0
+    score = _text_ratio(wanted, key)
+    if score >= FUZZY_THRESHOLD:
+        return 40.0 + score * 30.0
     return 0.0
 
 

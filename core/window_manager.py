@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from core.text_match import partial_ratio
+
 _OS = platform.system()
 
 
@@ -109,23 +111,73 @@ def _process_name(pid: int) -> str:
         return str(pid)
 
 
+_DESKTOP_BACKEND: object | None = None
+_DESKTOP_BACKEND_NAME = ""
+
+
+def desktop_backend():
+    """Return the desktop window library, or None when there is no desktop.
+
+    PyWinCtl is preferred over PyGetWindow: it is the maintained successor, it
+    reports the owning process id, and it supports macOS and Linux properly
+    rather than only Windows. Both raise on import in a headless session, so
+    the import is lazy and its failure is cached instead of retried per call.
+    """
+    global _DESKTOP_BACKEND, _DESKTOP_BACKEND_NAME
+    if _DESKTOP_BACKEND is not None or _DESKTOP_BACKEND_NAME == "none":
+        return _DESKTOP_BACKEND
+    for module_name in ("pywinctl", "pygetwindow"):
+        try:
+            module = __import__(module_name)
+        except Exception:
+            continue
+        if not hasattr(module, "getAllWindows"):
+            continue
+        _DESKTOP_BACKEND = module
+        _DESKTOP_BACKEND_NAME = module_name
+        return module
+    _DESKTOP_BACKEND_NAME = "none"
+    return None
+
+
+def backend_name() -> str:
+    """Name of the active window backend, for diagnostics."""
+    if _OS == "Windows":
+        return "user32"
+    desktop_backend()
+    return _DESKTOP_BACKEND_NAME or "none"
+
+
+def _window_pid(win) -> int:
+    """PyWinCtl exposes the owning pid; PyGetWindow does not."""
+    getter = getattr(win, "getPID", None)
+    if callable(getter):
+        try:
+            return int(getter() or 0)
+        except Exception:
+            return 0
+    return 0
+
+
 def _windows() -> list[WindowInfo]:
     if _OS == "Windows":
         return _windows_native()
+    module = desktop_backend()
+    if module is None:
+        return _windows_wmctrl()
     try:
-        import pygetwindow as gw
-
         out: list[WindowInfo] = []
-        for win in gw.getAllWindows():
+        for win in module.getAllWindows():
             title = str(getattr(win, "title", "") or "").strip()
             if not title:
                 continue
+            pid = _window_pid(win)
             out.append(
                 WindowInfo(
-                    handle=int(getattr(win, "_hWnd", 0) or 0),
+                    handle=int(getattr(win, "_hWnd", 0) or id(win)),
                     title=title,
-                    process="",
-                    pid=0,
+                    process=_process_name(pid) if pid else "",
+                    pid=pid,
                     left=int(getattr(win, "left", 0) or 0),
                     top=int(getattr(win, "top", 0) or 0),
                     right=int(getattr(win, "right", 0) or 0),
@@ -387,7 +439,13 @@ def _score_window(window: WindowInfo, target: str) -> tuple[int, WindowInfo]:
         return (80, window)
     words = set(wanted.split())
     overlap = len(words & set(title.split())) + len(words & set(process.split()))
-    return (overlap * 10, window)
+    if overlap:
+        return (overlap * 10, window)
+    # A window title carries text the user never says — "Inbox (12) - Gmail -
+    # Google Chrome" for a request of "chrome" — so fall back to a partial
+    # similarity rather than declaring no match at all.
+    best = max(partial_ratio(wanted, title), partial_ratio(wanted, process))
+    return ((int(best * 60) if best >= 0.75 else 0), window)
 
 
 def find_window(target: str = "") -> WindowInfo | None:
@@ -428,12 +486,17 @@ def _native_window(handle: int, operation: str, *args) -> None:
         raise ValueError(f"unsupported window operation: {operation}")
 
 
-def _pygetwindow_for(info: WindowInfo):
-    import pygetwindow as gw
-
-    for window in gw.getAllWindows():
-        if int(getattr(window, "_hWnd", 0) or 0) == info.handle:
+def _desktop_window_for(info: WindowInfo):
+    """Locate the backend object for a WindowInfo, by handle then by title."""
+    module = desktop_backend()
+    if module is None:
+        return None
+    windows = list(module.getAllWindows())
+    for window in windows:
+        handle = int(getattr(window, "_hWnd", 0) or id(window))
+        if handle == info.handle:
             return window
+    for window in windows:
         if str(getattr(window, "title", "") or "").strip() == info.title:
             return window
     return None
@@ -443,9 +506,12 @@ def operate(window: WindowInfo, operation: str, *args) -> None:
     if _OS == "Windows":
         _native_window(window.handle, operation, *args)
         return
-    target = _pygetwindow_for(window)
+    target = _desktop_window_for(window)
     if target is None:
-        raise RuntimeError("desktop window API could not find that window")
+        raise RuntimeError(
+            "no desktop window API is available on this system "
+            "(install pywinctl, or run inside a graphical session)"
+        )
     if operation == "minimize":
         target.minimize()
     elif operation == "maximize":
