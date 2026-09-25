@@ -1,9 +1,23 @@
-import time
-import subprocess
 import platform
-import shutil
+import time
 
+from core.app_index import (
+    LaunchError,
+    build_index,
+    record_launch,
+    sanitise_arguments,
+    is_uri,
+    launch as launch_app,
+    launch_uri,
+    load_index,
+    meaningful_terms,
+    normalize_key,
+    resolve as resolve_app,
+    sanitise_arguments as _sanitise_arguments,
+    score_entry,
+)
 from core.shortcut_store import resolve as resolve_shortcut
+from core.text_match import ratio as _text_ratio
 
 try:
     import psutil
@@ -12,6 +26,11 @@ except ImportError:
     _PSUTIL = False
 
 _SYSTEM = platform.system()
+
+_ALLOWED_STATES = {
+    "normal", "maximized", "fullscreen", "minimized",
+    "left", "right", "top", "bottom",
+}
 
 _APP_ALIASES: dict[str, dict[str, str]] = {
 
@@ -68,181 +87,109 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
+def _alias_target(raw: str) -> str:
+    """Rewrite a spoken name to this platform's canonical application name.
+
+    Matching is exact first, then whole-word, and only then a bounded fuzzy
+    match.  The previous substring test matched 'code' inside 'vscode' and
+    'git' inside 'digital', so the first alias in declaration order won rather
+    than the best one.
+    """
+    key = normalize_key(raw)
+    if not key:
+        return raw
+
+    entry = _APP_ALIASES.get(key)
+    if entry is not None:
+        return entry.get(_SYSTEM, raw)
+
+    wanted = meaningful_terms(raw)
+    if wanted:
+        for alias_key, os_map in _APP_ALIASES.items():
+            alias_terms = set(normalize_key(alias_key).split())
+            if wanted == alias_terms:
+                return os_map.get(_SYSTEM, raw)
+        for alias_key, os_map in _APP_ALIASES.items():
+            alias_terms = set(normalize_key(alias_key).split())
+            if alias_terms and alias_terms <= wanted:
+                return os_map.get(_SYSTEM, raw)
+
+    best_key, best_ratio = "", 0.0
+    for alias_key in _APP_ALIASES:
+        score = _text_ratio(key, normalize_key(alias_key))
+        if score > best_ratio:
+            best_key, best_ratio = alias_key, score
+    if best_ratio >= 0.82:
+        return _APP_ALIASES[best_key].get(_SYSTEM, raw)
+    return raw
+
+
 def _normalize(raw: str) -> str:
-    key = raw.lower().strip()
+    """Backwards-compatible alias resolution used by callers and tests."""
+    return _alias_target(raw)
 
-    if key in _APP_ALIASES:
-        return _APP_ALIASES[key].get(_SYSTEM, raw)
 
-    for alias_key, os_map in _APP_ALIASES.items():
-        if alias_key in key or key in alias_key:
-            return os_map.get(_SYSTEM, raw)
+def _resolve_candidates(*queries: str) -> tuple[list, bool]:
+    """Match an application against the installed-app index.
 
-    return raw  
+    Returns the ranked candidates and whether the index had to be rebuilt.  A
+    stale cache is the normal reason a freshly installed application is not
+    found, so one silent rebuild is attempted before reporting failure.
+    """
+    wanted = [query for query in queries if str(query or "").strip()]
+    if not wanted:
+        return [], False
+    try:
+        entries = load_index()
+    except Exception as exc:
+        print(f"[open_app] application index unavailable ({type(exc).__name__}).")
+        return [], False
 
-def _launch_windows(app_name: str) -> bool:
+    for query in wanted:
+        matches = resolve_app(query, entries=entries)
+        if matches:
+            return matches, False
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    try:
+        entries = load_index(refresh=True)
+    except Exception as exc:
+        print(f"[open_app] application index refresh failed ({type(exc).__name__}).")
+        return [], True
+    for query in wanted:
+        matches = resolve_app(query, entries=entries)
+        if matches:
+            return matches, True
+    return [], True
+
+
+def _note_opened_pages(arguments) -> None:
+    """Tell the browser handoff about a web page opened through an argument.
+
+    Opening Chrome with a URL puts a page on screen exactly as a browser_control
+    'go_to' would. Recording it here is what lets a following "click the login
+    button" resume on that page instead of starting the automation window on a
+    blank one.
+    """
+    for argument in arguments or []:
         try:
-            subprocess.Popen(
-                [app_name],
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=(_SYSTEM != "Windows"),
-            )
-            time.sleep(1.5)
-            return True
-        except Exception as e:
-            print(f"[open_app] subprocess launch failed ({type(e).__name__}).")
+            from core import browser_handoff
 
-    if ":" in app_name:
-        # URI launch without a shell: never interpolate model text into cmd.exe.
-        try:
-            import os
-            os.startfile(app_name)  # type: ignore[attr-defined]
-            time.sleep(1.0)
-            return True
+            if browser_handoff.is_web_url(argument):
+                browser_handoff.note(str(argument))
         except Exception:
-            pass
+            return
 
+
+def _launch_resolved(entry, arguments=None) -> tuple[bool, int | None, str]:
+    """Start one indexed application.  Never simulates keyboard input."""
     try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
-        pyautogui.press("enter")
-        time.sleep(2.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Start Menu search failed ({type(e).__name__}).")
+        pid = launch_app(entry, arguments)
+        return True, pid, ""
+    except LaunchError as exc:
+        return False, None, str(exc)
+    except Exception as exc:
+        return False, None, f"{type(exc).__name__}"
 
-    return False
-
-
-def _launch_macos(app_name: str) -> bool:
-
-    try:
-        result = subprocess.run(
-            ["open", "-a", app_name],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            ["open", "-a", f"{app_name}.app"],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
-    except Exception:
-        pass
-
-    binary = shutil.which(app_name) or shutil.which(app_name.lower())
-    if binary:
-        try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(1.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Spotlight launch failed ({type(e).__name__}).")
-
-    return False
-
-
-_LINUX_TERMINAL_FALLBACKS = [
-    "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal",
-    "xterm", "lxterminal", "mate-terminal", "tilix", "alacritty", "kitty",
-]
-
-def _launch_linux(app_name: str) -> bool:
-
-    # terminal emulators: try common ones in order
-    if app_name in ("x-terminal-emulator", "gnome-terminal", "terminal"):
-        for term in _LINUX_TERMINAL_FALLBACKS:
-            if shutil.which(term):
-                try:
-                    subprocess.Popen([term], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1.0)
-                    return True
-                except Exception:
-                    continue
-
-    binary = (
-        shutil.which(app_name) or
-        shutil.which(app_name.lower()) or
-        shutil.which(app_name.lower().replace(" ", "-")) or
-        shutil.which(app_name.lower().replace(" ", "_"))
-    )
-    if binary:
-        try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        result = subprocess.run(
-            ["xdg-open", app_name],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            return True
-    except Exception:
-        pass
-
-    for desktop_name in [
-        app_name.lower(),
-        app_name.lower().replace(" ", "-"),
-        app_name.lower().replace(" ", ""),
-    ]:
-        try:
-            result = subprocess.run(
-                ["gtk-launch", desktop_name],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True
-        except Exception:
-            pass
-
-    return False
-
-
-_OS_LAUNCHERS = {
-    "Windows": _launch_windows,
-    "Darwin":  _launch_macos,
-    "Linux":   _launch_linux,
-}
 
 def _normalised_window_text(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else " " for ch in str(value or "")).strip()
@@ -357,12 +304,90 @@ def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
     return any(phrase in text for phrase in phrases)
 
 
-def _launch(launcher, normalized: str, shortcut_target: str) -> bool:
-    if launcher(normalized):
-        return True
-    if normalized.casefold() != shortcut_target.casefold() and launcher(shortcut_target):
-        return True
-    return False
+def _wait_for_pid_window(pid: int | None, timeout: float = 12.0):
+    """Wait until the launched process owns a visible window."""
+    if not pid:
+        return []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            from core.window_manager import windows_for_pid
+            found = windows_for_pid(pid)
+        except Exception:
+            return []
+        if found:
+            return found
+        time.sleep(0.2)
+    return []
+
+
+def _await_launched_window(app_name: str, normalized: str, pid: int | None,
+                           existing_keys: set[tuple], timeout: float = 12.0):
+    """Identify the window a launch produced, by pid first and title second.
+
+    Replaces the old fixed ``time.sleep`` guesses: a fast machine continues as
+    soon as the window exists, a slow one still gets the full budget, and a
+    launch that produces nothing is reported instead of being called a success.
+    """
+    by_pid = _wait_for_pid_window(pid, timeout=timeout)
+    if by_pid:
+        return by_pid[0]
+    _, new_windows = _wait_for_windows(app_name, normalized, 1, existing_keys, timeout=timeout)
+    return new_windows[-1] if new_windows else None
+
+
+def _placement_request(parameters: dict) -> tuple[int | None, str]:
+    monitor = parameters.get("monitor")
+    if monitor in ("", None):
+        monitor_index = None
+    else:
+        try:
+            monitor_index = int(monitor)
+        except (TypeError, ValueError):
+            monitor_index = None
+    state = str(parameters.get("state") or "").casefold().strip()
+    return monitor_index, state
+
+
+def _apply_placement(window, monitor_index: int | None, state: str,
+                     *, focus: bool) -> tuple[bool, str]:
+    """Move a window to the requested monitor/state and verify the outcome."""
+    if monitor_index is None and not state:
+        return True, ""
+    try:
+        from core.window_manager import monitor_for, place_window, window_on_monitor
+    except Exception as exc:
+        return False, f"window placement is unavailable ({type(exc).__name__})"
+
+    monitor = None
+    if monitor_index is not None:
+        try:
+            monitor = monitor_for(monitor_index)
+        except ValueError as exc:
+            return False, str(exc)
+        except Exception as exc:
+            return False, f"monitor lookup failed ({type(exc).__name__})"
+
+    try:
+        placed = place_window(window, monitor, state or "normal", focus=focus)
+    except ValueError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, f"placement failed ({type(exc).__name__})"
+
+    if monitor is not None and not window_on_monitor(placed, monitor):
+        return False, f"I could not verify the move to monitor {monitor.index}"
+    return True, ""
+
+
+def _placement_summary(monitor_index: int | None, state: str) -> str:
+    parts = []
+    if state:
+        parts.append({"fullscreen": "in fullscreen", "maximized": "maximised",
+                      "minimized": "minimised"}.get(state, f"snapped {state}"))
+    if monitor_index is not None:
+        parts.append(f"on monitor {monitor_index}")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def open_app(
@@ -379,12 +404,23 @@ def open_app(
     if len(app_name) > 160 or any(ord(ch) < 32 for ch in app_name):
         return "That application name is invalid or too long."
 
-    launcher = _OS_LAUNCHERS.get(_SYSTEM)
-    if launcher is None:
+    if _SYSTEM not in ("Windows", "Darwin", "Linux"):
         return f"Unsupported operating system: {_SYSTEM}"
 
+    foreground = parameters.get("foreground")
+    foreground = True if foreground is None else bool(foreground)
+    try:
+        arguments = sanitise_arguments(
+            parameters.get("arguments", parameters.get("open_with"))
+        )
+    except ValueError as exc:
+        return f"I cannot pass that to the application: {exc}."
+    monitor_index, state = _placement_request(parameters)
+    if state and state not in _ALLOWED_STATES:
+        return f"state must be one of: {', '.join(sorted(_ALLOWED_STATES))}."
+
     shortcut_target = resolve_shortcut(app_name)
-    normalized = _normalize(shortcut_target)
+    normalized = _alias_target(shortcut_target)
     explicit_second = _explicit_second_instance(parameters, app_name)
     is_roblox = _is_roblox(app_name) or _is_roblox(shortcut_target) or _is_roblox(normalized)
     existing = _matching_windows(app_name, normalized)
@@ -392,70 +428,213 @@ def open_app(
     if player:
         player.write_log("[open_app] Launch requested")
 
+    # A plain URL or shell URI is not an installed application; hand it to the
+    # platform handler directly rather than searching the index for it.
+    if is_uri(shortcut_target) or is_uri(normalized):
+        target = shortcut_target if is_uri(shortcut_target) else normalized
+        try:
+            launch_uri(target)
+        except Exception as exc:
+            return f"I could not open that link ({type(exc).__name__})."
+        return f"Opened {app_name}."
+
     # A normal open is idempotent.  In particular, do not create a duplicate
     # Roblox client just because the launcher was called a second time.
     if existing and not explicit_second:
-        if _focus_window(existing[0]):
+        window = existing[0]
+        if monitor_index is not None or state:
+            ok, detail = _apply_placement(window, monitor_index, state, focus=foreground)
+            if not ok:
+                return f"{app_name} is already open, but {detail}."
+            return f"{app_name} was already open; moved it{_placement_summary(monitor_index, state)}."
+        if not foreground:
+            return f"{app_name} is already open; left it in the background."
+        if _focus_window(window):
             return f"{app_name} is already open; switched to it."
         return f"{app_name} is already open, but I could not focus its window."
 
-    if shortcut_target.casefold() != app_name.casefold():
-        print("[open_app] Resolved a saved shortcut.")
-    print(f"[open_app] Launching application target ({_SYSTEM}).")
+    candidates, refreshed = _resolve_candidates(normalized, shortcut_target, app_name)
+    if not candidates:
+        suggestions = _nearby_names(app_name, normalized)
+        hint = f" Did you mean: {suggestions}?" if suggestions else ""
+        scanned = " I rescanned the installed applications first." if refreshed else ""
+        return (
+            f"I could not find an installed application called '{app_name}'.{scanned}{hint}"
+        )
 
+    if len(candidates) > 1 and not _confident_match(candidates, normalized, app_name):
+        names = ", ".join(entry.name for entry in candidates[:4])
+        return (
+            f"'{app_name}' matches more than one installed application: {names}. "
+            "Tell me which one you mean."
+        )
+
+    entry = candidates[0]
+    previous_foreground = None
+    if not foreground:
+        try:
+            from core.window_manager import foreground_window
+            previous_foreground = foreground_window()
+        except Exception:
+            previous_foreground = None
+
+    print(f"[open_app] Launching an indexed application ({_SYSTEM}, {entry.source}).")
     existing_keys = {_window_key(window) for window in existing}
+
     try:
-        if not _launch(launcher, normalized, shortcut_target):
-            return (
-                f"Could not confirm that {app_name} launched. "
-                f"It may still be loading, or it might not be installed."
-            )
+        started, pid, failure = _launch_resolved(entry, arguments)
+        if not started:
+            return f"I could not start {entry.name}: {failure or 'the launch was refused'}."
 
         if is_roblox and explicit_second:
-            desired_count = max(1, len(existing) + 1)
-            matches, new_windows = _wait_for_windows(
-                app_name, normalized, desired_count, existing_keys
-            )
-            if len(matches) < desired_count or not new_windows:
-                return (
-                    "Roblox did not open a second window. It may prevent multiple "
-                    "instances, so I did not claim that a second client started."
-                )
-            new_window = new_windows[-1]
-            try:
-                from core.window_manager import move_to_monitor
-                target_monitor = _opposite_monitor(existing[0] if existing else matches[0])
-                if target_monitor is None:
-                    return "A second Roblox window opened, but no opposite monitor was available."
-                move_to_monitor(new_window, target_monitor)
-            except Exception as exc:
-                return f"A second Roblox window opened, but I could not move it: {type(exc).__name__}"
-            verified, _ = _wait_for_windows(
-                app_name, normalized, desired_count, set()
-            )
-            moved = next(
-                (window for window in verified if _window_key(window) == _window_key(new_window)),
-                None,
-            )
-            if len(verified) < desired_count or moved is None:
-                return "A second Roblox window was launched, but I could not verify it after moving it."
-            if not _window_on_monitor(moved, target_monitor):
-                return "A second Roblox window opened, but I could not verify its opposite-monitor placement."
-            return f"Opened a second Roblox window on monitor {target_monitor.index}."
+            return _second_roblox_instance(app_name, normalized, existing, existing_keys)
 
-        # For ordinary launches, report success only when the launcher accepted
-        # the request.  Roblox receives the stricter second-window verification
-        # above; existing applications are handled before launch.
-        return f"Opened {app_name}."
+        record_launch(entry.name)
+        _note_opened_pages(arguments)
+        window = _await_launched_window(app_name, normalized, pid, existing_keys)
+        if window is None:
+            return (
+                f"I started {entry.name}, but no window appeared within the wait window. "
+                "It may still be loading or it may have failed to start."
+            )
+
+        _remember_launch(entry.name, window)
+
+        if monitor_index is not None or state:
+            ok, detail = _apply_placement(window, monitor_index, state, focus=foreground)
+            if not ok:
+                return f"Opened {entry.name}, but {detail}."
+
+        if not foreground:
+            try:
+                from core.window_manager import operate, restore_foreground
+                if previous_foreground is not None:
+                    restore_foreground(previous_foreground)
+                elif state != "minimized":
+                    operate(window, "minimize")
+            except Exception:
+                pass
+            return f"Opened {entry.name} in the background{_placement_summary(monitor_index, state)}."
+
+        return f"Opened {entry.name}{_placement_summary(monitor_index, state)}."
     except Exception as exc:
         print(f"[open_app] Launch failed ({type(exc).__name__}).")
-        return f"Failed to open {app_name}."
+        return f"Failed to open {app_name} ({type(exc).__name__})."
+
+
+def _remember_launch(name: str, window) -> None:
+    """Make an application launch reversible by closing the window it opened.
+
+    Only the window this launch produced is closed, and only if it is still the
+    same window, so an undo cannot take down something the user opened since.
+    """
+    handle = int(getattr(window, "handle", 0) or 0)
+    if not handle:
+        return
+
+    def _undo() -> str:
+        from core import undo as undo_stack
+        from core.window_manager import list_windows, operate
+        current = next((item for item in list_windows() if item.handle == handle), None)
+        if current is None:
+            undo_stack.refuse(f"{name} is no longer open, so there is nothing to close.")
+        operate(current, "close")
+        return f"Closed {name} again."
+
+    try:
+        from core.undo import push_undo
+        push_undo(f"opening {name}", _undo)
+    except Exception:
+        pass
+
+
+def _confident_match(candidates, *queries: str) -> bool:
+    """True when the top candidate is a clear winner rather than a fuzzy guess."""
+    best = candidates[0]
+    for query in queries:
+        if not str(query or "").strip():
+            continue
+        if score_entry(query, best) >= 92.0:
+            return True
+    if len(candidates) < 2:
+        return True
+    top = max(score_entry(query, best) for query in queries if str(query or "").strip())
+    second = max(
+        score_entry(query, candidates[1]) for query in queries if str(query or "").strip()
+    )
+    return top - second >= 15.0
+
+
+def _nearby_names(*queries: str, limit: int = 3) -> str:
+    """Closest installed application names, for an honest 'did you mean'."""
+    try:
+        entries = load_index()
+    except Exception:
+        return ""
+    scored = []
+    for entry in entries:
+        best = max((_text_ratio(normalize_key(query), entry.key)
+                    for query in queries if str(query or "").strip()), default=0.0)
+        if best >= 0.45:
+            scored.append((best, entry.name))
+    scored.sort(key=lambda item: -item[0])
+    return ", ".join(name for _, name in scored[:limit])
+
+
+def _second_roblox_instance(app_name: str, normalized: str, existing, existing_keys: set[tuple]) -> str:
+    """Verify an explicitly requested second Roblox client and place it."""
+    desired_count = max(1, len(existing) + 1)
+    matches, new_windows = _wait_for_windows(app_name, normalized, desired_count, existing_keys)
+    if len(matches) < desired_count or not new_windows:
+        return (
+            "Roblox did not open a second window. It may prevent multiple "
+            "instances, so I did not claim that a second client started."
+        )
+    new_window = new_windows[-1]
+    try:
+        from core.window_manager import move_to_monitor
+        target_monitor = _opposite_monitor(existing[0] if existing else matches[0])
+        if target_monitor is None:
+            return "A second Roblox window opened, but no opposite monitor was available."
+        move_to_monitor(new_window, target_monitor)
+    except Exception as exc:
+        return f"A second Roblox window opened, but I could not move it: {type(exc).__name__}"
+    verified, _ = _wait_for_windows(app_name, normalized, desired_count, set())
+    moved = next(
+        (window for window in verified if _window_key(window) == _window_key(new_window)),
+        None,
+    )
+    if len(verified) < desired_count or moved is None:
+        return "A second Roblox window was launched, but I could not verify it after moving it."
+    if not _window_on_monitor(moved, target_monitor):
+        return "A second Roblox window opened, but I could not verify its opposite-monitor placement."
+    return f"Opened a second Roblox window on monitor {target_monitor.index}."
+
+
+def refresh_app_index(parameters=None, response=None, player=None, session_memory=None) -> str:
+    """Rescan installed applications; used after installing something new."""
+    entries = build_index()
+    if not entries:
+        return "I could not build an application index on this system."
+    return f"Rebuilt the application index: {len(entries)} installed applications found."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens or focuses an application, game, folder, or URL. Ordinary opens focus an existing app instead of duplicating it. Set new_instance true only when the user explicitly asks for another instance; for Roblox this attempts a second window, moves it to the opposite monitor when possible, and verifies the result.",
+    "description": (
+        "Opens or focuses an application, game, folder, or URL using the indexed list of "
+        "installed applications. Never simulates the Start menu or keyboard input. Ordinary "
+        "opens focus an existing app instead of duplicating it. Set foreground false to start "
+        "or leave an app in the background. Use monitor and state to place the window, for "
+        "example monitor 2 with state fullscreen. Set new_instance true only when the user "
+        "explicitly asks for another instance. Pass arguments to open a URL or document with "
+        "the application, for example Chrome with https://youtube.com. For a web page the "
+        "user wants to look at or work on, prefer browser_control: it opens the same real "
+        "browser and can then click, type and read on the page. For Roblox new_instance "
+        "attempts a second window, moves it to the opposite monitor when possible, and "
+        "verifies the result."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -463,6 +642,26 @@ TOOL = {
                 "type": "STRING",
                 "maxLength": 160,
                 "description": "Name of the application (e.g. 'WhatsApp', 'Chrome', 'Roblox')"
+            },
+            "foreground": {
+                "type": "BOOLEAN",
+                "description": "Default true. Set false when the user says to open it in the background or without stealing focus."
+            },
+            "monitor": {
+                "type": "INTEGER",
+                "description": "1-based monitor number to place the window on, when the user names one."
+            },
+            "state": {
+                "type": "STRING",
+                "enum": ["normal", "maximized", "fullscreen", "minimized", "left", "right", "top", "bottom"],
+                "maxLength": 16,
+                "description": "Window state after opening: fullscreen, maximized, minimized, or a snap side."
+            },
+            "arguments": {
+                "type": "ARRAY",
+                "maxItems": 8,
+                "items": {"type": "STRING", "maxLength": 2048},
+                "description": "Documents or URLs to open with the application, e.g. ['https://youtube.com']. Command-line switches are rejected."
             },
             "new_instance": {
                 "type": "BOOLEAN",

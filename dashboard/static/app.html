@@ -174,7 +174,39 @@
     .explorer-result small { display:block; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:2px 0 5px; }
     .explorer-result-actions { display:flex; gap:5px; }
     .explorer-result button { padding:4px 6px; }
-    @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } .explorer-form { grid-template-columns:1fr 1fr; } }
+    .launcher-form { display:grid; grid-template-columns:1.6fr .7fr .9fr auto; gap:5px; margin-bottom:7px; }
+    .launcher-form input, .launcher-form select { min-width:0; background:#07090f; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px; outline:none; font-size:10px; }
+    .launcher-form button, .app-tile button { background:#101629; color:#b9c7e0; border:1px solid #293451; border-radius:6px; padding:6px 8px; font-size:9px; font-weight:700; cursor:pointer; }
+    .launcher-form button:hover, .app-tile button:hover { color:var(--accent); border-color:var(--accent); }
+    .launcher-opts { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:9px; margin-bottom:6px; }
+    .app-tile { border-top:1px solid var(--border); padding:6px 0; display:flex; align-items:center; gap:6px; }
+    .app-icon { width:20px; height:20px; border-radius:4px; flex-shrink:0; object-fit:contain; background:#0d1220; }
+    .pin-btn { background:none; border:none; cursor:pointer; font-size:11px; color:#3d4a68; padding:2px 4px; }
+    .pin-btn.on { color:var(--accent); }
+    .quick-apps { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
+    .quick-app { display:flex; align-items:center; gap:5px; background:#101629; border:1px solid #293451; border-radius:6px; padding:5px 7px; font-size:9px; font-weight:700; color:#b9c7e0; cursor:pointer; max-width:150px; }
+    .quick-app:hover { color:var(--accent); border-color:var(--accent); }
+    .quick-app span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .quick-label { color:var(--muted); font-size:8px; letter-spacing:.6px; margin:2px 0 4px; }
+    .layout-row { display:flex; align-items:center; gap:6px; border-top:1px solid var(--border); padding:6px 0; }
+    .layout-row b { flex:1; min-width:0; color:var(--text); font:600 10px monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .layout-row small { color:var(--muted); font-size:8px; }
+    .layout-form { display:grid; grid-template-columns:1fr auto; gap:5px; margin-bottom:7px; }
+    .layout-form input { min-width:0; background:#07090f; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px; outline:none; font-size:10px; }
+    .layout-form button, .layout-row button { background:#101629; color:#b9c7e0; border:1px solid #293451; border-radius:6px; padding:6px 8px; font-size:9px; font-weight:700; cursor:pointer; }
+    .layout-form button:hover, .layout-row button:hover { color:var(--accent); border-color:var(--accent); }
+    .app-tile b { flex:1; min-width:0; color:var(--text); font:600 10px monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .app-tile small { color:var(--muted); font-size:8px; letter-spacing:.4px; }
+    .spotify-now { display:flex; gap:9px; align-items:center; padding:6px 0; }
+    .spotify-art { width:52px; height:52px; border-radius:6px; background:#0d1220; border:1px solid var(--border); object-fit:cover; flex-shrink:0; }
+    .spotify-meta { min-width:0; flex:1; }
+    .spotify-meta b { display:block; color:var(--text); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .spotify-meta small { display:block; color:var(--muted); font-size:9px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .spotify-seek { width:100%; margin:6px 0 2px; }
+    .spotify-times { display:flex; justify-content:space-between; color:var(--muted); font-size:8px; }
+    .spotify-row { display:flex; flex-wrap:wrap; gap:5px; align-items:center; margin-top:6px; }
+    .spotify-row button.on { color:var(--accent); border-color:var(--accent); }
+    @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } .explorer-form { grid-template-columns:1fr 1fr; } .launcher-form { grid-template-columns:1fr 1fr; } }
     @media (max-width:650px) { .admin-grid { grid-template-columns:1fr; } .admin-panel { max-height:65vh; } #admin-summary { display:none; } }
   </style>
 </head>
@@ -217,6 +249,37 @@
           <button onclick="searchExplorer()">SEARCH</button>
         </div>
         <div id="explorer-results">Search Home for a file.</div>
+      </div>
+      <div class="admin-card"><h3>APP LAUNCHER</h3>
+        <div class="launcher-form">
+          <input id="launcher-query" placeholder="Search installed apps…" aria-label="Search installed applications">
+          <select id="launcher-monitor" aria-label="Target monitor"><option value="">MONITOR</option></select>
+          <select id="launcher-state" aria-label="Window state">
+            <option value="">NORMAL</option>
+            <option value="maximized">MAXIMIZED</option>
+            <option value="fullscreen">FULLSCREEN</option>
+            <option value="left">SNAP LEFT</option>
+            <option value="right">SNAP RIGHT</option>
+            <option value="minimized">MINIMIZED</option>
+          </select>
+          <button onclick="searchApps()">FIND</button>
+        </div>
+        <div class="launcher-opts">
+          <label><input type="checkbox" id="launcher-background"> open in background (keep focus)</label>
+          <button class="undo-btn" onclick="searchApps(true)">RESCAN</button>
+        </div>
+        <div id="launcher-quick"></div>
+        <div id="launcher-results">Search your installed applications.</div>
+      </div>
+      <div class="admin-card"><h3>WINDOW LAYOUTS</h3>
+        <div class="layout-form">
+          <input id="layout-name" placeholder="Layout name, e.g. work" aria-label="Layout name" maxlength="40">
+          <button onclick="saveLayout()">SAVE CURRENT</button>
+        </div>
+        <div id="layout-list">Loading…</div>
+      </div>
+      <div class="admin-card"><h3>SPOTIFY</h3>
+        <div id="spotify-panel">Loading…</div>
       </div>
       <div class="admin-card"><h3>DESKTOP WINDOWS</h3><div id="window-tiles">Loading…</div><pre id="desktop-info" style="margin-top:8px"></pre></div>
     </div>
@@ -495,7 +558,11 @@
     function toggleAdmin() {
       const panel = document.getElementById('admin-panel');
       panel.hidden = !panel.hidden;
-      if (!panel.hidden) loadAdmin();
+      clearInterval(_spotifyTimer);
+      if (!panel.hidden) {
+        loadAdmin();
+        _spotifyTimer = setInterval(loadSpotify, 5000);
+      }
     }
 
     async function loadAdmin() {
@@ -526,7 +593,11 @@
         ).join('') || 'No visible windows';
         document.getElementById('desktop-info').textContent =
           (_desktopWindows.length ? _desktopWindows.map(w => `${w.title}${w.process ? ' [' + w.process + ']' : ''}`).join('\\n') : '');
+        fillMonitorChoices(desktop.monitors || []);
         renderUndo(desktop.undo || []);
+        loadSpotify();
+        loadLayouts();
+        searchApps();
       } catch (e) {
         document.getElementById('desktop-info').textContent = 'Admin data unavailable: ' + e;
       }
@@ -677,6 +748,256 @@
         setTimeout(() => document.getElementById('admin-command-input').focus(), 0);
       }
     });
+
+
+    // ── App launcher ─────────────────────────────────────────────────────────
+    // Launches by indexed application name only: the browser never sends a path
+    // or a command line, and the server runs it through the same action
+    // registry (and confirmation gate) that voice commands use.
+    let _appResults = [];
+
+    function launcherOptions() {
+      const monitor = document.getElementById('launcher-monitor').value;
+      const state = document.getElementById('launcher-state').value;
+      const background = document.getElementById('launcher-background').checked;
+      const body = { foreground: !background };
+      if (monitor) body.monitor = parseInt(monitor, 10);
+      if (state) body.state = state;
+      return body;
+    }
+
+    function renderApps(apps) {
+      _appResults = apps || [];
+      const box = document.getElementById('launcher-results');
+      if (!_appResults.length) {
+        box.textContent = 'No installed application matched that name.';
+        return;
+      }
+      box.innerHTML = _appResults.map((app, index) =>
+        `<div class="app-tile">${_iconTag(app)}<b title="${esc(app.name)}">${esc(app.name)}</b>` +
+        `<small>${esc(app.source || app.kind || '')}</small>` +
+        `<button class="pin-btn" data-name="${esc(app.name)}" title="Pin" ` +
+        `onclick="pinApp(this.dataset.name, true)">★</button>` +
+        `<button data-index="${index}" onclick="launchApp(this.dataset.index)">OPEN</button></div>`
+      ).join('');
+    }
+
+    async function searchApps(refresh) {
+      const query = (document.getElementById('launcher-query').value || '').trim();
+      const box = document.getElementById('launcher-results');
+      box.textContent = refresh ? 'Rescanning installed applications…' : 'Searching…';
+      try {
+        const params = new URLSearchParams({ query, limit: '25' });
+        if (refresh) params.set('refresh', '1');
+        const response = await _authFetch('/api/apps?' + params.toString());
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) { box.textContent = payload.error || 'Application index unavailable.'; return; }
+        renderApps(payload.apps);
+        renderQuickApps(payload.pinned, payload.recent);
+      } catch (error) {
+        box.textContent = 'Application index unavailable: ' + error;
+      }
+    }
+
+    async function launchApp(index) {
+      const app = _appResults[parseInt(index, 10)];
+      if (!app) return;
+      const body = Object.assign({ name: app.name }, launcherOptions());
+      try {
+        const response = await _authFetch('/api/apps/launch', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (payload.result || 'Launched') : (payload.error || 'Launch failed'));
+        if (response.ok && payload.ok) setTimeout(loadAdmin, 1200);
+      } catch (error) {
+        toast('Launch unavailable: ' + error);
+      }
+    }
+
+    document.getElementById('launcher-query').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); searchApps(); }
+    });
+
+    function fillMonitorChoices(monitors) {
+      const select = document.getElementById('launcher-monitor');
+      const previous = select.value;
+      select.innerHTML = '<option value="">MONITOR</option>' +
+        (monitors || []).map(m => `<option value="${m.index}">MONITOR ${m.index}</option>`).join('');
+      select.value = previous;
+    }
+
+
+    // ── Pinned and recent applications ───────────────────────────────────────
+    function _iconTag(app) {
+      if (!app.icon) return '<span class="app-icon"></span>';
+      return `<img class="app-icon" src="/api/apps/icon?name=${encodeURIComponent(app.name)}" alt="" ` +
+             `onerror="this.style.visibility='hidden'">`;
+    }
+
+    function renderQuickApps(pinned, recent) {
+      const box = document.getElementById('launcher-quick');
+      const section = (label, apps, isPinned) => {
+        if (!apps || !apps.length) return '';
+        return `<div class="quick-label">${label}</div><div class="quick-apps">` +
+          apps.map(app =>
+            `<div class="quick-app" title="${esc(app.name)}" data-name="${esc(app.name)}" ` +
+            `onclick="launchNamed(this.dataset.name)">${_iconTag(app)}<span>${esc(app.name)}</span>` +
+            `<button class="pin-btn ${isPinned ? 'on' : ''}" data-name="${esc(app.name)}" data-pin="${isPinned ? '0' : '1'}" ` +
+            `title="${isPinned ? 'Unpin' : 'Pin'}" onclick="event.stopPropagation();pinApp(this.dataset.name,this.dataset.pin==='1')">★</button></div>`
+          ).join('') + '</div>';
+      };
+      box.innerHTML = section('PINNED', pinned, true) + section('RECENT', recent, false);
+    }
+
+    async function pinApp(name, pinned) {
+      try {
+        const response = await _authFetch('/api/apps/pin', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name, pinned })
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) { toast(payload.error || 'Pin failed'); return; }
+        toast(pinned ? 'Pinned ' + name : 'Unpinned ' + name);
+        searchApps();
+      } catch (error) { toast('Pin unavailable: ' + error); }
+    }
+
+    async function launchNamed(name) {
+      const body = Object.assign({ name }, launcherOptions());
+      try {
+        const response = await _authFetch('/api/apps/launch', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (payload.result || 'Launched') : (payload.error || 'Launch failed'));
+        if (response.ok && payload.ok) setTimeout(loadAdmin, 1200);
+      } catch (error) { toast('Launch unavailable: ' + error); }
+    }
+
+    // ── Window layouts ───────────────────────────────────────────────────────
+    function renderLayouts(layouts) {
+      const box = document.getElementById('layout-list');
+      if (!layouts || !layouts.length) {
+        box.innerHTML = '<div style="color:var(--muted);font-size:10px">No layouts saved. Arrange your windows, then press SAVE CURRENT.</div>';
+        return;
+      }
+      box.innerHTML = layouts.map(item =>
+        `<div class="layout-row"><b title="${esc(item.name)}">${esc(item.name)}</b>` +
+        `<small>${item.windows} windows</small>` +
+        `<button data-name="${esc(item.name)}" onclick="layoutCommand('apply', this.dataset.name)">APPLY</button>` +
+        `<button data-name="${esc(item.name)}" onclick="layoutCommand('delete', this.dataset.name)">DELETE</button></div>`
+      ).join('');
+    }
+
+    async function loadLayouts() {
+      try {
+        const response = await _authFetch('/api/layouts');
+        const payload = await response.json();
+        if (response.ok && payload.ok) renderLayouts(payload.layouts);
+        else document.getElementById('layout-list').textContent = payload.error || 'Layouts unavailable.';
+      } catch (error) {
+        document.getElementById('layout-list').textContent = 'Layouts unavailable.';
+      }
+    }
+
+    async function layoutCommand(action, name) {
+      try {
+        const response = await _authFetch('/api/layouts', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ action, name })
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (payload.result || 'Done') : (payload.error || 'Layout command failed'));
+        loadLayouts();
+      } catch (error) { toast('Layout command unavailable: ' + error); }
+    }
+
+    function saveLayout() {
+      const input = document.getElementById('layout-name');
+      const name = (input.value || '').trim();
+      if (!name) { toast('Give the layout a name first.'); return; }
+      input.value = '';
+      layoutCommand('save', name);
+    }
+
+    document.getElementById('layout-name').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); saveLayout(); }
+    });
+
+    // ── Spotify panel ────────────────────────────────────────────────────────
+    let _spotify = {};
+    let _spotifyTimer = null;
+
+    function _fmtMs(ms) {
+      const total = Math.max(0, Math.round((ms || 0) / 1000));
+      return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+    }
+
+    function renderSpotify(state) {
+      _spotify = state || {};
+      const box = document.getElementById('spotify-panel');
+      if (!_spotify.connected) {
+        box.innerHTML = `<div style="color:var(--muted);font-size:10px;line-height:1.5">${esc(_spotify.reason || 'Spotify is not connected.')}<br>Set a Spotify client ID, then run <b>connect Spotify</b> once.</div>` +
+          `<div class="spotify-row"><button onclick="quickCommand('connect Spotify')">CONNECT</button></div>`;
+        return;
+      }
+      const art = _spotify.artwork
+        ? `<img class="spotify-art" src="${esc(_spotify.artwork)}" alt="">`
+        : '<div class="spotify-art"></div>';
+      const title = _spotify.track || 'Nothing playing';
+      const duration = _spotify.duration_ms || 0;
+      box.innerHTML =
+        `<div class="spotify-now">${art}<div class="spotify-meta">` +
+        `<b>${esc(title)}</b><small>${esc(_spotify.artists || '')}</small>` +
+        `<small>${esc(_spotify.device || 'no device')} · ${_spotify.playing ? 'playing' : 'paused'}</small>` +
+        `</div></div>` +
+        `<input class="spotify-seek" type="range" min="0" max="${duration}" value="${_spotify.progress_ms || 0}" ` +
+        `${duration ? '' : 'disabled'} onchange="spotifySeek(this.value)" aria-label="Seek">` +
+        `<div class="spotify-times"><span>${_fmtMs(_spotify.progress_ms)}</span><span>${_fmtMs(duration)}</span></div>` +
+        `<div class="spotify-row">` +
+        `<button onclick="spotifyCommand('previous')">◀◀</button>` +
+        `<button onclick="spotifyCommand('${_spotify.playing ? 'pause' : 'play'}')">${_spotify.playing ? '❚❚' : '▶'}</button>` +
+        `<button onclick="spotifyCommand('next')">▶▶</button>` +
+        `<button class="${_spotify.shuffle ? 'on' : ''}" onclick="spotifyShuffle()">SHUFFLE</button>` +
+        `<button class="${_spotify.repeat && _spotify.repeat !== 'off' ? 'on' : ''}" onclick="spotifyRepeat()">REPEAT ${esc(_spotify.repeat || 'off').toUpperCase()}</button>` +
+        `</div>` +
+        `<div class="spotify-row"><span style="color:var(--muted);font-size:9px">VOL</span>` +
+        `<input type="range" min="0" max="100" value="${_spotify.volume || 0}" style="flex:1" onchange="spotifyVolume(this.value)" aria-label="Volume"></div>`;
+    }
+
+    async function spotifyPost(body) {
+      try {
+        const response = await _authFetch('/api/spotify', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) { toast(payload.error || 'Spotify command failed'); return; }
+        if (payload.result) toast(payload.result);
+        setTimeout(loadSpotify, 600);
+      } catch (error) {
+        toast('Spotify unavailable: ' + error);
+      }
+    }
+
+    function spotifyCommand(action) { spotifyPost({ action }); }
+    function spotifyShuffle() { spotifyPost({ action: 'shuffle', enabled: !_spotify.shuffle }); }
+    function spotifyRepeat() {
+      const order = ['off', 'context', 'track'];
+      const next = order[(order.indexOf(_spotify.repeat || 'off') + 1) % order.length];
+      spotifyPost({ action: 'repeat', mode: next });
+    }
+    function spotifySeek(value) { spotifyPost({ action: 'seek', value: Number(value) / 1000 }); }
+    function spotifyVolume(value) { spotifyPost({ action: 'volume', value: Number(value) }); }
+
+    async function loadSpotify() {
+      try {
+        const response = await _authFetch('/api/spotify');
+        renderSpotify(await response.json());
+      } catch (error) {
+        document.getElementById('spotify-panel').textContent = 'Spotify panel unavailable.';
+      }
+    }
 
     // ── Toast ─────────────────────────────────────────────────────────────────
     let _toastTimer;

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core import explorer
+from core.app_index import AppEntry
 from core.window_manager import MonitorInfo, WindowInfo
 from actions import file_controller, open_app
 
@@ -88,6 +89,9 @@ class FileControllerTests(unittest.TestCase):
         open_in_explorer.assert_called_once_with(second, select=True)
 
 
+_ROBLOX_ENTRY = AppEntry(name="Roblox", kind="exec", target="/usr/bin/roblox", source="registry")
+
+
 class OpenAppTests(unittest.TestCase):
     def setUp(self) -> None:
         self.window = WindowInfo(
@@ -111,7 +115,7 @@ class OpenAppTests(unittest.TestCase):
     def test_normal_open_focuses_existing_window_without_launching(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[self.window]), \
              patch.object(open_app, "_focus_window", return_value=True) as focus, \
-             patch.object(open_app, "_launch") as launch:
+             patch.object(open_app, "_launch_resolved") as launch:
             result = open_app.open_app({"app_name": "Roblox"})
         self.assertIn("already open", result)
         focus.assert_called_once_with(self.window)
@@ -127,7 +131,8 @@ class OpenAppTests(unittest.TestCase):
             left=1920, top=0, right=2720, bottom=600,
         )
         with patch.object(open_app, "_matching_windows", side_effect=[[self.window], [self.window, self.second_window], [self.window, moved_window]]), \
-             patch.object(open_app, "_launch", return_value=True), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_ROBLOX_ENTRY], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, None, "")), \
              patch("core.window_manager.list_monitors", return_value=monitors), \
              patch("core.window_manager.move_to_monitor") as move:
             result = open_app.open_app({"app_name": "Roblox", "new_instance": True})
@@ -136,7 +141,8 @@ class OpenAppTests(unittest.TestCase):
 
     def test_second_roblox_failure_is_reported_honestly(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[self.window]), \
-             patch.object(open_app, "_launch", return_value=True), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_ROBLOX_ENTRY], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, None, "")), \
              patch.object(open_app, "_wait_for_windows", return_value=([self.window], [])):
             result = open_app.open_app({"app_name": "Roblox", "new_instance": True})
         self.assertIn("did not open a second", result)

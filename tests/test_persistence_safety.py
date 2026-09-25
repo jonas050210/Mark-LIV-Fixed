@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -17,7 +18,14 @@ from memory import config_manager, memory_manager
 
 class JsonStoreSafetyTests(unittest.TestCase):
     def test_concurrent_updates_do_not_lose_changes(self) -> None:
-        with TemporaryDirectory(dir=Path.home()) as directory:
+        # Every update is a locked read, an atomic write and an fsync. On a
+        # Windows CI runner with a virus scanner in the path that is tens of
+        # milliseconds each, so 120 of them can take the better part of a
+        # minute — the budget is generous on purpose. A genuine deadlock still
+        # fails the test, it just takes longer to say so.
+        deadline = 60
+        started = time.monotonic()
+        with TemporaryDirectory(dir=Path.home(), ignore_cleanup_errors=True) as directory:
             path = Path(directory) / "state.json"
             store = JsonStore(
                 path,
@@ -36,8 +44,11 @@ class JsonStoreSafetyTests(unittest.TestCase):
             for thread in threads:
                 thread.start()
             for thread in threads:
-                thread.join(10)
-                self.assertFalse(thread.is_alive())
+                thread.join(deadline)
+                self.assertFalse(
+                    thread.is_alive(),
+                    f"a writer was still blocked after {time.monotonic() - started:.0f}s",
+                )
 
             value = store.read()
             self.assertEqual(value["count"], 120)
@@ -213,3 +224,224 @@ class ManagerTransactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JsonStoreRecoveryTests(unittest.TestCase):
+    """What the store does when the file on disk is not what it wrote.
+
+    Every persistent piece of state in the project — configuration, tokens,
+    shortcuts, the app index, pins, layouts, reminders — goes through this
+    class, so its failure modes are the project's failure modes.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "store.json"
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _store(self, validator=None, private: bool = False, max_bytes: int = 1_000_000):
+        from core.json_store import JsonStore
+
+        return JsonStore(
+            self.path, dict, validator=validator, private=private, max_bytes=max_bytes
+        )
+
+    def test_a_missing_file_reads_as_the_default(self) -> None:
+        self.assertEqual(self._store().read(), {})
+
+    def test_a_corrupt_primary_is_recovered_from_the_backup(self) -> None:
+        store = self._store()
+        store.write({"value": 1})
+        store.write({"value": 2})          # the first write becomes the backup
+        self.path.write_text("{ truncated", encoding="utf-8")
+        recovered = store.read()
+        self.assertEqual(recovered, {"value": 1})
+        # The unreadable file is kept for inspection rather than deleted.
+        quarantined = list(self.path.parent.glob(f".{self.path.name}.corrupt-*"))
+        self.assertTrue(quarantined)
+
+    def test_a_corrupt_primary_without_a_usable_backup_raises(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store()
+        store.write({"value": 1})
+        self.path.write_text("{ truncated", encoding="utf-8")
+        store.backup_path.write_text("{ also truncated", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read()
+
+    def test_recovery_can_be_refused_by_the_caller(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store()
+        store.write({"value": 1})
+        store.write({"value": 2})
+        self.path.write_text("{ truncated", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read(recover=False)
+
+    def test_a_value_the_validator_rejects_is_never_written(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store(validator=lambda value: "allowed" in value)
+        store.write({"allowed": True})
+        with self.assertRaises(JsonStoreCorruptError):
+            store.write({"something": "else"})
+        self.assertEqual(store.read(), {"allowed": True})
+
+    def test_a_validator_that_raises_is_treated_as_a_rejection(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        def explode(_value):
+            raise KeyError("missing")
+
+        with self.assertRaises(JsonStoreCorruptError):
+            self._store(validator=explode).write({"x": 1})
+
+    def test_a_file_over_the_size_limit_is_refused(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store(max_bytes=2_048)
+        self.path.write_text("[" + "0," * 5_000 + "0]", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read()
+
+    def test_update_applies_a_mutation_atomically(self) -> None:
+        store = self._store()
+        store.write({"count": 1})
+        result = store.update(lambda data: {**data, "count": data["count"] + 1})
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(store.read()["count"], 2)
+
+    def test_a_mutator_returning_none_keeps_its_in_place_edits(self) -> None:
+        store = self._store()
+        store.write({"items": []})
+
+        def mutate(data):
+            data["items"].append("added")
+
+        store.update(mutate)
+        self.assertEqual(store.read()["items"], ["added"])
+
+    def test_a_failing_mutator_leaves_the_stored_value_untouched(self) -> None:
+        store = self._store()
+        store.write({"count": 1})
+
+        def mutate(_data):
+            raise RuntimeError("no")
+
+        with self.assertRaises(RuntimeError):
+            store.update(mutate)
+        self.assertEqual(store.read(), {"count": 1})
+
+    def test_concurrent_updates_do_not_lose_an_increment(self) -> None:
+        import threading
+
+        store = self._store()
+        store.write({"count": 0})
+
+        def bump():
+            for _ in range(20):
+                store.update(lambda data: {**data, "count": data["count"] + 1})
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(store.read()["count"], 80)
+
+    def test_no_temporary_files_are_left_behind(self) -> None:
+        store = self._store()
+        for index in range(5):
+            store.write({"index": index})
+        leftovers = [p.name for p in self.path.parent.glob("*.tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_private_store_is_readable_only_by_its_owner(self) -> None:
+        import os
+        import stat as stat_module
+
+        store = self._store(private=True)
+        store.write({"token": "secret"})
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits do not apply on Windows")
+        mode = stat_module.S_IMODE(self.path.stat().st_mode)
+        self.assertEqual(mode & 0o077, 0, oct(mode))
+
+
+class WindowsLockAcquisitionTests(unittest.TestCase):
+    """The Windows lock has to wait, not give up.
+
+    msvcrt.locking with LK_LOCK retries ten times at one-second intervals and
+    then raises, which is not the blocking acquire the store assumed. Under
+    contention a background thread could therefore fail after ten seconds, and
+    in a thread nobody is watching that means a write vanished without a word.
+    The retry is injected here so it can be exercised away from Windows.
+    """
+
+    def test_a_lock_that_is_free_is_taken_immediately(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        calls = []
+        _acquire_windows_lock(lambda: calls.append(1), "store.lock")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_busy_lock_is_retried_until_it_is_free(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        attempts = {"count": 0}
+
+        def try_lock():
+            attempts["count"] += 1
+            if attempts["count"] < 25:
+                raise OSError(13, "Permission denied")
+
+        slept = []
+        _acquire_windows_lock(
+            try_lock, "store.lock", sleep=slept.append, monotonic=lambda: 0.0
+        )
+        self.assertEqual(attempts["count"], 25)
+        self.assertEqual(len(slept), 24)
+
+    def test_the_backoff_is_bounded(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        attempts = {"count": 0}
+
+        def try_lock():
+            attempts["count"] += 1
+            if attempts["count"] < 40:
+                raise OSError(13, "Permission denied")
+
+        slept = []
+        _acquire_windows_lock(
+            try_lock, "store.lock", sleep=slept.append, monotonic=lambda: 0.0
+        )
+        self.assertLessEqual(max(slept), 0.1)
+
+    def test_a_lock_that_never_frees_fails_with_an_explanation(self) -> None:
+        from core.json_store import JsonStoreError, _acquire_windows_lock
+
+        clock = {"now": 0.0}
+
+        def monotonic():
+            clock["now"] += 5.0
+            return clock["now"]
+
+        def try_lock():
+            raise OSError(13, "Permission denied")
+
+        with self.assertRaises(JsonStoreError) as caught:
+            _acquire_windows_lock(
+                try_lock, "config.json.lock", timeout=30,
+                sleep=lambda _seconds: None, monotonic=monotonic,
+            )
+        message = str(caught.exception)
+        self.assertIn("config.json.lock", message)
+        self.assertIn("30s", message)

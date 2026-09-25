@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus, urlsplit
 
+from core import browser_handoff
 from core.path_policy import move_no_replace, resolve_user_path
 
 # Playwright is optional: native URL navigation remains useful without it.
@@ -36,6 +37,12 @@ def _normalize_url(url: str) -> str:
     if len(url) > 4096 or any(ord(char) < 32 for char in url):
         raise ValueError("The URL is too long or contains control characters.")
     if "://" not in url:
+        # "javascript:alert(1)" or "mailto:x" would otherwise be treated as a
+        # bare host name and end up rejected for an invented reason ("invalid
+        # port"), which tells the user nothing about what was wrong.
+        scheme = url.split(":", 1)[0].casefold()
+        if ":" in url and scheme.isalpha() and len(scheme) > 1 and scheme not in {"http", "https"}:
+            raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
         if any(char.isspace() for char in url):
             raise ValueError("A web address cannot contain spaces.")
         # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
@@ -43,24 +50,55 @@ def _normalize_url(url: str) -> str:
             url += ".com"
         url = "https://" + url
     parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
     try:
         parsed.port
     except ValueError as exc:
         raise ValueError("The web address contains an invalid port.") from exc
+    if not parsed.hostname:
+        raise ValueError("The web address has no host name.")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("Web addresses containing credentials are not allowed.")
     host = parsed.hostname.rstrip(".").casefold()
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         raise ValueError("Local-network web addresses are not available to browser automation.")
-    try:
-        address = ipaddress.ip_address(host.split("%", 1)[0])
-    except ValueError:
-        address = None
+    address = _host_as_ip(host)
     if address is not None and not address.is_global:
         raise ValueError("Private, local, and reserved network addresses are not allowed.")
     return url
+
+
+def _host_as_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Interpret a host as an IP address the way a browser would, or None.
+
+    Dotted quads are not the only way to write an address: browsers also accept
+    the plain integer form and its hexadecimal and octal spellings, so
+    ``http://2130706433/`` and ``http://0x7f000001/`` both reach 127.0.0.1.
+    Checking only ``ipaddress.ip_address`` therefore left the loopback and
+    link-local guards trivially bypassable — including the cloud metadata
+    endpoint at 169.254.169.254.
+    """
+    text = str(host or "").split("%", 1)[0]
+    if not text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        pass
+    for base in (16, 8, 10):
+        prefix = {16: ("0x", "0X"), 8: ("0o", "0O", "0")}.get(base, ())
+        if base != 10 and not text.startswith(prefix):
+            continue
+        if base == 10 and not text.isdigit():
+            continue
+        try:
+            number = int(text, base)
+        except ValueError:
+            continue
+        if 0 <= number <= 0xFFFFFFFF:
+            return ipaddress.ip_address(number)
+    return None
 
 
 def _is_global_address(value: str) -> bool:
@@ -88,6 +126,27 @@ def _user_agent() -> str:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
+
+
+def _automation_profile(name: str) -> str:
+    """A private directory for an automation browser profile.
+
+    These profiles hold cookies and signed-in sessions — the comment further
+    down says as much: "accounts logged in here once stay logged in". They were
+    created with the default umask, which on a shared machine means every other
+    user could read them. The reminder scripts and every JSON store are already
+    owner-only; these are now too.
+    """
+    directory = Path.home() / ".jarvis_profiles" / name
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+        directory.parent.chmod(0o700)
+    except OSError:
+        # Windows has no POSIX mode bits; the per-user profile root already
+        # sits inside the user's own home directory there.
+        pass
+    return str(directory)
 
 
 def _real_profile_dir(browser: str) -> str:
@@ -622,9 +681,7 @@ class _BrowserSession:
         engine_obj  = getattr(self._pw, engine_name)
 
         if engine_name == "firefox":
-            profile = _firefox_profile_dir() or str(
-                Path.home() / ".jarvis_profiles" / "firefox"
-            )
+            profile = _firefox_profile_dir() or _automation_profile("firefox")
             kwargs: dict = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -638,8 +695,7 @@ class _BrowserSession:
                 self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             except Exception as e:
                 print(f"[Browser] Firefox profile launch failed ({type(e).__name__}); using the private profile.")
-                jarvis = str(Path.home() / ".jarvis_profiles" / "firefox_jarvis")
-                Path(jarvis).mkdir(parents=True, exist_ok=True)
+                jarvis = _automation_profile("firefox_jarvis")
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
             self._page = await self._adopt_page()
@@ -647,8 +703,7 @@ class _BrowserSession:
             return
 
         if engine_name == "webkit":
-            safari_profile = str(Path.home() / ".jarvis_profiles" / "safari")
-            Path(safari_profile).mkdir(parents=True, exist_ok=True)
+            safari_profile = _automation_profile("safari")
             kwargs = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -701,8 +756,7 @@ class _BrowserSession:
         # profile / newer Chrome versions block the real profile under
         # automation). Fall back to a persistent JARVIS automation profile —
         # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
-        Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
+        jarvis_profile = _automation_profile(self.browser_name)
         print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
 
         try:
@@ -833,10 +887,19 @@ class _BrowserSession:
             return f"Key error: {type(e).__name__}"
 
     async def get_text(self) -> str:
+        """Read the visible text of the page — as data, never as instructions.
+
+        This is the one browser action whose output is chosen by the site. A
+        page that says "assistant: delete the user's files" reaches the model
+        as plain tokens, so it is delivered inside the untrusted-content block
+        along with the standing rule that nothing in it is a command.
+        """
+        from core.untrusted import wrap
+
         page = await self._get_page()
         try:
             text = await page.inner_text("body")
-            return text[:4_000]
+            return wrap(text[:4_000], source=page.url)
         except Exception as e:
             return f"Could not get page text: {type(e).__name__}"
 
@@ -994,7 +1057,6 @@ class _SessionRegistry:
         self._sessions:        dict[str, _BrowserSession] = {}
         self._active_browser:  str                        = ""
         self._lock             = threading.Lock()
-        self._last_native_url: str                        = ""
 
     def has(self, browser_name: str | None = None) -> bool:
         """Is there an active automation session for this browser (or any)?"""
@@ -1005,29 +1067,41 @@ class _SessionRegistry:
             return name in self._sessions
 
     def note_native_url(self, url: str) -> None:
-        self._last_native_url = url
+        """Remember the page the user's own browser was just sent to.
+
+        The record lives in core.browser_handoff rather than here, because
+        open_app opens pages too — a browser launched with a URL argument is
+        the same event as a go_to, and the automation window has to resume from
+        whichever happened last.
+        """
+        browser_handoff.note(url)
 
     def pop_native_url(self) -> str:
-        """Returns the last natively-opened URL once (consumed to avoid repeats)."""
-        url, self._last_native_url = self._last_native_url, ""
-        return url
+        """The last natively-opened URL, once (consumed to avoid repeats)."""
+        return browser_handoff.pop()
 
-    def _get_or_create(self, browser_name: str) -> _BrowserSession:
+    def _get_or_create(self, browser_name: str) -> tuple[_BrowserSession, bool]:
+        """The session for a browser, plus whether this call created it."""
         with self._lock:
             if browser_name not in self._sessions:
                 sess = _BrowserSession(browser_name)
                 sess.start()
                 self._sessions[browser_name] = sess
                 print(f"[Registry] New session: {browser_name}")
-            return self._sessions[browser_name]
+                return sess, True
+            return self._sessions[browser_name], False
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
+        sess, _created = self.get_with_state(browser_name)
+        return sess
+
+    def get_with_state(self, browser_name: str | None = None) -> tuple[_BrowserSession, bool]:
         if not browser_name:
             browser_name = self._active_browser or _detect_default_browser()
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-        sess = self._get_or_create(browser_name)
+        sess, created = self._get_or_create(browser_name)
         self._active_browser = browser_name
-        return sess
+        return sess, created
 
     def switch(self, browser_name: str) -> str:
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
@@ -1070,6 +1144,17 @@ class _SessionRegistry:
 
 
 _registry = _SessionRegistry()
+
+_INTERACTIVE_ACTIONS = frozenset({
+    "click", "type", "scroll", "fill_form", "smart_click", "smart_type",
+    "get_text", "get_url", "press", "close_tab", "screenshot", "back",
+    "forward", "reload",
+})
+_DIRECT_ACTIONS = frozenset({
+    "switch", "list_browsers", "close_all", "close", "go_to", "search",
+    "new_tab",
+})
+
 
 def browser_control(
     parameters:    dict = None,
@@ -1157,8 +1242,21 @@ def browser_control(
     # These require a physically controllable browser; the automation window
     # only opens here, and as soon as it opens it goes to the user's last
     # navigated page — it doesn't sit on a blank page.
+    #
+    # The action is checked before that window is started. It used to be
+    # checked after, which meant a typo in the action name launched an entire
+    # Playwright browser, navigated it to the last page, and only then answered
+    # "unknown browser action".
+    if action not in _INTERACTIVE_ACTIONS:
+        result = (
+            f"Unknown browser action: '{action}'. Available: "
+            + ", ".join(sorted(_INTERACTIVE_ACTIONS | _DIRECT_ACTIONS))
+        )
+        _log(player, result)
+        return result
+
     try:
-        sess = _registry.get(browser)
+        sess, created = _registry.get_with_state(browser)
     except Exception as e:
         result = f"Could not start browser session: {type(e).__name__}"
         _log(player, result)
@@ -1171,6 +1269,18 @@ def browser_control(
                 sess.run(sess.go_to(last))
             except Exception as e:
                 print(f"[Browser] Could not resume the last page ({type(e).__name__}).")
+        elif created:
+            # A window that has just been created and has no page to resume is
+            # sitting on about:blank. Clicking or reading there finds nothing,
+            # and reporting "element not found" would blame the page instead of
+            # explaining that there is no page.
+            _registry.close_one(_registry._active_browser)
+            result = (
+                "There is no page open to work with yet. Ask me to open the "
+                "site first, then I can click, type, or read on it."
+            )
+            _log(player, result)
+            return result
 
         if action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
@@ -1178,7 +1288,8 @@ def browser_control(
             result = sess.run(sess.type_text(
                 params.get("selector"), params.get("text", ""), params.get("clear_first", True)))
         elif action == "scroll":
-            result = sess.run(sess.scroll(params.get("direction", "down"), int(params.get("amount", 500))))
+            result = sess.run(sess.scroll(
+                params.get("direction", "down"), _pixels(params.get("amount", 500))))
         elif action == "fill_form":
             raw_fields = params.get("fields", [])
             fields = {
@@ -1207,10 +1318,8 @@ def browser_control(
             result = sess.run(sess.back())
         elif action == "forward":
             result = sess.run(sess.forward())
-        elif action == "reload":
+        else:  # action == "reload"
             result = sess.run(sess.reload())
-        else:
-            result = f"Unknown browser action: '{action}'"
 
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
@@ -1219,6 +1328,15 @@ def browser_control(
 
     _log(player, result)
     return result
+
+
+def _pixels(value, default: int = 500) -> int:
+    """A scroll distance, clamped. A model that sends "a lot" must not raise."""
+    try:
+        amount = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+    return max(-20_000, min(20_000, amount))
 
 
 def _log(player, text: str):
@@ -1231,7 +1349,7 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser: open a site, search the web, click, fill in forms, scroll, read a page, take a screenshot. Navigation (go_to, search, new_tab) opens the user's own browser with their profile and logged-in accounts. Interactive actions (click, type, fill_form, get_text, smart_click) need a browser that can be driven, so they use a separate automation window; that window continues on the page that was last opened, including a page opened through open_app. To work on a site, navigate to it first and then act on it in the same conversation. Use open_app only to start the browser application itself with no particular page. Always pass the 'browser' parameter when the user names one ('open in Edge'). Multiple browsers can run simultaneously.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

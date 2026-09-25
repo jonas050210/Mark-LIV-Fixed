@@ -11,7 +11,9 @@ from core.window_manager import (
     monitor_for,
     move_to_monitor,
     operate,
+    place_window,
     snap_window,
+    window_on_monitor,
 )
 
 
@@ -80,10 +82,23 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         # impossible to bypass through a second caller.
         operate(window, "close")
         return f"Closed {_target_label(window)}."
+    if action in {"fullscreen", "full_screen", "full"}:
+        monitor = monitor_for(p.get("monitor")) if p.get("monitor") else None
+        placed = place_window(window, monitor, "fullscreen")
+        _remember_window(window, label, before)
+        if monitor is not None and not window_on_monitor(placed, monitor):
+            return f"I put {label} in fullscreen, but could not verify monitor {monitor.index}."
+        where = f" on monitor {monitor.index}" if monitor is not None else ""
+        return f"{label} is now fullscreen{where}."
     if action in {"move_to_monitor", "move_monitor", "send_to_monitor"}:
         monitor = monitor_for(p.get("monitor", 1))
         move_to_monitor(window, monitor)
         _remember_window(window, label, before)
+        # Report the verified result rather than assuming the move landed.
+        from core.window_manager import refresh_window
+        moved = refresh_window(window) or window
+        if not window_on_monitor(moved, monitor):
+            return f"I asked to move {label} to monitor {monitor.index}, but could not verify it."
         return f"Moved {label} to monitor {monitor.index}."
     if action in {"snap", "tile"}:
         monitor = monitor_for(p.get("monitor", 1))
@@ -119,7 +134,7 @@ TOOL = {
     "description": (
         "Controls a named desktop window and the user's monitors. Use this instead "
         "of a blind hotkey when the user names an app: list open windows, focus, "
-        "minimize, maximize, restore, close with confirmation, move an app to a "
+        "minimize, maximize, fullscreen, restore, close with confirmation, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "
         "If no target is supplied, use the currently active window."
@@ -129,11 +144,11 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["list_windows", "list_monitors", "focus", "minimize", "maximize", "restore", "close", "move_to_monitor", "snap", "move"],
+                "enum": ["list_windows", "list_monitors", "focus", "minimize", "maximize", "fullscreen", "restore", "close", "move_to_monitor", "snap", "move"],
                 "maxLength": 32,
                 "description": (
                     "list_windows | list_monitors | focus | minimize | maximize | "
-                    "restore | close | move_to_monitor | snap | move"
+                    "fullscreen | restore | close | move_to_monitor | snap | move"
                 ),
             },
             "target": {

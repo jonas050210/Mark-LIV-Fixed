@@ -8,6 +8,7 @@ return a useful error when the desktop does not expose a window manager.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import platform
 import re
@@ -15,6 +16,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+from core.text_match import partial_ratio
 
 _OS = platform.system()
 
@@ -109,23 +112,89 @@ def _process_name(pid: int) -> str:
         return str(pid)
 
 
+_DESKTOP_BACKEND: object | None = None
+_DESKTOP_BACKEND_NAME = ""
+
+
+def desktop_backend():
+    """Return the desktop window library, or None when there is no desktop.
+
+    PyWinCtl is preferred over PyGetWindow: it is the maintained successor, it
+    reports the owning process id, and it supports macOS and Linux properly
+    rather than only Windows. Both raise on import in a headless session, so
+    the import is lazy and its failure is cached instead of retried per call.
+    """
+    global _DESKTOP_BACKEND, _DESKTOP_BACKEND_NAME
+    if _DESKTOP_BACKEND is not None or _DESKTOP_BACKEND_NAME == "none":
+        return _DESKTOP_BACKEND
+    for module_name in ("pywinctl", "pygetwindow"):
+        try:
+            module = __import__(module_name)
+        except Exception:
+            continue
+        if not hasattr(module, "getAllWindows"):
+            continue
+        _DESKTOP_BACKEND = module
+        _DESKTOP_BACKEND_NAME = module_name
+        return module
+    _DESKTOP_BACKEND_NAME = "none"
+    return None
+
+
+def backend_name() -> str:
+    """Name of the active window backend, for diagnostics."""
+    if _OS == "Windows":
+        return "user32"
+    desktop_backend()
+    return _DESKTOP_BACKEND_NAME or "none"
+
+
+def _stable_handle(win, title: str, pid: int) -> int:
+    """A handle that survives re-enumeration.
+
+    Only Windows gives every window a real HWND. Using ``id()`` of the backend
+    wrapper instead would look like a handle but change on every enumeration,
+    so ``refresh_window`` would never find the window it just moved and every
+    placement would report as unverified. A digest of pid and title is stable
+    for as long as both are, which is exactly the lifetime a caller needs.
+    """
+    native = int(getattr(win, "_hWnd", 0) or 0)
+    if native:
+        return native
+    digest = hashlib.blake2b(f"{pid}:{title}".encode("utf-8", "replace"), digest_size=7)
+    return int.from_bytes(digest.digest(), "big")
+
+
+def _window_pid(win) -> int:
+    """PyWinCtl exposes the owning pid; PyGetWindow does not."""
+    getter = getattr(win, "getPID", None)
+    if callable(getter):
+        try:
+            return int(getter() or 0)
+        except Exception:
+            return 0
+    return 0
+
+
 def _windows() -> list[WindowInfo]:
     if _OS == "Windows":
         return _windows_native()
+    module = desktop_backend()
+    if module is None:
+        return _windows_wmctrl()
     try:
-        import pygetwindow as gw
-
         out: list[WindowInfo] = []
-        for win in gw.getAllWindows():
+        for win in module.getAllWindows():
             title = str(getattr(win, "title", "") or "").strip()
             if not title:
                 continue
+            pid = _window_pid(win)
             out.append(
                 WindowInfo(
-                    handle=int(getattr(win, "_hWnd", 0) or 0),
+                    handle=_stable_handle(win, title, pid),
                     title=title,
-                    process="",
-                    pid=0,
+                    process=_process_name(pid) if pid else "",
+                    pid=pid,
                     left=int(getattr(win, "left", 0) or 0),
                     top=int(getattr(win, "top", 0) or 0),
                     right=int(getattr(win, "right", 0) or 0),
@@ -387,7 +456,13 @@ def _score_window(window: WindowInfo, target: str) -> tuple[int, WindowInfo]:
         return (80, window)
     words = set(wanted.split())
     overlap = len(words & set(title.split())) + len(words & set(process.split()))
-    return (overlap * 10, window)
+    if overlap:
+        return (overlap * 10, window)
+    # A window title carries text the user never says — "Inbox (12) - Gmail -
+    # Google Chrome" for a request of "chrome" — so fall back to a partial
+    # similarity rather than declaring no match at all.
+    best = max(partial_ratio(wanted, title), partial_ratio(wanted, process))
+    return ((int(best * 60) if best >= 0.75 else 0), window)
 
 
 def find_window(target: str = "") -> WindowInfo | None:
@@ -428,12 +503,17 @@ def _native_window(handle: int, operation: str, *args) -> None:
         raise ValueError(f"unsupported window operation: {operation}")
 
 
-def _pygetwindow_for(info: WindowInfo):
-    import pygetwindow as gw
-
-    for window in gw.getAllWindows():
-        if int(getattr(window, "_hWnd", 0) or 0) == info.handle:
+def _desktop_window_for(info: WindowInfo):
+    """Locate the backend object for a WindowInfo, by handle then by title."""
+    module = desktop_backend()
+    if module is None:
+        return None
+    windows = list(module.getAllWindows())
+    for window in windows:
+        title = str(getattr(window, "title", "") or "").strip()
+        if _stable_handle(window, title, _window_pid(window)) == info.handle:
             return window
+    for window in windows:
         if str(getattr(window, "title", "") or "").strip() == info.title:
             return window
     return None
@@ -443,9 +523,12 @@ def operate(window: WindowInfo, operation: str, *args) -> None:
     if _OS == "Windows":
         _native_window(window.handle, operation, *args)
         return
-    target = _pygetwindow_for(window)
+    target = _desktop_window_for(window)
     if target is None:
-        raise RuntimeError("desktop window API could not find that window")
+        raise RuntimeError(
+            "no desktop window API is available on this system "
+            "(install pywinctl, or run inside a graphical session)"
+        )
     if operation == "minimize":
         target.minimize()
     elif operation == "maximize":
@@ -462,6 +545,58 @@ def operate(window: WindowInfo, operation: str, *args) -> None:
         target.resizeTo(int(width), int(height))
     else:
         raise ValueError(f"unsupported window operation: {operation}")
+
+
+def foreground_window() -> WindowInfo | None:
+    """The window that currently owns input focus, when the platform reports it."""
+    if _OS != "Windows":
+        return None
+    try:
+        handle = int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return None
+    if not handle:
+        return None
+    for window in list_windows():
+        if window.handle == handle:
+            return window
+    return None
+
+
+def restore_foreground(window: WindowInfo | None) -> bool:
+    """Give focus back to a window that was in front before a launch."""
+    if window is None:
+        return False
+    try:
+        operate(window, "focus")
+        return True
+    except Exception:
+        return False
+
+
+def _descendant_pids(pid: int) -> set[int]:
+    pids = {int(pid)}
+    try:
+        import psutil
+
+        for child in psutil.Process(pid).children(recursive=True):
+            pids.add(int(child.pid))
+    except Exception:
+        pass
+    return pids
+
+
+def windows_for_pid(pid: int | None) -> list[WindowInfo]:
+    """Visible windows owned by a process or any of its children.
+
+    Many launchers (Chrome, Steam, Electron apps) hand off to a second process,
+    so the window that appears frequently belongs to a child rather than to the
+    pid returned by the spawn itself.
+    """
+    if not pid:
+        return []
+    wanted = _descendant_pids(int(pid))
+    return [window for window in list_windows() if int(window.pid or 0) in wanted]
 
 
 def monitor_for(index: int | str | None) -> MonitorInfo:
@@ -528,3 +663,97 @@ def snap_window(window: WindowInfo, monitor: MonitorInfo, side: str) -> None:
     operate(window, "restore")
     operate(window, "move", *rect)
     operate(window, "focus")
+
+
+PLACEMENT_STATES = (
+    "normal", "maximized", "fullscreen", "minimized",
+    "left", "right", "top", "bottom",
+)
+
+
+def window_on_monitor(window: WindowInfo, monitor: MonitorInfo) -> bool:
+    """True when the window's centre point lies inside the monitor's bounds."""
+    center_x = (int(window.left) + int(window.right)) // 2
+    center_y = (int(window.top) + int(window.bottom)) // 2
+    return (
+        monitor.left <= center_x < monitor.right and
+        monitor.top <= center_y < monitor.bottom
+    )
+
+
+def monitor_of(window: WindowInfo) -> MonitorInfo | None:
+    for monitor in list_monitors():
+        if window_on_monitor(window, monitor):
+            return monitor
+    return None
+
+
+def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
+                 state: str = "normal", *, focus: bool = True) -> WindowInfo:
+    """Move a window to a monitor and apply a window state, then re-read it.
+
+    The returned WindowInfo is a fresh reading rather than the caller's stale
+    one, so the result can be verified instead of assumed.
+    """
+    state = str(state or "normal").casefold().strip()
+    if state in {"full", "full_screen", "full screen"}:
+        state = "fullscreen"
+    if state in {"maximize", "maximised"}:
+        state = "maximized"
+    if state in {"minimize", "minimised"}:
+        state = "minimized"
+    if state not in PLACEMENT_STATES:
+        raise ValueError(f"state must be one of: {', '.join(PLACEMENT_STATES)}")
+
+    if state == "minimized":
+        operate(window, "minimize")
+        return refresh_window(window) or window
+
+    if monitor is not None:
+        # Maximised or snapped windows ignore MoveWindow, so restore first.
+        operate(window, "restore")
+        if state == "fullscreen":
+            operate(window, "move", monitor.left, monitor.top, monitor.width, monitor.height)
+        elif state in {"left", "right", "top", "bottom"}:
+            snap_window(window, monitor, state)
+        else:
+            move_to_monitor(window, monitor)
+            if state == "maximized":
+                operate(window, "maximize")
+    else:
+        if state == "maximized":
+            operate(window, "maximize")
+        elif state == "fullscreen":
+            target = monitor_of(window) or list_monitors()[0]
+            operate(window, "restore")
+            operate(window, "move", target.left, target.top, target.width, target.height)
+        elif state in {"left", "right", "top", "bottom"}:
+            target = monitor_of(window) or list_monitors()[0]
+            snap_window(window, target, state)
+        else:
+            operate(window, "restore")
+
+    if focus:
+        try:
+            operate(window, "focus")
+        except Exception:
+            pass
+    return refresh_window(window) or window
+
+
+def refresh_window(window: WindowInfo) -> WindowInfo | None:
+    """Re-read a window so callers can verify a placement.
+
+    The handle is tried first. A window whose title changed while it was being
+    moved would otherwise look closed, so process and title are accepted as a
+    second identity.
+    """
+    candidates = list_windows()
+    for candidate in candidates:
+        if candidate.handle == window.handle:
+            return candidate
+    if window.pid:
+        for candidate in candidates:
+            if candidate.pid == window.pid and candidate.title == window.title:
+                return candidate
+    return None

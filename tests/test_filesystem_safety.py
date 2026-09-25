@@ -126,7 +126,8 @@ class FileControllerSafetyTests(unittest.TestCase):
                     str(source), destination=str(destination)
                 )
 
-            self.assertIn("Could not copy", result)
+            self.assertIn("could not copy", result.casefold())
+            self.assertIn("simulated copy failure", result)
             self.assertFalse(destination.exists())
             self.assertEqual(list(root.glob(".*.copying-*")), [])
 
@@ -219,3 +220,54 @@ class ArchiveSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FailureReasonTests(unittest.TestCase):
+    """A refused file operation has to say why it was refused.
+
+    "Could not copy: ValueError" is indistinguishable from a bug. The user
+    cannot tell a rejected name from a missing folder from a full disk, and
+    neither can the model deciding what to do next.
+    """
+
+    def test_common_failures_are_translated_into_reasons(self) -> None:
+        from actions.file_controller import _why
+
+        self.assertEqual(_why(PermissionError()), "permission was denied")
+        self.assertEqual(_why(FileNotFoundError()), "the path no longer exists")
+        self.assertEqual(_why(FileExistsError()), "something with that name already exists")
+        self.assertEqual(_why(IsADirectoryError()), "the target is a folder")
+
+    def test_a_full_disk_is_named(self) -> None:
+        from actions.file_controller import _why
+
+        self.assertEqual(_why(OSError(28, "No space left on device")), "the disk is full")
+
+    def test_a_validation_message_is_passed_through(self) -> None:
+        from actions.file_controller import _why
+
+        self.assertEqual(
+            _why(ValueError("the name must not contain a folder path")),
+            "the name must not contain a folder path",
+        )
+
+    def test_an_unhelpful_exception_still_names_its_type(self) -> None:
+        from actions.file_controller import _why
+
+        self.assertIn("RuntimeError", _why(RuntimeError()))
+        self.assertIn("RuntimeError", _why(RuntimeError("x" * 500)))
+
+    def test_a_rejected_rename_explains_itself(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from actions.file_controller import file_controller
+
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            source = Path(directory) / "note.txt"
+            source.write_text("x", encoding="utf-8")
+            result = file_controller(
+                {"action": "rename", "path": str(source), "name": "../escaped.txt"}
+            )
+        self.assertIn("folder path", result)
+        self.assertNotIn("ValueError", result)

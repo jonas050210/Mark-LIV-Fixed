@@ -23,9 +23,13 @@ import time
 from pathlib import Path
 
 from core.action_runtime import runtime as action_runtime
+from core import app_index
+from core import app_icons
 from core import undo as undo_stack
 from core import confirm as confirm_gate
 from core import explorer as explorer_core
+from actions import layout_manager as layout_core
+from actions import media_control as media_control_core
 from core.path_policy import (
     PathPolicyError,
     atomic_write_bytes,
@@ -58,8 +62,24 @@ MAX_UPLOAD_MB = 100
 LOGIN_ATTEMPT_WINDOW = 300.0
 MAX_LOGIN_ATTEMPTS = 10
 AUTH_TOKEN_TTL = 12 * 60 * 60
+# Window states and Spotify verbs the panels may request. Anything outside these
+# sets is rejected before it reaches an action, so the browser cannot widen the
+# action surface beyond what the voice layer already exposes.
+_APP_LAUNCH_STATES = frozenset({
+    "normal", "maximized", "fullscreen", "minimized",
+    "left", "right", "top", "bottom",
+})
+_LAYOUT_PANEL_ACTIONS = frozenset({"list", "save", "apply", "delete"})
+_SPOTIFY_PANEL_ACTIONS = frozenset({
+    "status", "devices", "play", "pause", "next", "previous",
+    "shuffle", "repeat", "seek", "volume", "search", "queue",
+})
 DEVICE_TOKEN_TTL = 30 * 24 * 60 * 60
 MAX_REQUEST_BYTES = 2_000_000
+
+
+class _RegistryNotReady(RuntimeError):
+    """The assistant has not connected its action registry to the dashboard yet."""
 
 
 class _RequestBodyTooLarge(ValueError):
@@ -369,6 +389,7 @@ class DashboardServer:
         self._connect_callback            = None
         self._capabilities_callback       = None
         self._desktop_callback            = None
+        self._action_callback             = None
         self._pending_keys: dict[str, float] = {}
         self._login_attempts: dict[str, list[float]] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
@@ -455,6 +476,20 @@ class DashboardServer:
             self._mac_cache[session_key] = _derive_mac_key(session_key)
         return self._mac_cache[session_key]
 
+    async def _close_other_sockets(self) -> None:
+        """Drop live websockets after a revocation.
+
+        A socket that was accepted with a token now revoked would otherwise
+        keep receiving broadcasts for as long as it stayed connected.
+        """
+        for socket in list(self._clients) + list(self._phone_clients):
+            try:
+                await socket.close(code=1008)
+            except Exception:
+                pass
+        self._clients.clear()
+        self._phone_clients.clear()
+
     def _issue_token(self, session_key: str) -> str:
         now = time.time()
         token = secrets.token_urlsafe(32)
@@ -470,6 +505,23 @@ class DashboardServer:
                 self._tokens.pop(oldest, None)
                 self._token_keys.pop(oldest, None)
         return token
+
+    def revoke_all_sessions(self, *, keep: str = "") -> dict[str, int]:
+        """Cut off every remote session, optionally sparing the caller's own.
+
+        Clearing the remembered devices is not enough on its own: a phone that
+        is already logged in holds a bearer token in memory, and that token
+        stays valid until it expires on its own. Someone revoking access after
+        losing a device would have been told the job was done while the lost
+        device still had a live session.
+        """
+        devices = len(self._device_sessions)
+        self._device_sessions.clear()
+        doomed = [token for token in self._tokens if token != keep]
+        for token in doomed:
+            self._tokens.pop(token, None)
+            self._token_keys.pop(token, None)
+        return {"devices": devices, "sessions": len(doomed)}
 
     def _valid_token(self, token: str) -> bool:
         if not isinstance(token, str) or not token or len(token) > 256:
@@ -512,6 +564,10 @@ class DashboardServer:
     def set_capabilities_callback(self, fn) -> None:
         """Provide the same action registry used by voice commands."""
         self._capabilities_callback = fn
+
+    def set_action_callback(self, fn) -> None:
+        """Route panel buttons through the same action registry as voice commands."""
+        self._action_callback = fn
 
     def set_desktop_callback(self, fn) -> None:
         """Provide a live window/monitor snapshot for the admin panel."""
@@ -581,7 +637,10 @@ class DashboardServer:
     # ── FastAPI app ───────────────────────────────────────────────────────
 
     def _build_app(self) -> "FastAPI":
-        app = FastAPI(docs_url=None, redoc_url=None)
+        # The interactive docs were already disabled; the schema they are generated
+        # from was not, so /openapi.json handed an unauthenticated caller on the
+        # network the full list of routes and their parameters.
+        app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
         @app.middleware("http")
         async def security_headers(req: Request, call_next):
@@ -616,6 +675,24 @@ class DashboardServer:
                 "base-uri 'none'; frame-ancestors 'none'"
             )
             return response
+
+        def action_registry_run(name: str, parameters: dict) -> str:
+            """Execute one registered action, or explain that none is wired up."""
+            if self._action_callback is None:
+                raise _RegistryNotReady("the action registry is not connected yet")
+            return str(self._action_callback(name, parameters))
+
+        def _registry_unavailable() -> JSONResponse:
+            """The assistant is not running yet — that is not a server fault.
+
+            Answering 500 with a bare exception name told the user nothing and
+            implied a defect. The dashboard can be reached while MARK LIV is
+            still starting, and the honest answer is to say so.
+            """
+            return JSONResponse(
+                {"ok": False, "error": "MARK LIV is not ready yet. Try again in a moment."},
+                status_code=503,
+            )
 
         def _auth(req: Request) -> bool:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -802,12 +879,22 @@ class DashboardServer:
 
         @app.post("/api/revoke-devices")
         async def revoke_devices(req: Request):
-            """Invalidate all persistent device tokens (admin action)."""
+            """Sign out every remote device, including live sessions.
+
+            The session making the request keeps working; everything else —
+            remembered devices and any bearer token already handed out — stops
+            immediately.
+            """
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            count = len(self._device_sessions)
-            self._device_sessions.clear()
-            return JSONResponse({"ok": True, "revoked": count})
+            caller = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            removed = self.revoke_all_sessions(keep=caller)
+            self._spawn(self._close_other_sockets())
+            return JSONResponse({
+                "ok": True,
+                "revoked": removed["devices"],
+                "sessions_closed": removed["sessions"],
+            })
 
         @app.post("/api/command")
         async def command(req: Request):
@@ -948,6 +1035,283 @@ class DashboardServer:
                 return JSONResponse({"ok": True, "path": str(target), "select": select, "message": message})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Could not open Explorer: {type(exc).__name__}"}, status_code=500)
+
+        @app.get("/api/apps")
+        async def app_list(req: Request, query: str = "", refresh: str = "", limit: int = 40):
+            """List indexed installed applications, or rank them against a query.
+
+            Read-only: building the index only reads registry keys, shortcut
+            folders, and desktop entries. Nothing is launched here.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            query = str(query or "").strip()[:160]
+            want_refresh = str(refresh or "").strip().casefold() in {"1", "true", "yes"}
+            try:
+                entries = await asyncio.to_thread(app_index.load_index, refresh=want_refresh)
+                if query:
+                    entries = await asyncio.to_thread(
+                        app_index.resolve, query, limit=max(1, min(int(limit), 50)), entries=entries
+                    )
+                def _row(entry) -> dict:
+                    return {
+                        "name": entry.name,
+                        "kind": entry.kind,
+                        "source": entry.source,
+                        "icon": app_icons.has_icon(entry),
+                    }
+
+                rows = [_row(entry) for entry in entries[: max(1, min(int(limit), 200))]]
+                quick = await asyncio.to_thread(app_index.quick_list)
+                return JSONResponse({
+                    "ok": True,
+                    "query": query,
+                    "count": len(rows),
+                    "apps": rows,
+                    "pinned": [_row(entry) for entry in quick["pinned"]],
+                    "recent": [_row(entry) for entry in quick["recent"]],
+                })
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "Invalid parameters."}, status_code=400)
+            except Exception as exc:
+                return JSONResponse(
+                    {"ok": False, "error": f"Application index failed: {type(exc).__name__}"},
+                    status_code=500,
+                )
+
+        @app.post("/api/apps/launch")
+        async def app_launch(req: Request):
+            """Launch an indexed application through the normal action pipeline.
+
+            The panel sends a name, never a path or command line, so the
+            dashboard cannot be used to execute arbitrary binaries.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            if not name or len(name) > 160 or any(ord(char) < 32 for char in name):
+                return JSONResponse({"ok": False, "error": "A valid application name is required."},
+                                    status_code=400)
+
+            parameters: dict = {"app_name": name}
+            foreground = body.get("foreground", True)
+            if not isinstance(foreground, bool):
+                return JSONResponse({"ok": False, "error": "foreground must be true or false."},
+                                    status_code=400)
+            parameters["foreground"] = foreground
+
+            monitor = body.get("monitor")
+            if monitor not in (None, ""):
+                try:
+                    monitor_index = int(monitor)
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": "monitor must be a number."},
+                                        status_code=400)
+                if not 1 <= monitor_index <= 32:
+                    return JSONResponse({"ok": False, "error": "monitor must be between 1 and 32."},
+                                        status_code=400)
+                parameters["monitor"] = monitor_index
+
+            state = body.get("state")
+            if state not in (None, ""):
+                state = str(state).casefold().strip()[:16]
+                if state not in _APP_LAUNCH_STATES:
+                    return JSONResponse({"ok": False, "error": "Unsupported window state."},
+                                        status_code=400)
+                parameters["state"] = state
+
+            try:
+                result = await asyncio.to_thread(
+                    action_registry_run, "open_app", parameters
+                )
+            except _RegistryNotReady:
+                return _registry_unavailable()
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Launch failed: {type(exc).__name__}"},
+                                    status_code=500)
+            await self.broadcast({"type": "sys", "text": result})
+            return JSONResponse({"ok": True, "result": result})
+
+        @app.post("/api/apps/pin")
+        async def app_pin(req: Request):
+            """Pin or unpin an application in the launcher's quick row."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            pinned = body.get("pinned")
+            if not name or len(name) > 160 or not isinstance(pinned, bool):
+                return JSONResponse({"ok": False, "error": "A name and a pinned flag are required."},
+                                    status_code=400)
+            try:
+                pins = await asyncio.to_thread(app_index.set_pinned, name, pinned)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Pin failed: {type(exc).__name__}"},
+                                    status_code=500)
+            return JSONResponse({"ok": True, "pinned": pins})
+
+        @app.get("/api/apps/icon")
+        async def app_icon(req: Request, name: str = ""):
+            """Serve a cached application icon as PNG.
+
+            The lookup goes through the index by name, so the browser cannot ask
+            for an arbitrary file: only an indexed application resolves.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            name = str(name or "").strip()[:160]
+            if not name:
+                return JSONResponse({"ok": False, "error": "A name is required."}, status_code=400)
+            try:
+                matches = await asyncio.to_thread(app_index.resolve, name, limit=1)
+                if not matches:
+                    return JSONResponse({"ok": False, "error": "Unknown application."}, status_code=404)
+                data = await asyncio.to_thread(app_icons.icon_png, matches[0])
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Icon failed: {type(exc).__name__}"},
+                                    status_code=500)
+            if not data:
+                return JSONResponse({"ok": False, "error": "No icon available."}, status_code=404)
+            return Response(
+                content=data,
+                media_type="image/png",
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
+
+        @app.get("/api/layouts")
+        async def layout_list(req: Request):
+            """Saved window layouts, as a plain list for the panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                data = await asyncio.to_thread(layout_core._read)
+                layouts = [
+                    {
+                        "name": name,
+                        "windows": len(layout.get("windows", [])),
+                        "saved_at": str(layout.get("saved_at", ""))[:19],
+                    }
+                    for name, layout in sorted((data.get("layouts") or {}).items())
+                ]
+                return JSONResponse({"ok": True, "layouts": layouts})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Layouts unavailable: {type(exc).__name__}"},
+                                    status_code=500)
+
+        @app.post("/api/layouts")
+        async def layout_command(req: Request):
+            """Save, apply, or delete a window layout through the action registry."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            action = body.get("action")
+            action = action.strip().casefold() if isinstance(action, str) else ""
+            if action not in _LAYOUT_PANEL_ACTIONS:
+                return JSONResponse({"ok": False, "error": "Unsupported layout action."},
+                                    status_code=400)
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            if action != "list" and (not name or len(name) > 40):
+                return JSONResponse({"ok": False, "error": "A layout name is required."},
+                                    status_code=400)
+            parameters = {"action": action}
+            if name:
+                parameters["name"] = name
+            try:
+                result = await asyncio.to_thread(action_registry_run, "layout_manager", parameters)
+            except _RegistryNotReady:
+                return _registry_unavailable()
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Layout command failed: {type(exc).__name__}"},
+                                    status_code=500)
+            await self.broadcast({"type": "sys", "text": result})
+            return JSONResponse({"ok": True, "result": result})
+
+        @app.get("/api/spotify")
+        async def spotify_status(req: Request):
+            """Current Spotify playback state for the media panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                snapshot = await asyncio.to_thread(media_control_core.playback_snapshot)
+                return JSONResponse({"ok": True, **snapshot})
+            except Exception as exc:
+                return JSONResponse(
+                    {"ok": False, "error": f"Spotify status failed: {type(exc).__name__}"},
+                    status_code=500,
+                )
+
+        @app.post("/api/spotify")
+        async def spotify_command(req: Request):
+            """Run one Spotify transport command from the media panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+
+            action = body.get("action")
+            action = action.strip().casefold() if isinstance(action, str) else ""
+            if action not in _SPOTIFY_PANEL_ACTIONS:
+                return JSONResponse({"ok": False, "error": "Unsupported Spotify action."},
+                                    status_code=400)
+
+            parameters: dict = {"action": action}
+            for key in ("query", "uri", "device", "mode"):
+                value = body.get(key)
+                if isinstance(value, str) and value.strip():
+                    parameters[key] = value.strip()[:500]
+            value = body.get("value")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if not 0 <= float(value) <= 86_400:
+                    return JSONResponse({"ok": False, "error": "value is out of range."},
+                                        status_code=400)
+                parameters["value"] = value
+            if isinstance(body.get("enabled"), bool):
+                parameters["enabled"] = body["enabled"]
+
+            try:
+                result = await asyncio.to_thread(
+                    action_registry_run, "media_control", parameters
+                )
+            except _RegistryNotReady:
+                return _registry_unavailable()
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Spotify command failed: {type(exc).__name__}"},
+                                    status_code=500)
+            return JSONResponse({"ok": True, "result": result})
 
         @app.get("/api/actions")
         async def action_runs(req: Request):

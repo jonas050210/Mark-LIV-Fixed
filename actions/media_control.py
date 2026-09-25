@@ -268,6 +268,102 @@ def _connect(parameters: dict) -> str:
         return f"Spotify token exchange failed ({type(exc).__name__})."
 
 
+# ── System media keys ────────────────────────────────────────────────────────
+# The Web API needs Premium and an active Connect device.  When neither is
+# available the operating system's own media transport still reaches whichever
+# player owns the session.  These are hardware transport events, not simulated
+# typing into a focused window, so they cannot land in the wrong text field.
+_VK_MEDIA = {
+    "play": 0xB3, "pause": 0xB3, "playpause": 0xB3,
+    "next": 0xB0, "previous": 0xB1, "stop": 0xB2,
+}
+
+
+def _media_key(action: str) -> bool:
+    """Send a system media-transport key. Returns True when it was delivered."""
+    code = _VK_MEDIA.get(action)
+    if code is None:
+        return False
+    import platform
+
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.keybd_event(code, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(code, 0, 2, 0)
+            return True
+        except Exception:
+            return False
+    if system == "Linux":
+        import shutil
+        import subprocess
+
+        if shutil.which("playerctl"):
+            command = {"play": "play", "pause": "pause", "playpause": "play-pause",
+                       "next": "next", "previous": "previous", "stop": "stop"}[action]
+            try:
+                return subprocess.run(["playerctl", command], capture_output=True,
+                                      timeout=5).returncode == 0
+            except Exception:
+                return False
+    return False
+
+
+def _fallback_note(action: str, api_error: str) -> str:
+    if _media_key(action):
+        return (
+            f"Spotify's Web API was unavailable ({api_error}) so I used the system "
+            f"media keys instead: {action}."
+        )
+    return api_error
+
+
+def playback_snapshot() -> dict:
+    """Structured now-playing state for the dashboard media panel.
+
+    Read-only, and it never raises for the ordinary "not configured" cases: the
+    panel needs to render a reason, not a stack trace.
+    """
+    token_data = _load_token()
+    client_id = str(token_data.get("client_id") or "")
+    token = _refresh_token(token_data, client_id)
+    if not token:
+        return {"connected": False, "reason": "Spotify is not connected."}
+
+    status, body = _request("GET", "/me/player", token)
+    if status == 204 or not body:
+        return {"connected": True, "playing": False, "reason": "Nothing is playing."}
+    if status != 200:
+        return {"connected": True, "playing": False, "reason": _error(status, body)}
+
+    item = body.get("item") or {}
+    album = item.get("album") or {}
+    images = album.get("images") or []
+    artwork = ""
+    for image in images:
+        url = str(image.get("url") or "")
+        if url.startswith("https://"):
+            artwork = url
+            break
+    device = body.get("device") or {}
+    return {
+        "connected": True,
+        "playing": bool(body.get("is_playing")),
+        "track": str(item.get("name") or ""),
+        "artists": ", ".join(str(a.get("name") or "") for a in item.get("artists", [])),
+        "album": str(album.get("name") or ""),
+        "artwork": artwork,
+        "progress_ms": int(body.get("progress_ms") or 0),
+        "duration_ms": int(item.get("duration_ms") or 0),
+        "shuffle": bool(body.get("shuffle_state")),
+        "repeat": str(body.get("repeat_state") or "off"),
+        "volume": int(device.get("volume_percent") or 0),
+        "device": str(device.get("name") or ""),
+    }
+
+
 def media_control(parameters: dict | None = None, player=None) -> str:
     p = parameters if isinstance(parameters, dict) else {}
     action = str(p.get("action") or "status")[:32].casefold().strip().replace(" ", "_")
@@ -316,6 +412,10 @@ def media_control(parameters: dict | None = None, player=None) -> str:
 
     device, device_error = _device_id(token, str(p.get("device") or p.get("device_id") or ""))
     if not device:
+        transport = {"play": "play", "resume": "play", "pause": "pause", "stop": "pause",
+                     "next": "next", "skip": "next", "previous": "previous", "back": "previous"}
+        if action in transport and not p.get("query") and not p.get("track") and not p.get("uri"):
+            return _fallback_note(transport[action], device_error)
         return device_error
     device_param = {"device_id": device}
 
@@ -333,17 +433,19 @@ def media_control(parameters: dict | None = None, player=None) -> str:
         elif p.get("uri"):
             payload["uris"] = [str(p["uri"])]
         status, body = _request("PUT", "/me/player/play", token, params=device_param, json=payload)
-        return "Spotify playback started in the background." if status in {200, 204} else _error(status, body)
+        if status in {200, 204}:
+            return "Spotify playback started in the background."
+        return _error(status, body) if payload else _fallback_note("play", _error(status, body))
 
     if action in {"pause", "stop"}:
         status, body = _request("PUT", "/me/player/pause", token, params=device_param)
-        return "Spotify paused." if status in {200, 204} else _error(status, body)
+        return "Spotify paused." if status in {200, 204} else _fallback_note("pause", _error(status, body))
     if action in {"next", "skip"}:
         status, body = _request("POST", "/me/player/next", token, params=device_param)
-        return "Skipped to the next Spotify track." if status in {200, 204} else _error(status, body)
+        return "Skipped to the next Spotify track." if status in {200, 204} else _fallback_note("next", _error(status, body))
     if action in {"previous", "back"}:
         status, body = _request("POST", "/me/player/previous", token, params=device_param)
-        return "Moved to the previous Spotify track." if status in {200, 204} else _error(status, body)
+        return "Moved to the previous Spotify track." if status in {200, 204} else _fallback_note("previous", _error(status, body))
     if action in {"volume", "set_volume"}:
         try:
             volume = max(0, min(100, int(p.get("value", p.get("volume", 0)))))
@@ -357,24 +459,68 @@ def media_control(parameters: dict | None = None, player=None) -> str:
             return "Provide a Spotify track URI to queue. Search first if needed."
         status, body = _request("POST", "/me/player/queue", token, params={**device_param, "uri": uri})
         return "Added the track to the Spotify queue." if status in {200, 204} else _error(status, body)
-    return "Use connect, search, play, pause, next, previous, volume, queue, status, or devices."
+    if action in {"shuffle", "set_shuffle"}:
+        raw = p.get("value", p.get("enabled", True))
+        if isinstance(raw, str):
+            enabled = raw.strip().casefold() not in {"off", "false", "no", "0"}
+        else:
+            enabled = bool(raw)
+        status, body = _request("PUT", "/me/player/shuffle", token,
+                                params={**device_param, "state": "true" if enabled else "false"})
+        if status in {200, 204}:
+            return f"Spotify shuffle is now {'on' if enabled else 'off'}."
+        return _error(status, body)
+
+    if action in {"repeat", "set_repeat", "loop"}:
+        raw = str(p.get("mode") or p.get("value") or "context").casefold().strip()
+        mode = {"all": "context", "playlist": "context", "album": "context",
+                "one": "track", "song": "track", "single": "track",
+                "off": "off", "none": "off", "context": "context", "track": "track"}.get(raw)
+        if mode is None:
+            return "Repeat mode must be off, track, or context."
+        status, body = _request("PUT", "/me/player/repeat", token,
+                                params={**device_param, "state": mode})
+        if status in {200, 204}:
+            label = {"off": "off", "track": "repeating the current track",
+                     "context": "repeating the whole context"}[mode]
+            return f"Spotify repeat is now {label}."
+        return _error(status, body)
+
+    if action in {"seek", "scrub", "jump"}:
+        raw = p.get("value", p.get("seconds", p.get("position")))
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            return "Tell me the position in seconds to seek to."
+        if not 0 <= seconds <= 86_400:
+            return "Seek position must be between 0 seconds and 24 hours."
+        status, body = _request("PUT", "/me/player/seek", token,
+                                params={**device_param, "position_ms": int(seconds * 1000)})
+        if status in {200, 204}:
+            return f"Moved Spotify playback to {int(seconds // 60)}:{int(seconds % 60):02d}."
+        return _error(status, body)
+
+    return ("Use connect, search, play, pause, next, previous, shuffle, repeat, "
+            "seek, volume, queue, status, or devices.")
 
 
 TOOL = {
     "name": "media_control",
     "description": (
         "Controls Spotify playback through Spotify Connect without using the visible Spotify window. "
-        "Search and play tracks, pause, skip, change volume, inspect the current song, list devices, "
+        "Search and play tracks, pause, skip, shuffle, repeat, seek, change volume, inspect the current song, list devices, "
         "and connect Spotify once. Playback needs Spotify Premium and an active Connect device."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "enum": ["connect", "search", "play", "pause", "next", "previous", "volume", "queue", "status", "devices"], "maxLength": 16, "description": "connect | search | play | pause | next | previous | volume | queue | status | devices"},
+            "action": {"type": "STRING", "enum": ["connect", "search", "play", "pause", "next", "previous", "shuffle", "repeat", "seek", "volume", "queue", "status", "devices"], "maxLength": 16, "description": "connect | search | play | pause | next | previous | shuffle | repeat | seek | volume | queue | status | devices"},
             "query": {"type": "STRING", "maxLength": 500, "description": "Song, artist, or search text."},
             "track": {"type": "STRING", "maxLength": 500, "description": "Track search text for play."},
             "uri": {"type": "STRING", "maxLength": 200, "description": "Spotify track URI for play or queue."},
-            "value": {"type": "INTEGER", "minimum": 0, "maximum": 100, "description": "Spotify volume from 0 to 100."},
+            "value": {"type": "NUMBER", "minimum": 0, "maximum": 86400, "description": "Volume percent for volume, seconds for seek, or 1/0 for shuffle."},
+            "mode": {"type": "STRING", "enum": ["off", "track", "context"], "maxLength": 10, "description": "Repeat mode: off, track, or context."},
+            "enabled": {"type": "BOOLEAN", "description": "Shuffle on or off."},
             "device": {"type": "STRING", "maxLength": 300, "description": "Optional Spotify device name or ID."},
             "client_id": {"type": "STRING", "minLength": 16, "maxLength": 128, "description": "Spotify application client ID for the one-time connect flow."},
         },

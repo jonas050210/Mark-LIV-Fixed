@@ -67,7 +67,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 🌤️ Weather Report | Live weather data for your city, personalized from memory |
 | 🗺️ Dynamic Content Panel | Scrollable display layer beneath the HUD that renders web results, news, and search data |
 | 🔍 Multi-Mode Web Search | `news` / `research` / `price` / `compare` / `search` — Gemini Grounded first, DDG fallback |
-| ⏰ Smart Reminders | OS-native scheduled notifications (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) |
+| ⏰ Smart Reminders | OS-native scheduled notifications (Windows Task Scheduler / macOS LaunchAgent / Linux systemd), listable and cancellable |
 | ✈️ Flight Finder | Live flight price and availability lookup |
 | 🎮 Game Updater | Checks and triggers game updates on Steam and Epic Games on demand |
 | 📂 File Processor | Read, summarize, and answer questions about local files |
@@ -204,7 +204,7 @@ Three things it deliberately does *not* do:
 * **It does not hoard.** Undoing a write means keeping the old contents in memory, so files over 1 MB are excluded and it says so rather than holding a 200 MB log for the session.
 * **It does not delete your files to undo a copy.** The reverse of a copy is removing the copy; the reverse of "create a folder" is removing it *only while it's still empty*.
 
-`organize_desktop` gets special treatment — one command that moves dozens of files, which made it the least reversible thing the assistant could do. It journals every move and puts all of them back in one go, cleaning up the folders it created if they're still empty.
+Bulk desktop reorganisation used to live here, with a journal that could put every moved file back. It was removed anyway: a user who cannot see where fifty files went does not know there is anything to undo, and asking for three specific files to be moved is both clearer and safer.
 
 **Undo costs nothing at runtime.** It appends a closure to a list; nothing in it runs unless you ask.
 
@@ -314,6 +314,17 @@ python main.py
 Mark LIV/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, viseme extraction, tool dispatch
 ├── ui.py                     # PyQt6 HUD — avatar canvas, waveform, log panel, settings drawer, camera feed
+├── ui_panels/                # every floating HUD panel, kept out of ui.py
+│   ├── base.py               # panel base class, palette proxy, shared widget styling
+│   ├── launcher.py           # search, pin and start any indexed application
+│   ├── layouts.py            # save, restore and delete window layouts
+│   ├── setup.py              # first-run API key entry
+│   ├── customize.py          # accent colour, avatar and identity
+│   ├── plugins.py            # plugin manager and plugin settings
+│   ├── confirm.py            # the confirmation gate for irreversible actions
+│   ├── audio_devices.py      # microphone and speaker selection
+│   ├── memory.py             # browse, search and forget memory entries
+│   └── remote_key.py         # dashboard pairing, QR code and PIN
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
@@ -328,7 +339,8 @@ Mark LIV/
 │   ├── screen_processor.py   # Screen & webcam capture for vision
 │   ├── background_monitor.py # User-configured topic watching — daily DDG check
 │   ├── proactive.py          # Proactive 2.0 — time/context/rotation-aware check-ins
-│   ├── reminder.py           # OS-native scheduled notifications
+│   ├── file_handlers/        # per-format handlers behind file_processor
+│   ├── reminder.py           # OS-native scheduled notifications, with a cancellable registry
 │   ├── system_monitor.py     # CPU / RAM / GPU / temperature telemetry
 │   ├── computer_settings.py  # System settings, media keys, and confirmed power actions
 │   ├── computer_control.py   # Mouse, keyboard, clipboard, screenshots, UI targeting

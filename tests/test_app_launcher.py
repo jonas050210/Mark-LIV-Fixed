@@ -1,0 +1,247 @@
+"""Regression tests for the indexed launcher and the focus-safety guards.
+
+These cover the behaviours that previously went wrong:
+
+* an application launch fell through to pressing the Windows key and typing the
+  name into the Start menu, then reported success unconditionally;
+* a close request was carried out with alt+f4, which hits whichever window has
+  focus rather than the named one;
+* alias resolution matched on substrings, so 'code' matched inside 'vscode';
+* there was no way to open an application in the background, on a chosen
+  monitor, or in fullscreen.
+"""
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from core import app_index
+from core.app_index import AppEntry
+from core.window_manager import MonitorInfo, WindowInfo
+from actions import computer_control, open_app
+
+
+def _entry(name: str, target: str = "/usr/bin/app", kind: str = "exec") -> AppEntry:
+    return AppEntry(name=name, kind=kind, target=target, source="registry")
+
+
+def _window(handle: int = 1, title: str = "Google Chrome", process: str = "chrome",
+            pid: int = 10, left: int = 0, right: int = 800) -> WindowInfo:
+    return WindowInfo(
+        handle=handle, title=title, process=process, pid=pid,
+        left=left, top=0, right=right, bottom=600,
+    )
+
+
+_MONITORS = [
+    MonitorInfo(1, "primary", 0, 0, 1920, 1080, 0, 0, 1920, 1040, primary=True),
+    MonitorInfo(2, "secondary", 1920, 0, 3840, 1080, 1920, 0, 3840, 1040),
+]
+
+
+class HotkeyGuardTests(unittest.TestCase):
+    """Focus-dependent combinations must be refused, not sent."""
+
+    def test_alt_f4_is_refused_and_names_the_safe_alternative(self) -> None:
+        with patch.object(computer_control, "pyautogui", create=True) as gui:
+            result = computer_control._hotkey("alt", "f4")
+        self.assertIn("Refused", result)
+        self.assertIn("window_manager", result)
+        gui.hotkey.assert_not_called()
+
+    def test_command_q_and_ctrl_w_are_refused(self) -> None:
+        for keys in (("command", "q"), ("ctrl", "w"), ("alt", "tab")):
+            with patch.object(computer_control, "pyautogui", create=True) as gui:
+                result = computer_control._hotkey(*keys)
+            self.assertIn("Refused", result, keys)
+            gui.hotkey.assert_not_called()
+
+    def test_windows_key_alone_is_refused(self) -> None:
+        with patch.object(computer_control, "pyautogui", create=True) as gui:
+            result = computer_control._press("win")
+        self.assertIn("Refused", result)
+        gui.press.assert_not_called()
+
+    def test_aliases_are_canonicalised_before_the_check(self) -> None:
+        with patch.object(computer_control, "pyautogui", create=True) as gui:
+            result = computer_control._hotkey("Cmd", "Q")
+        self.assertIn("Refused", result)
+        gui.hotkey.assert_not_called()
+
+    def test_ordinary_in_app_shortcuts_still_work(self) -> None:
+        with patch.object(computer_control, "pyautogui", create=True) as gui, \
+             patch.object(computer_control, "_PYAUTOGUI", True):
+            result = computer_control._hotkey("ctrl", "s")
+        self.assertEqual(result, "Hotkey: ctrl+s")
+        gui.hotkey.assert_called_once_with("ctrl", "s")
+
+    def test_the_guard_runs_before_pyautogui_is_required(self) -> None:
+        """A refusal must be an explanation, not a missing-dependency error."""
+        with patch.object(computer_control, "_PYAUTOGUI", False):
+            self.assertIn("Refused", computer_control._hotkey("alt", "f4"))
+
+
+class AliasResolutionTests(unittest.TestCase):
+    """Alias lookup must not match on accidental substrings."""
+
+    def test_unrelated_word_containing_an_alias_is_not_rewritten(self) -> None:
+        self.assertEqual(open_app._alias_target("digital"), "digital")
+
+    def test_exact_alias_resolves_to_this_platform_s_name(self) -> None:
+        # On Windows the canonical name happens to be "chrome" itself, so
+        # asserting that the text changed only holds on the other platforms.
+        expected = open_app._APP_ALIASES["chrome"][open_app._SYSTEM]
+        self.assertEqual(open_app._alias_target("chrome"), expected)
+
+    def test_multiword_request_prefers_the_full_alias(self) -> None:
+        self.assertEqual(
+            open_app._alias_target("visual studio code"),
+            open_app._alias_target("vscode"),
+        )
+
+
+class IndexScoringTests(unittest.TestCase):
+    def test_exact_name_outranks_a_fuzzy_neighbour(self) -> None:
+        exact = _entry("Discord")
+        fuzzy = _entry("Discord PTB")
+        self.assertGreater(
+            app_index.score_entry("discord", exact),
+            app_index.score_entry("discord", fuzzy),
+        )
+
+    def test_unrelated_entries_score_zero(self) -> None:
+        self.assertEqual(app_index.score_entry("chrome", _entry("Blender")), 0.0)
+
+    def test_resolve_ranks_the_exact_match_first(self) -> None:
+        pool = [_entry("Steam Cleaner"), _entry("Steam"), _entry("Steamworks SDK")]
+        matches = app_index.resolve("steam", entries=pool)
+        self.assertEqual(matches[0].name, "Steam")
+
+    def test_a_uri_is_recognised_and_a_path_is_not(self) -> None:
+        self.assertTrue(app_index.is_uri("ms-settings:"))
+        self.assertTrue(app_index.is_uri("https://example.com"))
+        self.assertFalse(app_index.is_uri(r"C:\\Program Files\\app.exe"))
+        self.assertFalse(app_index.is_uri("chrome"))
+
+
+class LaunchHonestyTests(unittest.TestCase):
+    """A launch must never claim success it did not verify."""
+
+    def test_unknown_application_is_reported_instead_of_typed_into_the_start_menu(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([], True)), \
+             patch.object(open_app, "_nearby_names", return_value=""), \
+             patch.object(open_app, "_launch_resolved") as launch:
+            result = open_app.open_app({"app_name": "Nonexistent Thing"})
+        self.assertIn("could not find an installed application", result)
+        launch.assert_not_called()
+
+    def test_launch_without_a_window_is_not_called_a_success(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 4242, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=None):
+            result = open_app.open_app({"app_name": "Chrome"})
+        self.assertIn("no window appeared", result)
+        self.assertNotIn("Opened Chrome.", result)
+
+    def test_launch_failure_is_reported_with_its_reason(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(False, None, "it is no longer installed")):
+            result = open_app.open_app({"app_name": "Chrome"})
+        self.assertIn("could not start", result)
+        self.assertIn("no longer installed", result)
+
+    def test_ambiguous_match_asks_instead_of_guessing(self) -> None:
+        candidates = [_entry("Visual Studio"), _entry("Visual Studio Code")]
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=(candidates, False)), \
+             patch.object(open_app, "_launch_resolved") as launch:
+            result = open_app.open_app({"app_name": "visual studio thing"})
+        self.assertIn("more than one installed application", result)
+        launch.assert_not_called()
+
+
+class PlacementTests(unittest.TestCase):
+    """Monitor and window-state requests must be applied and verified."""
+
+    def test_open_on_second_monitor_in_fullscreen(self) -> None:
+        placed = _window(handle=7, left=1920, right=3840)
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 99, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=_window(handle=7)), \
+             patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
+             patch("core.window_manager.place_window", return_value=placed) as place:
+            result = open_app.open_app(
+                {"app_name": "Chrome", "monitor": 2, "state": "fullscreen"}
+            )
+        self.assertIn("monitor 2", result)
+        self.assertIn("fullscreen", result)
+        self.assertEqual(place.call_args[0][2], "fullscreen")
+
+    def test_unverified_monitor_move_is_reported(self) -> None:
+        still_on_monitor_one = _window(handle=7, left=0, right=800)
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 99, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=_window(handle=7)), \
+             patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
+             patch("core.window_manager.place_window", return_value=still_on_monitor_one):
+            result = open_app.open_app({"app_name": "Chrome", "monitor": 2})
+        self.assertIn("could not verify", result)
+
+    def test_invalid_state_is_rejected_before_launching(self) -> None:
+        with patch.object(open_app, "_launch_resolved") as launch:
+            result = open_app.open_app({"app_name": "Chrome", "state": "sideways"})
+        self.assertIn("state must be one of", result)
+        launch.assert_not_called()
+
+
+class BackgroundLaunchTests(unittest.TestCase):
+    """Opening without stealing focus must restore the previous foreground."""
+
+    def test_background_launch_restores_the_previous_foreground_window(self) -> None:
+        previous = _window(handle=1, title="Editor", process="code")
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 99, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=_window(handle=7)), \
+             patch("core.window_manager.foreground_window", return_value=previous), \
+             patch("core.window_manager.restore_foreground") as restore, \
+             patch("core.window_manager.operate"):
+            result = open_app.open_app({"app_name": "Chrome", "foreground": False})
+        self.assertIn("in the background", result)
+        restore.assert_called_once_with(previous)
+
+    def test_already_open_app_is_left_alone_when_background_is_requested(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[_window()]), \
+             patch.object(open_app, "_focus_window") as focus:
+            result = open_app.open_app({"app_name": "Chrome", "foreground": False})
+        self.assertIn("left it in the background", result)
+        focus.assert_not_called()
+
+    def test_already_open_app_is_moved_when_a_placement_is_requested(self) -> None:
+        placed = _window(handle=1, left=1920, right=3840)
+        with patch.object(open_app, "_matching_windows", return_value=[_window()]), \
+             patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
+             patch("core.window_manager.place_window", return_value=placed):
+            result = open_app.open_app({"app_name": "Chrome", "monitor": 2})
+        self.assertIn("was already open", result)
+        self.assertIn("monitor 2", result)
+
+
+class NoKeyboardFallbackTests(unittest.TestCase):
+    """The Start-menu/Spotlight typing fallback must be gone for good."""
+
+    def test_open_app_never_imports_pyautogui(self) -> None:
+        source = open_app.__file__
+        with open(source, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn("pyautogui", text)
+        self.assertNotIn('press("win")', text)
+
+
+if __name__ == "__main__":
+    unittest.main()

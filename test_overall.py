@@ -240,16 +240,29 @@ def _setup_and_requirements() -> str:
 
 
 def _secret_hygiene() -> str:
-    ignore = (REPO / ".gitignore").read_text(encoding="utf-8")
     expected = (
         "config/api_keys.json",
         "config/spotify_token.json",
+        "config/app_index.json",
+        "config/certs/jarvis.key",
         "memory/long_term.json",
         "memory/sessions.json",
     )
-    missing = [entry for entry in expected if entry not in ignore]
+    # Ask git itself rather than searching .gitignore for a substring. A pattern
+    # written as "config/api_keys.json  # comment" appears in the file but
+    # matches nothing, because git has no trailing-comment syntax.
+    missing = [
+        entry for entry in expected
+        if subprocess.run(
+            ["git", "check-ignore", "-q", entry],
+            cwd=REPO, capture_output=True, check=False, timeout=10,
+        ).returncode != 0
+    ]
     if missing:
-        raise RuntimeError(".gitignore does not protect: " + ", ".join(missing))
+        raise RuntimeError(
+            ".gitignore does not actually ignore: " + ", ".join(missing)
+            + " (a trailing '# comment' on a pattern line breaks it)"
+        )
     forbidden_names = {
         "api_keys.json", "spotify_token.json", "client_secret.json",
         "token.json", "jarvis.key", "jarvis.crt",
@@ -294,6 +307,98 @@ def _run_unit_tests() -> str:
     return summary or "unit suite passed"
 
 
+# The modules where a gap in the tests is a safety problem rather than a
+# cosmetic one: they decide what is allowed to touch the filesystem, what is
+# persisted, what a failed action reports, and what a launch actually starts.
+#
+# The floors are a few points below what the suite actually reaches, because
+# the same tests cover slightly different lines on each platform: POSIX
+# permission bits, Windows reparse points and the native window API are each
+# unreachable somewhere. A floor that only holds on Linux would fail the
+# Windows runner for no defect.
+COVERAGE_FLOORS = {
+    "core/action_result.py": 90,
+    "core/action_runtime.py": 85,
+    "core/app_index.py": 76,
+    "core/background_scheduler.py": 88,
+    "core/browser_handoff.py": 90,
+    "core/confirm.py": 70,
+    "core/json_store.py": 84,
+    "core/path_policy.py": 62,
+    "core/sandbox.py": 78,
+    "core/text_match.py": 82,
+    "core/undo.py": 85,
+    "memory/session_store.py": 88,
+    "actions/layout_manager.py": 74,
+    "actions/open_app.py": 60,
+    "actions/reminder.py": 65,
+    "dashboard/server.py": 40,
+    "core/speech_shaping.py": 85,
+    "core/untrusted.py": 85,
+    # Windows cannot execute the POSIX ownership and permission branches.
+    "core/plugin_loader.py": 66,
+}
+
+
+def _run_coverage() -> str:
+    """Measure line coverage and enforce a floor on the modules that matter.
+
+    A total percentage across a codebase this size says very little — it is
+    dominated by the GUI and by platform branches that cannot run here. What is
+    worth gating is the handful of modules that decide what MARK LIV is allowed
+    to do, so each of those carries its own floor.
+    """
+    try:
+        import coverage  # noqa: F401
+    except ImportError as exc:
+        raise SkipCheck("coverage is not installed (pip install coverage)") from exc
+
+    env = os.environ.copy()
+    env.pop("RUN_WINDOWS_INTEGRATION", None)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    data_file = REPO / ".coverage.overall"
+    env["COVERAGE_FILE"] = str(data_file)
+    common = [sys.executable, "-m", "coverage"]
+    try:
+        completed = subprocess.run(
+            common + ["run", "--source", ".", "--omit", "tests/*,*/site-packages/*",
+                      "-m", "unittest", "discover", "-s", str(TESTS), "-p", "test_*.py"],
+            cwd=REPO, env=env, capture_output=True, text=True, timeout=600, check=False,
+        )
+        if completed.returncode:
+            tail = (completed.stderr or completed.stdout).strip().splitlines()[-20:]
+            raise RuntimeError("tests failed under coverage:\n" + "\n".join(tail))
+        report = subprocess.run(
+            common + ["json", "-o", "-", "--quiet"],
+            cwd=REPO, env=env, capture_output=True, text=True, timeout=120, check=False,
+        )
+        if report.returncode:
+            raise RuntimeError("coverage report failed: " + report.stderr.strip()[-400:])
+        measured = json.loads(report.stdout)
+    finally:
+        for leftover in REPO.glob(".coverage.overall*"):
+            leftover.unlink(missing_ok=True)
+
+    files = measured.get("files", {})
+    below = []
+    for name, floor in sorted(COVERAGE_FLOORS.items()):
+        entry = files.get(name) or files.get(name.replace("/", os.sep))
+        if entry is None:
+            below.append(f"{name}: not measured")
+            continue
+        percent = entry["summary"]["percent_covered"]
+        if percent + 0.5 < floor:
+            below.append(f"{name}: {percent:.0f}% < {floor}%")
+    if below:
+        raise RuntimeError("coverage below the agreed floor — " + "; ".join(below))
+    total = measured.get("totals", {}).get("percent_covered", 0.0)
+    return (
+        f"{len(COVERAGE_FLOORS)} safety-critical modules at or above their floor; "
+        f"{total:.0f}% overall"
+    )
+
+
 def _run_windows_tests() -> str:
     if platform.system() != "Windows":
         raise SkipCheck("Windows integration checks require Windows")
@@ -330,6 +435,8 @@ def _environment() -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--windows", action="store_true", help="run opt-in Windows hardware checks")
+    parser.add_argument("--coverage", action="store_true",
+                        help="measure line coverage and enforce the per-module floors")
     parser.add_argument("--json", metavar="PATH", help="write the machine-readable report to PATH")
     args = parser.parse_args(argv)
 
@@ -346,6 +453,14 @@ def main(argv: list[str] | None = None) -> int:
     runner.run("setup and requirements", _setup_and_requirements)
     runner.run("secret hygiene", _secret_hygiene)
     runner.run("unit test suite", _run_unit_tests)
+    if args.coverage:
+        runner.run("coverage floors", _run_coverage)
+    else:
+        runner.checks.append(Check(
+            "coverage floors", "skipped",
+            "use --coverage to measure line coverage of the safety-critical modules", 0,
+        ))
+        print("[SKIP] coverage floors — use --coverage to measure them")
     if args.windows:
         runner.run("Windows integration suite", _run_windows_tests)
     else:

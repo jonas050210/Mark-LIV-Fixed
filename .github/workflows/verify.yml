@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.11", "3.13"]
 
     steps:
@@ -41,7 +41,18 @@ jobs:
         run: >-
           python -m pip install --disable-pip-version-check
           "fastapi<1" "uvicorn<1" "cryptography<47"
-          "python-multipart<1" "httpx<0.28"
+          "python-multipart<1" "httpx<0.28" "coverage<8"
+          "rapidfuzz<4" "PyQt6<7" "psutil<8" "numpy<3"
+
+      # The panel tests need a platform plugin. Without these the widget tests
+      # skip, and a panel that fails to build would reach a user unnoticed.
+      - name: Install Qt runtime dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0
 
       - name: Validate setup inputs
         run: python setup.py --check
@@ -50,7 +61,29 @@ jobs:
         run: python -m compileall -q .
 
       - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python .github/scripts/run_tests.py
 
       - name: Run overall verification
-        run: python .github/scripts/run_overall.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python .github/scripts/run_overall.py --coverage
+
+      # The Windows-only hardware checks are opt-in everywhere else; on a
+      # Windows runner there is no reason not to run them.
+      - name: Run Windows hardware integration suite
+        if: runner.os == 'Windows'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest tests.test_windows_integration -v
+
+      # The transcript is what makes a red Windows run diagnosable from here;
+      # the hosted log API is not always readable after the fact.
+      - name: Upload the verification report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-${{ matrix.os }}-py${{ matrix.python }}
+          path: overall-report.json
+          if-no-files-found: ignore

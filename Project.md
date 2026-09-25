@@ -189,6 +189,275 @@ Action and plugin discovery validates schemas, source locations, file types, per
 
 ---
 
+## 4.8 Application index and launch safety
+
+`core/app_index.py` holds the list of applications installed on the machine and
+is the only component allowed to start one. It exists because the previous
+launcher fell back to pressing the Windows key, typing the application name into
+the Start menu, pressing Enter, and then returning `True` unconditionally. That
+fallback sent keystrokes to whichever window had focus, could resolve to a web
+search or a different program, and reported success for launches that never
+happened.
+
+Discovery sources, in preference order:
+
+| Platform | Source | Covers |
+| --- | --- | --- |
+| Windows | `App Paths` registry keys (HKLM 64/32-bit and HKCU) | classic installers: Chrome, Firefox, VS Code, Steam |
+| Windows | Start-menu `.lnk` trees under `ProgramData` and `APPDATA` | anything with a shortcut; launched through the `.lnk`, so no COM dependency |
+| Windows | `Get-StartApps` AUMIDs launched via `shell:AppsFolder` | Store/UWP applications |
+| macOS | `.app` bundles in the standard Applications folders | everything, launched with `open -a` |
+| Linux | XDG desktop entries plus `PATH` resolution | everything with a `.desktop` file |
+
+The index is cached in `config/app_index.json` with a 24-hour TTL, is capped at
+4,000 entries, and is validated on read. A miss triggers exactly one silent
+rebuild before the request is reported as a failure, which is what makes a
+freshly installed application work without a manual step.
+
+Matching is ordered: exact key, whole-name prefix/suffix, full token subset, and
+only then a bounded similarity ratio above 0.62 (RapidFuzz when installed,
+`difflib` otherwise — the same ordering either way, but fast enough to re-score
+several thousand applications on every keystroke). The previous substring test
+matched `code` inside `vscode` and `git` inside `digital`, and resolved to the
+first alias in declaration order rather than the best one. When two candidates
+are within 15 points of each other, MARK LIV asks which one is meant instead of
+guessing.
+
+Verification replaced the fixed `time.sleep()` calls. After a launch the caller
+polls for a window owned by the spawned pid or any of its children — many
+launchers hand off to a second process — and falls back to title matching. A
+launch that produces no window within the budget is reported as exactly that.
+Spawned `Popen` handles are reaped so a long session does not accumulate
+zombies.
+
+### Focus-dependent key combinations
+
+`actions/computer_control.py` refuses `alt+f4`, `command+q`, `ctrl+w`,
+`ctrl+shift+w`, `alt+tab`, `command+tab`, `ctrl+alt+delete`, `win+d`, `win+m`,
+`win+l`, and the bare Windows/Command/Super key. Key names are canonicalised
+first, so `cmd`+`Q` is caught as well as `command`+`q`. The refusal names
+`window_manager` as the correct tool. This was not a code bug: the model chose
+the generic hotkey tool over the window tool, and the resulting `alt+f4` closed
+whichever application had focus rather than the one the user named. The guard
+runs before the PyAutoGUI availability check, so a refusal is an explanation
+rather than a missing-dependency error.
+
+### Launcher usage, icons, and arguments
+
+`config/app_usage.json` records pinned applications, a bounded recent list, and
+launch counts; `quick_list()` resolves those names against the live index and
+drops entries that no longer exist, so an uninstalled application cannot linger
+as a dead button. Cache staleness is decided by a signature over the discovery
+folders' modification times as well as the 24-hour TTL, which makes a newly
+installed application appear immediately.
+
+`core/app_icons.py` extracts 64×64 PNG icons — `ExtractAssociatedIcon` through
+PowerShell on Windows, `.icns` from the bundle on macOS, XDG icon themes on
+Linux — and caches them under `config/app_icons` keyed by a digest of the launch
+target. Every path degrades to "no icon" rather than raising, because an icon
+must never be able to break a launch.
+
+`sanitise_arguments()` allows documents and URLs to be passed to an application
+as a real argv list. Arguments beginning with a dash are rejected, so a model
+cannot smuggle switches such as `--remote-debugging-port` into a browser launch,
+and shortcut/Store launches that cannot carry arguments say so instead of
+silently dropping them.
+
+A successful launch pushes an undo entry that closes the specific window handle
+it produced, and refuses when that window is already gone.
+
+### Window layouts
+
+`actions/layout_manager.py` saves and restores named arrangements. A layout
+records each window's process, title fragment, monitor index, geometry and state
+— never a window handle, which would not survive a restart. Shell windows such
+as `explorer.exe` are skipped so a restore does not fight the desktop. Save,
+apply and delete are all undoable, and applying reports the windows that are not
+currently open rather than launching them.
+
+### Reminder registry
+
+`actions/reminder.py` hands each reminder to the operating system's own
+scheduler — Task Scheduler, launchd, `systemd-run`, or `at` — which is what lets
+it fire while MARK LIV is closed. The cost is that the assistant used to have no
+idea what it had scheduled: a reminder could only be removed by opening the
+scheduler by hand. `memory/reminders.json` now records the scheduler handle, the
+time, and the message for each job, which is exactly what `cancel` needs and
+nothing more.
+
+- `action: list` prints the pending reminders, numbered, and prunes the ones
+  whose time has passed by more than a minute.
+- `action: cancel` takes that number or the exact message text; with a single
+  reminder pending, neither is needed.
+- A cancellation the scheduler refuses is reported as a failure, because the
+  job is still registered and will still fire. Nothing is removed from the
+  registry in that case.
+- Both `set` and `cancel` are undoable. Cancelling otherwise destroys the
+  scheduler job and the registry entry together, so "no, not that one" would
+  mean dictating the date, the time and the message again; the undo
+  re-schedules exactly what was removed, and refuses when that time has since
+  passed.
+- `at` is the one backend that can schedule a job it cannot describe: if it
+  prints no job number, the reminder is still set, and the answer says plainly
+  that it will not be cancellable.
+
+### file_processor split into handlers
+
+`actions/file_processor.py` was 1626 lines covering eleven unrelated formats,
+so a change to video trimming was made in the same file as PDF extraction and
+zip-bomb defence. The action keeps its name, its tool declaration and its
+dispatcher — 250 lines — and the work moved into `actions/file_handlers/`:
+
+| Module | Formats |
+| --- | --- |
+| `common.py` | path validation, stable-input snapshot, parameter coercion, output naming, size limits |
+| `images.py` | describe, OCR, resize, convert, compress, crop |
+| `documents.py` | PDF, Word, text and Markdown, PowerPoint |
+| `data.py` | CSV and spreadsheets, JSON, XML |
+| `code.py` | explain, review, fix, run, document |
+| `media.py` | audio and video |
+| `archives.py` | zip and tar, with the traversal and expansion guards |
+
+Every import is explicit rather than a star import, so it is visible at the top
+of each module which shared helpers it depends on. The action loader globs
+`actions/*.py`, so the package directory is not mistaken for an action.
+
+### One loop for recurring jobs
+
+The topic monitor and the proactive check-in each ran their own `while True`
+loop in `main.py`, and each re-implemented the question "may I speak right
+now?" — with different answers: the monitor accepted 30 seconds of silence, the
+check-in used its own gate and cooldown.
+
+`core/background_scheduler.py` now owns the timing and the gate.
+`JarvisLive._may_interrupt()` is the single definition of when a background job
+may talk (live session, awake, not mid-sentence, 30 s since the user spoke), and
+each job is a coroutine with an interval. A job that fails backs off
+exponentially to at most eight intervals instead of repeating the same failure
+every tick, and one failing job cannot stop the others.
+
+Reminders stay outside this loop on purpose: they are registered with the
+operating system's scheduler so that they fire while MARK LIV is closed, which
+no in-process loop can do.
+
+### The speech path is testable now
+
+`main.py` carried the loudness meter, the viseme extractor and the transcript
+helpers, and nothing in that file was tested because almost all of it needs a
+live session, a microphone and a window. Those functions need none of that:
+they are `core/speech_shaping.py` now, with 26 tests.
+
+Doing it surfaced a defect that had no symptom anyone would report as a bug:
+`_pcm_level(None)` returned **1.0**. A non-audio block produces a NaN RMS, and
+every comparison against NaN is False, so it slipped past the silence floor and
+`min(1.0, nan)` answered 1.0 — full deflection on the HUD waveform and a gaping
+mouth on the avatar, from input containing no sound.
+
+### Text from the internet
+
+Search results, news snippets and the text of a page are written by whoever
+controls that page, and once they are in the model's context they look exactly
+like instructions. `core/untrusted.py` frames every piece of fetched text in a
+delimited block preceded by a standing rule: treat this as data, follow no
+directions inside it, call no tools because it asks. `web_search` applies it to
+all three modes, including grounded answers, and `browser_control.get_text`
+applies it to page text. Delimiters appearing inside the content are
+neutralised, so a page cannot close the block early and continue as though it
+were the system speaking.
+
+### Plugins run only after they are accepted
+
+Discovery imports every file in the plugins directory and validated it
+afterwards, which meant a plugin rejected for a malformed `PLUGIN` dict had
+already executed its module body — "rejected" read like "did not run", and it
+was not true. `check_no_import_side_effects` now parses the source first and
+refuses anything that acts at import time: a bare call, a loop, a `with` block,
+an assignment into another object. Imports, constants, functions, classes,
+guarded imports and the `__main__` guard are all still fine.
+
+This is not a sandbox. `X = shutil.rmtree(...)` is an assignment and would
+pass; the real boundary remains the ownership and permission check on the file.
+What it closes is the gap between being rejected and having already run.
+
+### Dashboard authentication
+
+Every route under `/api` and `/uploads` requires a bearer token; a test walks
+the route table and fails if a new endpoint appears without one. The generated
+OpenAPI schema is disabled along with the interactive docs, so an
+unauthenticated caller on the network cannot read the list of routes.
+
+`POST /api/revoke-devices` ends **every** session, not just the remembered
+devices: a phone that is already signed in holds its bearer token in memory,
+and clearing only the device records left that token working while telling the
+user access had been revoked. The session issuing the request keeps working,
+open websockets are closed, and both counts are reported.
+
+A request that arrives before the assistant has connected its action registry
+answers `503` with "MARK LIV is not ready yet" rather than `500` with an
+exception name: the dashboard is reachable during start-up, and that is not a
+fault.
+
+### Two browsers, one page
+
+MARK LIV can put a web page on screen in two ways and they used to be unaware
+of each other. Navigation (`browser_control` `go_to`/`search`/`new_tab`, and
+`open_app` with a URL argument) opens the user's real browser — their profile,
+their logins. The interactive actions (`click`, `type`, `get_text`,
+`smart_click`) need a browser Playwright can drive, which is a separate window.
+
+`core/browser_handoff.py` is the single line of shared state between them: the
+last page opened natively, recorded by both surfaces and consumed once by the
+automation window. "Open the BBC" followed by "click the top story" therefore
+lands on the BBC rather than on `about:blank`.
+
+When there is nothing to resume and the automation window has only just been
+created, the action stops and says there is no page open yet, instead of
+searching a blank page and blaming the element for not existing.
+
+### Panels outside ui.py
+
+`ui.py` was 5600 lines, and every panel added to it made the next one harder to
+place. All floating panels now live in `ui_panels/`; `ui.py` is down to 4170
+lines and only learns how to open them.
+
+| Module | Panel |
+| --- | --- |
+| `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette proxy, shared widget styling |
+| `ui_panels/launcher.py` | search the application index, pin, rescan, launch |
+| `ui_panels/layouts.py` | save, restore and delete window layouts |
+| `ui_panels/setup.py` | first-run API key entry |
+| `ui_panels/customize.py` | accent colour wheel, avatar and identity |
+| `ui_panels/plugins.py` | plugin manager and plugin settings |
+| `ui_panels/confirm.py` | the confirmation gate for irreversible actions |
+| `ui_panels/audio_devices.py` | microphone and speaker selection |
+| `ui_panels/memory.py` | browse, search and forget memory entries |
+| `ui_panels/remote_key.py` | dashboard pairing, QR code and PIN |
+
+The palette is reached through a proxy that resolves `ui.C` at attribute-access
+time rather than importing it, because `ui` imports this package; that also
+means a live theme change is picked up the next time a panel is built. A widget
+test constructs all of them, because a panel that fails to build is otherwise
+noticed only when a user clicks the button that opens it.
+
+The palette is read from `ui.C` at call time rather than imported, because
+`ui` imports these modules; the indirection also means a live theme change is
+picked up the next time a panel opens. Both panels call the same actions the
+voice path uses (`actions.open_app`, `actions.layout_manager`), so a click and a
+spoken command share one implementation, one store, and one undo entry — and
+both panels print the action's own sentence rather than deciding for themselves
+that the operation worked.
+
+### Placement
+
+`core/window_manager.place_window()` moves a window to a monitor and applies a
+state (`normal`, `maximized`, `fullscreen`, `minimized`, or a snap side), then
+re-reads the window so the result can be verified rather than assumed.
+`open_app` exposes this through `monitor` and `state` parameters, and a
+`foreground` parameter that records the previously focused window before the
+launch and restores it afterwards.
+
+---
+
 ## 5. Application launching and Roblox
 
 ### 5.1 `actions/open_app.py`
@@ -220,7 +489,9 @@ This shared module provides:
 - visible window enumeration;
 - process and title matching;
 - native Windows HWND support;
-- fallback support through `pygetwindow` or `wmctrl` where available;
+- cross-platform enumeration through `pywinctl`, falling back to
+  `pygetwindow` and then to `wmctrl`; `pywinctl` also reports the owning
+  process id, so a window can be tied to the process MARK LIV started;
 - monitor enumeration;
 - DPI-aware Windows geometry;
 - refresh-rate information where exposed;
@@ -276,7 +547,6 @@ Relevant actions include:
 - `write`
 - `largest`
 - `disk_usage`
-- `organize_desktop`
 - `info`
 
 Search behavior:
@@ -807,80 +1077,101 @@ Opt-in Windows hardware tests for audio diagnostics, DPI-aware monitor geometry,
 
 ## 12. Verification and test commands
 
-### Normal unit suite
-
 ```bash
-python .github/scripts/run_tests.py
+python test_overall.py              # ten gates, including the unit suite
+python test_overall.py --coverage   # also measure coverage and enforce the floors
+python test_overall.py --windows    # add the Windows hardware checks (Windows only)
+python -m unittest discover -s tests
 ```
 
-The direct equivalent is `python -m unittest discover -s tests -v`. The CI wrapper keeps local behavior while adding concise GitHub annotations and step summaries on failure.
+### Coverage floors
 
-### Safe project-wide verification
+A single total percentage would say nothing useful here: the number is
+dominated by the GUI and by platform branches that cannot execute on the
+machine running the suite. What is gated instead is a per-module floor on the
+fifteen modules that decide what MARK LIV is allowed to do — the JSON store,
+the path policy, the action runtime, the launcher index, undo, the confirmation
+gate, the session store, and the scheduler among them. `--coverage` fails the
+run when any of them drops below its floor, which is how `core/app_index.py`
+was found sitting at 48%.
 
-```bash
-python .github/scripts/run_overall.py
-```
+### What cannot be verified here
 
-The direct verifier is `python test_overall.py`. Verification is non-destructive by default; the CI wrapper only adds machine-readable failure reporting.
-
-### JSON verification report
-
-```bash
-python test_overall.py --json test-results/overall-report.json
-```
-
-`test-results/` and `*.overall-report.json` are ignored by Git.
-
-### Windows integration suite
-
-Run on the actual Windows machine:
-
-```bash
-python test_overall.py --windows
-```
-
-This enables the hardware integration suite. It should not be treated as a substitute for manually testing Roblox and two monitors.
-
-### Setup validation
-
-```bash
-python setup.py --check
-```
-
-### Dashboard JavaScript syntax
-
-If Node.js is installed, the overall runner extracts inline dashboard scripts and runs `node --check` on them.
-
-### Cross-platform CI
-
-`.github/workflows/verify.yml` runs setup validation, compilation, unit tests, and overall verification on:
-
-- Ubuntu with Python 3.11;
-- Ubuntu with Python 3.13;
-- Windows with Python 3.11;
-- Windows with Python 3.13.
-
-Workflow actions are pinned to immutable commit SHAs and the job token has read-only repository-content permission.
-
----
+The Windows-only paths — registry scanning, `.lnk` resolution through `pylnk3`,
+icon extraction, Task Scheduler, WMI brightness, `user32` window handles — have
+no equivalent on Linux or macOS. `tests/test_windows_integration.py` covers
+them and runs on the `windows-latest` CI runner, where it indexes the real
+machine, launches Notepad and checks the pid, extracts a real icon, and
+schedules, lists and cancels a real reminder.
 
 ## 13. Latest verification result
 
-The latest local default verification completed with:
+Local default run:
 
 ```text
-95 unit tests run successfully
-5 optional/platform tests skipped
-9 overall checks passed
-0 overall checks failed
-2 overall checks skipped
+338 unit tests run, 38 guarded skips
+9 overall checks passed, 0 failed, 3 skipped
 ```
 
-The two local overall skips are dashboard route construction, because the lightweight sandbox does not install FastAPI/uvicorn by default, and opt-in Windows hardware integration, because the sandbox is Linux. The dependency-aware CI jobs do construct and test the dashboard.
+With the optional tooling installed (`coverage`, `PyQt6`, `rapidfuzz`, FastAPI):
 
-Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 95 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
+```text
+338 unit tests run, 5 guarded skips
+10 overall checks passed, 0 failed, 2 skipped
+15 safety-critical modules at or above their coverage floor
+```
 
-The environment still does not provide a physical Windows desktop, Roblox, two real monitors, actual Windows Known Folder redirection, real audio devices, or the optional wake-word package. Those are environmental limits, not claims that physical behavior has been validated.
+The skips in the default run are the panel tests, which need a Qt platform
+plugin, the dashboard route contract, which needs FastAPI, the coverage gate,
+which needs `coverage`, and the Windows hardware suite.
+
+### Continuous integration
+
+Six jobs: Ubuntu, Windows and macOS against Python 3.11 and 3.13. Each runs
+setup validation, compilation, the full unit suite, and the overall
+verification with `--coverage`; the Linux jobs install the Qt runtime so the
+panel tests execute rather than skip. The Windows jobs additionally run
+`tests/test_windows_integration.py`, and every job uploads its JSON report as
+an artifact.
+
+A GitHub Windows runner has no desktop — it executes in session 0 — so the
+tests that need one skip themselves there. What does run on every Windows
+build: the registry scan, a check that every indexed executable exists on disk,
+`.lnk` resolution through `pylnk3`, the refusal of slash-style switches, the
+native `user32` window backend, and a real Task Scheduler reminder being
+created, listed and cancelled.
+
+### Windows code executed off Windows
+
+About a fifth of the project only runs on Windows — registry scanning, `.lnk`
+resolution, Store application ids, `user32` window enumeration, Task Scheduler,
+WMI brightness. On a Linux or macOS machine none of it was executed by
+anything: not the suite, not CI, not a developer. A wrong registry key or a
+swapped argument pair would survive every green build and fail the first time a
+Windows user asked for it.
+
+`tests/windows_fakes.py` supplies stand-ins for those interfaces — a fake
+`winreg` tree, a fake `pylnk3`, a fake `user32` — and
+`tests/test_windows_paths_simulated.py` drives the real code against them, 49
+tests that run on every platform. `core/app_index.py` went from 66% to 83%
+coverage as a result.
+
+The tests were checked by breaking the code on purpose: dropping the 32-bit
+registry view, removing the window visibility check, dropping `schtasks /F`,
+and letting `.lnk` resolution accept a document instead of an executable. Each
+mutation was caught.
+
+What this proves is that the code asks for the right things in the right order
+and handles what comes back. What it cannot prove is that the real Windows API
+behaves as assumed — for that, `tests/test_windows_integration.py` still has to
+run on a Windows machine. This is the floor, not a replacement.
+
+### What is still unverified
+
+No physical Windows desktop with two monitors, no Roblox, no real audio
+hardware, no Store applications, and no wake-word model. Those are
+environmental limits, and nothing in this document should be read as a claim
+that they have been exercised.
 
 ---
 
@@ -927,6 +1218,25 @@ The project avoids saying an action succeeded merely because a command was sent.
 ---
 
 ## 15. Important implementation decisions
+
+### Removed sub-actions and why
+
+An action is a liability when it answers confidently from nothing, or when a
+second tool already does the same job properly. Five sub-actions were removed
+for those reasons. None of them fails silently: each returns a sentence naming
+the tool that replaces it, so the model recovers within the same turn instead of
+reporting an unknown action to the user.
+
+| Removed | Reason | Use instead |
+| --- | --- | --- |
+| `web_search.price` | Prices came from the model, not from the search results, and were stated with full confidence while being months out of date. | `web_search.search` — a price question is an ordinary search, answered from what the sources actually say. |
+| `web_search.compare` | Same failure, one step worse: two invented specification sheets set side by side read as research. | `web_search.research` |
+| `computer_control.screen_find` | Screenshot to the vision model to a pixel coordinate: seconds per call, and wrong whenever a theme, scale factor, or scroll position changed. | `browser_control.smart_click`, which addresses elements through the DOM. |
+| `computer_control.screen_click` | The same guess, but it clicked on it. A wrong coordinate is not a failed action, it is an action performed on the wrong thing. | `browser_control.smart_click` |
+| `computer_control.focus_window` | Duplicate of `window_manager.focus`, with a weaker title match and no monitor awareness. Two tools for one job means the model picks the worse one half the time. | `window_manager` with `action: focus` |
+| `file_controller.organize_desktop` | Moved every desktop file into six category folders in a single step. It was reversible through the undo journal, but a user who cannot see where anything went does not know to ask for undo. | Ask for specific files to be moved. |
+
+
 
 1. **No duplicate normal Roblox launch**
    - Normal open is idempotent.
