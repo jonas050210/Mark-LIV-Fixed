@@ -115,11 +115,17 @@ class RegistryScanTests(unittest.TestCase):
         _entries, winreg = self._scan({"chrome.exe": str(self.chrome)})
         self.assertGreaterEqual(winreg.closed, 1)
 
-    def test_a_missing_registry_module_is_not_fatal(self) -> None:
-        """The same function is imported on Linux; it must simply find nothing."""
+    def test_the_scan_behaves_on_the_host_it_is_running_on(self) -> None:
+        """Without winreg the function must find nothing rather than raise; with
+        it — on a real Windows runner — it must return usable entries."""
         from core import app_index
 
-        self.assertEqual(app_index._windows_registry_entries(), [])
+        entries = app_index._windows_registry_entries()
+        if os.name != "nt":
+            self.assertEqual(entries, [])
+            return
+        self.assertTrue(all(entry.kind == "exec" for entry in entries))
+        self.assertTrue(all(Path(entry.target).is_file() for entry in entries))
 
 
 class ShortcutResolutionTests(unittest.TestCase):
