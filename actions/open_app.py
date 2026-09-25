@@ -228,12 +228,14 @@ def _launch_with_repair(entry, arguments, *queries: str):
 
 
 def _open_direct_path(app_name: str, path: str, arguments: list,
-                      monitor_ref, state: str, foreground: bool) -> str:
+                      monitor_ref, state: str, foreground: bool,
+                      cancel_event=None) -> tuple[bool, str]:
     """Launch a personal shortcut/executable the installed-app index cannot see.
 
     Follows the same wait-for-window, verify, and place pipeline as an
     indexed launch, so a saved Desktop shortcut behaves identically to any
-    other application once it is running.
+    other application once it is running. Returns (ok, message): ok is False
+    for anything short of a verified, correctly placed window.
     """
     label = Path(path).stem or app_name
     print(f"[open_app] Launching direct path '{path}' for '{app_name}'.")
@@ -241,15 +243,19 @@ def _open_direct_path(app_name: str, path: str, arguments: list,
     try:
         pid = launch_path(path, arguments)
     except LaunchError as exc:
-        return f"I could not open '{app_name}' from its saved shortcut: {exc}."
+        return False, f"I could not open '{app_name}' from its saved shortcut: {exc}."
     except Exception as exc:
-        return f"I could not open '{app_name}' from its saved shortcut ({type(exc).__name__})."
+        return False, f"I could not open '{app_name}' from its saved shortcut ({type(exc).__name__})."
 
     record_launch(label)
     _note_opened_pages(arguments)
-    window = _await_launched_window(app_name, label, pid, existing_keys, timeout=30.0)
+    window = _await_launched_window(
+        app_name, label, pid, existing_keys, timeout=30.0, cancel_event=cancel_event,
+    )
     if window is None:
-        return (
+        if cancel_event is not None and cancel_event.is_set():
+            return False, f"Launching '{app_name}' from its saved shortcut was cancelled."
+        return False, (
             f"I started '{app_name}' from its saved shortcut, but no window appeared "
             "within the wait window. It may still be loading or it may have failed to start."
         )
@@ -259,7 +265,7 @@ def _open_direct_path(app_name: str, path: str, arguments: list,
     if monitor_ref is not None or state:
         ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
         if not ok:
-            return f"Opened '{app_name}' from its saved shortcut, but {detail}."
+            return False, f"Opened '{app_name}' from its saved shortcut, but {detail}."
 
     if not foreground:
         try:
@@ -268,12 +274,12 @@ def _open_direct_path(app_name: str, path: str, arguments: list,
                 operate(window, "minimize")
         except Exception:
             pass
-        return (
+        return True, (
             f"Opened '{app_name}' from its saved shortcut in the background"
             f"{_placement_summary(resolved_index, state)}."
         )
 
-    return f"Opened '{app_name}' from its saved shortcut{_placement_summary(resolved_index, state)}."
+    return True, f"Opened '{app_name}' from its saved shortcut{_placement_summary(resolved_index, state)}."
 
 
 def _normalised_window_text(value: str) -> str:
@@ -369,12 +375,15 @@ def _visible_window_keys() -> set[tuple]:
 
 
 def _wait_for_windows(requested: str, normalized: str, minimum: int,
-                      existing_keys: set[tuple] | None = None, timeout: float = 8.0):
+                      existing_keys: set[tuple] | None = None, timeout: float = 8.0,
+                      cancel_event=None):
     """Wait briefly for a launched app's window, returning the newest matches."""
     deadline = time.monotonic() + timeout
     existing_keys = existing_keys or set()
     latest = []
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         latest = _matching_windows(requested, normalized)
         new_windows = [window for window in latest if _window_key(window) not in existing_keys]
         if len(latest) >= minimum and (not existing_keys or new_windows):
@@ -426,12 +435,14 @@ def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
     return any(phrase in text for phrase in phrases)
 
 
-def _wait_for_pid_window(pid: int | None, timeout: float = 12.0):
+def _wait_for_pid_window(pid: int | None, timeout: float = 12.0, cancel_event=None):
     """Wait until the launched process owns a visible window."""
     if not pid:
         return []
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         try:
             from core.window_manager import windows_for_pid
             found = windows_for_pid(pid)
@@ -445,7 +456,7 @@ def _wait_for_pid_window(pid: int | None, timeout: float = 12.0):
 
 def _await_launched_window(app_name: str, normalized: str, pid: int | None,
                            existing_keys: set[tuple], timeout: float = 20.0,
-                           allow_focused_existing: bool = False):
+                           allow_focused_existing: bool = False, cancel_event=None):
     """Identify a launched window without serial PID and title waits.
 
     PID ownership, name matching and the before/after window snapshot are
@@ -454,11 +465,17 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
     can be the current page rather than the installed app's name. A single new
     visible window is accepted after a short settling period; multiple unrelated
     windows are never guessed between.
+
+    A cooperative `cancel_event` is checked every iteration so a cancelled
+    multi-app sequence does not have to wait out the full timeout (up to 30s)
+    before the step is abandoned.
     """
     started_at = time.monotonic()
     deadline = started_at + max(1.0, timeout)
     single_new_since: float | None = None
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         try:
             from core.window_manager import list_windows, windows_for_pid
 
@@ -586,22 +603,30 @@ def _placement_summary(monitor_index: int | None, state: str) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
-def open_app(
+def _open_app_core(
     parameters=None,
     response=None,
     player=None,
     session_memory=None,
-) -> str:
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """Do the actual launch/focus/place work; every caller gets a real ok flag.
+
+    `open_app` and `open_app_result` are both thin wrappers around this. It
+    exists so that a caller which needs to know whether the launch actually
+    succeeded -- such as app_sequence's step runner -- never has to re-derive
+    that from English prose, which drifts every time a message is reworded.
+    """
     parameters = parameters if isinstance(parameters, dict) else {}
     app_name = str(parameters.get("app_name", ""))[:160].strip()
 
     if not app_name:
-        return "No application name provided."
+        return False, "No application name provided."
     if len(app_name) > 160 or any(ord(ch) < 32 for ch in app_name):
-        return "That application name is invalid or too long."
+        return False, "That application name is invalid or too long."
 
     if _SYSTEM not in ("Windows", "Darwin", "Linux"):
-        return f"Unsupported operating system: {_SYSTEM}"
+        return False, f"Unsupported operating system: {_SYSTEM}"
 
     foreground = parameters.get("foreground")
     foreground = True if foreground is None else bool(foreground)
@@ -610,10 +635,13 @@ def open_app(
             parameters.get("arguments", parameters.get("open_with"))
         )
     except ValueError as exc:
-        return f"I cannot pass that to the application: {exc}."
+        return False, f"I cannot pass that to the application: {exc}."
     monitor_ref, state = _placement_request(parameters)
     if state and state not in _ALLOWED_STATES:
-        return f"state must be one of: {', '.join(sorted(_ALLOWED_STATES))}."
+        return False, f"state must be one of: {', '.join(sorted(_ALLOWED_STATES))}."
+
+    if cancel_event is not None and cancel_event.is_set():
+        return False, f"Opening {app_name} was cancelled before it started."
 
     shortcut_target = resolve_shortcut(app_name)
     normalized = _alias_target(shortcut_target)
@@ -637,8 +665,8 @@ def open_app(
         try:
             launch_uri(target)
         except Exception as exc:
-            return f"I could not open that link ({type(exc).__name__})."
-        return f"Opened {app_name}."
+            return False, f"I could not open that link ({type(exc).__name__})."
+        return True, f"Opened {app_name}."
 
     # A normal open is idempotent.  In particular, do not create a duplicate
     # Roblox client just because the launcher was called a second time.
@@ -647,13 +675,13 @@ def open_app(
         if monitor_ref is not None or state:
             ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
             if not ok:
-                return f"{app_name} is already open, but {detail}."
-            return f"{app_name} was already open; moved it{_placement_summary(resolved_index, state)}."
+                return False, f"{app_name} is already open, but {detail}."
+            return True, f"{app_name} was already open; moved it{_placement_summary(resolved_index, state)}."
         if not foreground:
-            return f"{app_name} is already open; left it in the background."
+            return True, f"{app_name} is already open; left it in the background."
         if _focus_window(window):
-            return f"{app_name} is already open; switched to it."
-        return f"{app_name} is already open, but I could not focus its window."
+            return True, f"{app_name} is already open; switched to it."
+        return False, f"{app_name} is already open, but I could not focus its window."
 
     # A saved shortcut (or the spoken name itself) may point straight at a
     # file the installed-app index never scans, such as a personal .lnk on
@@ -664,7 +692,8 @@ def open_app(
     )
     if direct_target:
         return _open_direct_path(
-            app_name, direct_target, arguments, monitor_ref, state, foreground
+            app_name, direct_target, arguments, monitor_ref, state, foreground,
+            cancel_event=cancel_event,
         )
 
     candidates, refreshed = _resolve_candidates(normalized, shortcut_target, app_name)
@@ -672,13 +701,13 @@ def open_app(
         suggestions = _nearby_names(app_name, normalized)
         hint = f" Did you mean: {suggestions}?" if suggestions else ""
         scanned = " I rescanned the installed applications first." if refreshed else ""
-        return (
+        return False, (
             f"I could not find an installed application called '{app_name}'.{scanned}{hint}"
         )
 
     if len(candidates) > 1 and not _confident_match(candidates, normalized, app_name):
         names = ", ".join(entry.name for entry in candidates[:4])
-        return (
+        return False, (
             f"'{app_name}' matches more than one installed application: {names}. "
             "Tell me which one you mean."
         )
@@ -711,13 +740,15 @@ def open_app(
             )
         if not started:
             repair_note = " after rebuilding the application index" if repaired else ""
-            return (
+            return False, (
                 f"I could not start {entry.name}{repair_note}: "
                 f"{failure or 'the launch was refused'}."
             )
 
         if is_roblox and explicit_second:
-            return _second_roblox_instance(app_name, normalized, existing, existing_keys)
+            return _second_roblox_instance(
+                app_name, normalized, existing, existing_keys, cancel_event=cancel_event,
+            )
 
         record_launch(entry.name)
         _note_opened_pages(arguments)
@@ -725,13 +756,16 @@ def open_app(
         window = _await_launched_window(
             app_name, normalized, pid, existing_keys, timeout=wait_seconds,
             allow_focused_existing=(entry.source == "webapp"),
+            cancel_event=cancel_event,
         )
         if window is None:
+            if cancel_event is not None and cancel_event.is_set():
+                return False, f"Opening {entry.name} was cancelled."
             print(
                 f"[open_app] No verified window for '{entry.name}' "
                 f"(pid={pid or 'delegated'}, waited={int(wait_seconds)}s)."
             )
-            return (
+            return False, (
                 f"I started {entry.name}, but no window appeared within the wait window. "
                 "It may still be loading or it may have failed to start."
             )
@@ -742,7 +776,7 @@ def open_app(
         if monitor_ref is not None or state:
             ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
             if not ok:
-                return f"Opened {entry.name}, but {detail}."
+                return False, f"Opened {entry.name}, but {detail}."
 
         if not foreground:
             try:
@@ -753,12 +787,46 @@ def open_app(
                     operate(window, "minimize")
             except Exception:
                 pass
-            return f"Opened {entry.name} in the background{_placement_summary(resolved_index, state)}."
+            return True, f"Opened {entry.name} in the background{_placement_summary(resolved_index, state)}."
 
-        return f"Opened {entry.name}{_placement_summary(resolved_index, state)}."
+        return True, f"Opened {entry.name}{_placement_summary(resolved_index, state)}."
     except Exception as exc:
         print(f"[open_app] Launch failed ({type(exc).__name__}).")
-        return f"Failed to open {app_name} ({type(exc).__name__})."
+        return False, f"Failed to open {app_name} ({type(exc).__name__})."
+
+
+def open_app(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+    cancel_event=None,
+) -> str:
+    """Open, focus, or reposition an installed application, saved shortcut, or link.
+
+    Returns prose only, for callers that just relay a message to the user.
+    Use `open_app_result` when the caller needs to branch on whether the
+    launch actually succeeded.
+    """
+    _, message = _open_app_core(parameters, response, player, session_memory, cancel_event)
+    return message
+
+
+def open_app_result(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+    cancel_event=None,
+) -> tuple[bool, str]:
+    """Same launch as `open_app`, but with a real (ok, message) pair.
+
+    `ok` is False for anything short of a verified, correctly placed window --
+    including partial outcomes like "opened, but could not verify placement" --
+    so a caller such as app_sequence's step runner can decide whether to
+    retry without re-parsing English sentences that are free to be reworded.
+    """
+    return _open_app_core(parameters, response, player, session_memory, cancel_event)
 
 
 def _remember_launch(name: str, window) -> None:
@@ -820,12 +888,16 @@ def _nearby_names(*queries: str, limit: int = 3) -> str:
     return ", ".join(name for _, name in scored[:limit])
 
 
-def _second_roblox_instance(app_name: str, normalized: str, existing, existing_keys: set[tuple]) -> str:
+def _second_roblox_instance(
+    app_name: str, normalized: str, existing, existing_keys: set[tuple], cancel_event=None,
+) -> tuple[bool, str]:
     """Verify an explicitly requested second Roblox client and place it."""
     desired_count = max(1, len(existing) + 1)
-    matches, new_windows = _wait_for_windows(app_name, normalized, desired_count, existing_keys)
+    matches, new_windows = _wait_for_windows(
+        app_name, normalized, desired_count, existing_keys, cancel_event=cancel_event,
+    )
     if len(matches) < desired_count or not new_windows:
-        return (
+        return False, (
             "Roblox did not open a second window. It may prevent multiple "
             "instances, so I did not claim that a second client started."
         )
@@ -834,20 +906,20 @@ def _second_roblox_instance(app_name: str, normalized: str, existing, existing_k
         from core.window_manager import move_to_monitor
         target_monitor = _opposite_monitor(existing[0] if existing else matches[0])
         if target_monitor is None:
-            return "A second Roblox window opened, but no opposite monitor was available."
+            return False, "A second Roblox window opened, but no opposite monitor was available."
         move_to_monitor(new_window, target_monitor)
     except Exception as exc:
-        return f"A second Roblox window opened, but I could not move it: {type(exc).__name__}"
-    verified, _ = _wait_for_windows(app_name, normalized, desired_count, set())
+        return False, f"A second Roblox window opened, but I could not move it: {type(exc).__name__}"
+    verified, _ = _wait_for_windows(app_name, normalized, desired_count, set(), cancel_event=cancel_event)
     moved = next(
         (window for window in verified if _window_key(window) == _window_key(new_window)),
         None,
     )
     if len(verified) < desired_count or moved is None:
-        return "A second Roblox window was launched, but I could not verify it after moving it."
+        return False, "A second Roblox window was launched, but I could not verify it after moving it."
     if not _window_on_monitor(moved, target_monitor):
-        return "A second Roblox window opened, but I could not verify its opposite-monitor placement."
-    return f"Opened a second Roblox window on monitor {target_monitor.index}."
+        return False, "A second Roblox window opened, but I could not verify its opposite-monitor placement."
+    return True, f"Opened a second Roblox window on monitor {target_monitor.index}."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────

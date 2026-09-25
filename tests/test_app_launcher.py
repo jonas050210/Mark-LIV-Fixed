@@ -381,5 +381,118 @@ class DirectShortcutLaunchTests(unittest.TestCase):
         self.assertIn("could not find an installed application", result)
 
 
+class StructuredResultTests(unittest.TestCase):
+    """open_app_result must report a real ok flag, not prose to be re-parsed."""
+
+    def test_a_verified_launch_reports_ok_true(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 99, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=_window(handle=7)):
+            ok, message = open_app.open_app_result({"app_name": "Chrome"})
+        self.assertTrue(ok)
+        self.assertIn("Opened Chrome", message)
+
+    def test_a_missing_window_reports_ok_false(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 4242, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=None):
+            ok, message = open_app.open_app_result({"app_name": "Chrome"})
+        self.assertFalse(ok)
+        self.assertIn("no window appeared", message)
+
+    def test_a_partial_placement_failure_reports_ok_false(self) -> None:
+        still_on_monitor_one = _window(handle=7, left=0, right=800)
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 99, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=_window(handle=7)), \
+             patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
+             patch("core.window_manager.place_window", return_value=still_on_monitor_one):
+            ok, message = open_app.open_app_result({"app_name": "Chrome", "monitor": 2})
+        self.assertFalse(ok)
+        self.assertIn("could not verify", message)
+
+    def test_an_already_open_app_reports_ok_true(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[_window()]), \
+             patch.object(open_app, "_focus_window", return_value=True):
+            ok, message = open_app.open_app_result({"app_name": "Chrome"})
+        self.assertTrue(ok)
+        self.assertIn("already open", message)
+
+    def test_open_app_and_open_app_result_agree_on_the_message(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([], True)), \
+             patch.object(open_app, "_nearby_names", return_value=""):
+            message = open_app.open_app({"app_name": "Nonexistent Thing"})
+            ok, message_again = open_app.open_app_result({"app_name": "Nonexistent Thing"})
+        self.assertFalse(ok)
+        self.assertEqual(message, message_again)
+
+
+class CancellationDuringWaitTests(unittest.TestCase):
+    """A cancelled launch must not sit out the full window-wait timeout."""
+
+    def test_a_cancel_set_before_launching_is_honoured_immediately(self) -> None:
+        import threading
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with patch.object(open_app, "_launch_resolved") as launch:
+            ok, message = open_app.open_app_result(
+                {"app_name": "Chrome"}, cancel_event=cancel_event,
+            )
+        self.assertFalse(ok)
+        self.assertIn("cancelled", message)
+        launch.assert_not_called()
+
+    def test_a_cancel_set_mid_wait_stops_the_20s_wait_almost_immediately(self) -> None:
+        import threading
+        import time
+        cancel_event = threading.Event()
+        threading.Timer(0.05, cancel_event.set).start()
+
+        started = time.monotonic()
+        window = open_app._await_launched_window(
+            "Chrome", "chrome", None, set(), timeout=20.0, cancel_event=cancel_event,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(window)
+        self.assertLess(elapsed, 5.0)
+
+    def test_a_pre_cancelled_wait_skips_polling_and_does_a_single_final_read(self) -> None:
+        import threading
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with patch.object(open_app, "_matching_windows", return_value=[]) as matching:
+            matches, new_windows = open_app._wait_for_windows(
+                "Chrome", "chrome", 1, cancel_event=cancel_event,
+            )
+        self.assertEqual(matches, [])
+        self.assertEqual(new_windows, [])
+        # Cancelled before the first poll: only the unconditional final read
+        # happens, none of the up-to-8s of repeated polling.
+        matching.assert_called_once()
+
+    def test_direct_shortcut_launch_honours_cancellation(self) -> None:
+        import tempfile
+        import threading
+        from pathlib import Path
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "YouTube.lnk"
+            link.write_bytes(b"L\x00\x00\x00 fake shortcut")
+            with patch.object(open_app, "resolve_shortcut", return_value=str(link)), \
+                 patch.object(open_app, "_matching_windows", return_value=[]), \
+                 patch.object(open_app, "launch_path", return_value=None):
+                ok, message = open_app.open_app_result(
+                    {"app_name": "youtube"}, cancel_event=cancel_event,
+                )
+        self.assertFalse(ok)
+        self.assertIn("cancelled", message)
+
+
 if __name__ == "__main__":
     unittest.main()
