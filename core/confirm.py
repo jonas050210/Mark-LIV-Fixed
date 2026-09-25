@@ -57,7 +57,16 @@ class _Pending:
 
 
 _pending: Optional[_Pending] = None
+_expiry_timer: Optional[threading.Timer] = None
 _lock = threading.Lock()
+
+
+class ConfirmationBusyError(RuntimeError):
+    """Raised when a second action tries to replace a live confirmation."""
+
+
+class ConfirmationUnavailableError(RuntimeError):
+    """Raised when an irreversible action cannot be shown to the user."""
 
 # Set once at startup by main.py. Signature: (title, detail) -> None for show,
 # and () -> None for hide. Both are marshalled onto the Qt thread by the UI.
@@ -80,6 +89,28 @@ def _log(msg: str) -> None:
             pass
 
 
+def _expire(expected: _Pending) -> None:
+    """Actively expire exactly one banner, even if its key is later reused."""
+    global _pending, _expiry_timer
+    with _lock:
+        if _pending is not expected:
+            return
+        pending = _pending
+        _pending = None
+        _expiry_timer = None
+    if _hide_cb:
+        try:
+            _hide_cb()
+        except Exception:
+            pass
+    if pending.on_cancel:
+        try:
+            pending.on_cancel("expired")
+        except Exception:
+            pass
+    _log(f"SYS: Confirmation expired — {pending.title}")
+
+
 def request(
     key: str,
     title: str,
@@ -92,49 +123,92 @@ def request(
     Returns the sentence the tool should hand back to the model — phrased as an
     instruction so the assistant asks the user out loud in their own language,
     rather than reading an English string verbatim."""
-    global _pending
+    global _pending, _expiry_timer
+
+    clean_key = str(key or "").strip()
+    clean_title = " ".join(str(title or "").split())[:200]
+    clean_detail = " ".join(str(detail or "").split())[:1_000]
+    if not clean_key or len(clean_key) > 200 or not clean_title or not callable(run):
+        raise ValueError("confirmation metadata is invalid")
 
     if _show_cb is None:
         # No interface bound (headless, or a very early call). Refuse rather
         # than silently performing something irreversible.
-        return (f"I cannot confirm '{title}' right now because the interface is "
-                f"not available, so I have not done it.")
-
-    with _lock:
-        _pending = _Pending(
-            key=key,
-            title=title,
-            detail=detail,
-            run=run,
-            at=time.monotonic(),
-            on_cancel=on_cancel,
+        raise ConfirmationUnavailableError(
+            f"I cannot confirm '{clean_title}' because the interface is not available"
         )
 
+    stale: Optional[_Pending] = None
+    now = time.monotonic()
+    with _lock:
+        if _pending is not None and now - _pending.at <= TIMEOUT_SECONDS:
+            raise ConfirmationBusyError(
+                f"confirmation already pending for '{_pending.title}'"
+            )
+        stale = _pending
+        if _expiry_timer is not None:
+            _expiry_timer.cancel()
+        pending = _Pending(
+            key=clean_key,
+            title=clean_title,
+            detail=clean_detail,
+            run=run,
+            at=now,
+            on_cancel=on_cancel,
+        )
+        _pending = pending
+        _expiry_timer = threading.Timer(
+            TIMEOUT_SECONDS, _expire, args=(pending,)
+        )
+        _expiry_timer.daemon = True
+
+    if stale is not None and stale.on_cancel:
+        try:
+            stale.on_cancel("expired")
+        except Exception:
+            pass
+
     try:
-        _show_cb(title, detail)
+        _show_cb(clean_title, clean_detail)
     except Exception as e:
         with _lock:
-            _pending = None
-        return f"Could not ask for confirmation: {e}. Nothing was done."
+            if _pending is pending:
+                _pending = None
+                if _expiry_timer is not None:
+                    _expiry_timer.cancel()
+                    _expiry_timer = None
+        raise ConfirmationUnavailableError(
+            f"Could not ask for confirmation ({type(e).__name__})"
+        ) from e
 
-    _log(f"SYS: Awaiting confirmation — {title}")
+    with _lock:
+        timer = _expiry_timer if _pending is pending else None
+    if timer is not None:
+        timer.start()
+    _log(f"SYS: Awaiting confirmation — {clean_title}")
     return (
-        f"[CONFIRMATION_PENDING] I have put a confirmation on screen for: {title}. "
+        f"[CONFIRMATION_PENDING] I have put a confirmation on screen for: {clean_title}. "
         f"Say ONE short sentence in the user's own language telling them you need "
         f"them to confirm it on the HUD before you do it. Do not claim it is done."
     )
 
 
-def resolve(accepted: bool) -> None:
-    """Called by the UI when the user presses CONFIRM or CANCEL.
+def resolve(accepted: bool, *, key: str | None = None) -> bool:
+    """Resolve only the intended pending confirmation.
 
-    Runs the stored callable on a worker thread — this is invoked from the Qt
-    thread, and shutting the machine down from inside a button handler would
-    freeze the interface on its way out."""
-    global _pending
+    ``key`` is required for remote/action-specific cancellation so cancelling
+    one dashboard card can never dismiss another action's confirmation. The
+    local HUD may omit it because it can display only the current banner.
+    """
+    global _pending, _expiry_timer
 
     with _lock:
+        if key is not None and (_pending is None or _pending.key != str(key)):
+            return False
         p, _pending = _pending, None
+        timer, _expiry_timer = _expiry_timer, None
+    if timer is not None:
+        timer.cancel()
 
     if _hide_cb:
         try:
@@ -143,7 +217,7 @@ def resolve(accepted: bool) -> None:
             pass
 
     if p is None:
-        return
+        return False
 
     if time.monotonic() - p.at > TIMEOUT_SECONDS:
         if p.on_cancel:
@@ -152,7 +226,7 @@ def resolve(accepted: bool) -> None:
             except Exception:
                 pass
         _log(f"SYS: Confirmation expired — {p.title}")
-        return
+        return True
 
     if not accepted:
         if p.on_cancel:
@@ -161,17 +235,26 @@ def resolve(accepted: bool) -> None:
             except Exception:
                 pass
         _log(f"SYS: Cancelled — {p.title}")
-        return
+        return True
 
     def _worker():
         try:
             result = p.run() or "Done."
             _log(f"SYS: Confirmed — {p.title}. {result}")
         except Exception as e:
-            _log(f"ERR: {p.title} failed — {e}")
+            _log(f"ERR: {p.title} failed ({type(e).__name__}).")
 
     threading.Thread(target=_worker, daemon=True,
                      name=f"confirm-{p.key}").start()
+    return True
+
+
+def pending_key() -> str:
+    """Identifier of the live confirmation, or an empty string."""
+    with _lock:
+        if _pending is None or time.monotonic() - _pending.at > TIMEOUT_SECONDS:
+            return ""
+        return _pending.key
 
 
 def pending_title() -> str:

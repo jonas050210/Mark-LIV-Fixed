@@ -251,7 +251,7 @@ def _secret_hygiene() -> str:
         relative = str(path.relative_to(REPO))
         ignored = subprocess.run(
             ["git", "check-ignore", "-q", relative],
-            cwd=REPO, capture_output=True, check=False,
+            cwd=REPO, capture_output=True, check=False, timeout=10,
         ).returncode == 0
         if ignored:
             protected += 1
@@ -297,7 +297,7 @@ def _environment() -> dict:
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=REPO, capture_output=True, text=True, check=False,
+            cwd=REPO, capture_output=True, text=True, check=False, timeout=10,
         ).stdout.strip()
     except OSError:
         commit = ""

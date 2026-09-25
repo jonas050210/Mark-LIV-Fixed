@@ -166,7 +166,7 @@ def _transport_works(idx: int, kind: str, api_key) -> bool:
                 print(f"[Audio] input: host API delivered {frames[0]} frames in "
                       f"{secs*1000:.0f} ms — skipping it")
     except Exception as e:
-        print(f"[Audio] {kind} transport probe failed: {e}")
+        print(f"[Audio] {kind} transport probe failed ({type(e).__name__}).")
         ok = False
 
     _probe_results[api_key] = ok
@@ -315,7 +315,7 @@ def _query() -> dict[str, list[str]]:
         return out
 
     except Exception as e:
-        print(f"[Audio] Device enumeration failed: {e}")
+        print(f"[Audio] Device enumeration failed ({type(e).__name__}).")
     return out
 
 
@@ -417,7 +417,7 @@ def resolve(name: str, kind: str):
               f"{_RATES.get(kind)} Hz on any host API — using system default")
         return None
     except Exception as e:
-        print(f"[Audio] resolve({kind}) failed: {e} — using system default")
+        print(f"[Audio] resolve({kind}) failed ({type(e).__name__}) — using system default")
         return None
 
 
@@ -450,7 +450,8 @@ def diagnostics(selected_input: str = "", selected_output: str = "") -> dict:
             result[kind] = {
                 "selected": selected or DEFAULT_LABEL, "connected": False,
                 "fallback": True, "host_api": "unknown",
-                "sample_rate": _RATES.get(kind), "devices": [], "error": str(exc),
+                "sample_rate": _RATES.get(kind), "devices": [],
+                "error": f"enumeration failed ({type(exc).__name__})",
             }
     result["healthy"] = all(item.get("connected", False) for item in result.values())
     return result

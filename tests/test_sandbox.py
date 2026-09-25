@@ -6,9 +6,9 @@ from core.sandbox import UnsafeCode, run_generated_code
 
 
 class GeneratedCodeSandboxTests(unittest.TestCase):
-    def test_read_only_inspection_runs_in_child(self) -> None:
-        result = run_generated_code("print(Path.home().name)", timeout=3)
-        self.assertTrue(result)
+    def test_even_read_only_generated_code_execution_is_disabled(self) -> None:
+        with self.assertRaisesRegex(UnsafeCode, "execution is disabled"):
+            run_generated_code("print(Path.home().name)", timeout=3)
 
     def test_imports_and_destructive_methods_are_rejected(self) -> None:
         for code in ("import os", "Path.home().unlink()", "exec('print(1)')"):

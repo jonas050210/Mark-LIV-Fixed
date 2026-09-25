@@ -58,10 +58,20 @@ Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow)
 
 ## Action safety and reliability
 
-All discovered actions now pass through one registry contract. Results have explicit `succeeded`, `failed`, `forbidden`, `confirmation_pending`, `unavailable`, and `timed_out` states; handlers keep their old string API only at the Gemini boundary. The registry also owns per-action deadlines, trusted/admin checks, confirmation metadata, and the dashboard capability manifest.
+All discovered actions now pass through one registry contract. Results have explicit `succeeded`, `failed`, `busy`, `cancelled`, `forbidden`, `confirmation_pending`, `unavailable`, and `timed_out` states; handlers keep their old string API only at the Gemini boundary. The registry also owns per-action deadlines, bounded legacy-worker capacity, trusted/admin checks, confirmation metadata, and the dashboard capability manifest. Packaged action source is size-, ownership-, permission-, link-, and descriptor-checked before execution.
 
-High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface and protects app/PC closing, file deletion, power actions, WiFi changes, and other risky operations. Reversible settings continue to use the shared undo stack.
+High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface and protects app/PC closing, file deletion, power actions, WiFi changes, and other risky operations. Pending confirmations actively expire after 90 seconds and remain bound to the action ID shown to the user. Reversible settings continue to use the shared undo stack.
 
-The active action surface is intentionally small and PC-focused. Travel, weather, messaging, developer-agent, game-updater, generated-desktop-task, and YouTube-specific actions were removed instead of advertising unrelated or duplicated capabilities. Browser control covers normal websites; `media_control` uses Spotify Connect for playback without repeatedly foregrounding Spotify. `shortcut_manager` stores deterministic aliases such as `gd → Geometry Dash` and `roblox → Roblox Player`.
+The active action surface is intentionally small and PC-focused. Travel, weather, messaging, developer-agent, game-updater, generated-desktop-task, and YouTube-specific actions were removed instead of advertising unrelated or duplicated capabilities. Browser control covers normal HTTP(S) websites; local-file and script protocols are rejected. `media_control` uses Spotify Connect for playback without repeatedly foregrounding Spotify. `shortcut_manager` stores deterministic aliases such as `gd → Geometry Dash` and `roblox → Roblox Player`.
 
-Your API keys and runtime memory are intentionally ignored by Git. Never commit `config/api_keys.json` or personal data from `memory/`.
+File actions stay inside approved user folders, reject credential/browser-profile paths, symbolic links, and Windows reparse points, and never silently replace a destination. Large parser, archive, media, and directory-copy workloads are bounded. Parser inputs are copied through bounded no-follow descriptors into private stable snapshots before third-party libraries reopen them. Generated files are written to private staging names and published without replacement, so a timeout or name race cannot expose partial output or delete someone else's file. Direct execution of model-produced source code is disabled.
+
+## Dashboard and local-data security
+
+The phone dashboard uses short-lived bearer sessions, one-time pairing codes, login throttling, authenticated encrypted command payloads, bounded uploads, and authenticated WebSockets. It generates a per-install TLS key pair for LAN access. If TLS cannot be initialized, plain HTTP binds to `127.0.0.1` only—the dashboard is not exposed unencrypted to the LAN. Pairing codes, auth sessions, and remembered-device sessions are capped and expire automatically.
+
+Configuration, memory, shortcuts, and Spotify tokens use locked atomic JSON transactions with corruption recovery and private permissions where the platform supports them. Local LLM endpoints are restricted to loopback or private IP addresses. Spotify OAuth accepts only an explicit unprivileged `http://localhost:<port>/callback` redirect.
+
+Plugins are executable Python and must be treated as trusted local code. Discovery isolates import failures so one broken plugin cannot stop startup, rejects symbolic links and group/world-writable plugin files, validates schemas, and applies deadlines plus structured result handling.
+
+Your API keys and runtime memory are intentionally ignored by Git. Never commit `config/api_keys.json`, Spotify tokens, certificates/private keys, or personal data from `memory/`.

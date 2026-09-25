@@ -10,8 +10,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.server
-import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -19,13 +19,15 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
+from core.json_store import JsonStore, JsonStoreCorruptError
+from memory.config_manager import load_api_keys
+
 try:
     import requests
 except ImportError:  # optional in minimal installations
     requests = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-CONFIG_FILE = BASE_DIR / "config" / "api_keys.json"
 TOKEN_FILE = BASE_DIR / "config" / "spotify_token.json"
 DEFAULT_REDIRECT = "http://127.0.0.1:8765/callback"
 SPOTIFY_API = "https://api.spotify.com/v1"
@@ -35,10 +37,16 @@ SCOPES = "user-read-playback-state user-modify-playback-state user-read-currentl
 
 
 def _config() -> dict:
-    try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_api_keys()
+
+
+def _token_store() -> JsonStore[dict]:
+    return JsonStore(
+        TOKEN_FILE,
+        dict,
+        validator=lambda value: isinstance(value, dict),
+        private=True,
+    )
 
 
 def _client_id(parameters: dict) -> str:
@@ -51,20 +59,21 @@ def _client_id(parameters: dict) -> str:
 
 
 def _save_token(token: dict) -> None:
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = TOKEN_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(token, indent=2), encoding="utf-8")
-    os.replace(temporary, TOKEN_FILE)
+    if not isinstance(token, dict):
+        raise TypeError("Spotify token must be an object")
+    _token_store().write(token)
 
 
 def _load_token() -> dict:
     raw = os.environ.get("SPOTIFY_ACCESS_TOKEN", "").strip()
     if raw:
         return {"access_token": raw, "expires_at": time.time() + 300}
+    if not TOKEN_FILE.exists():
+        return {}
     try:
-        value = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except Exception:
+        return _token_store().read()
+    except JsonStoreCorruptError as exc:
+        print(f"[Spotify] Token store is corrupt ({type(exc).__name__}).")
         return {}
 
 
@@ -111,7 +120,7 @@ def _request(method: str, path: str, token: str, **kwargs):
             body = {"message": response.text[:300]}
         return response.status_code, body
     except Exception as exc:
-        return None, {"error": str(exc)}
+        return None, {"error": f"request failed ({type(exc).__name__})"}
 
 
 def _error(status, body) -> str:
@@ -146,11 +155,18 @@ def _device_id(token: str, requested: str = "") -> tuple[str | None, str]:
 
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     callback = None
+    expected_path = "/callback"
+
     def do_GET(self):  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        if self.callback is not None:
-            self.callback(query)
+        if parsed.path != self.expected_path:
+            self.send_error(404)
+            return
+        query = urllib.parse.parse_qs(parsed.query, max_num_fields=20)
+        accepted = bool(self.callback(query)) if self.callback is not None else False
+        if not accepted:
+            self.send_error(400, "Invalid or expired OAuth state")
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -165,7 +181,12 @@ def _connect(parameters: dict) -> str:
     client_id = _client_id(parameters)
     if not client_id:
         return "Set spotify_client_id in config/api_keys.json or SPOTIFY_CLIENT_ID first. Add http://127.0.0.1:8765/callback as a Spotify redirect URI."
-    redirect_uri = str(parameters.get("redirect_uri") or DEFAULT_REDIRECT).strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{16,128}", client_id):
+        return "The Spotify client ID has an invalid format."
+    raw_redirect = parameters.get("redirect_uri") or DEFAULT_REDIRECT
+    if not isinstance(raw_redirect, str) or len(raw_redirect) > 500:
+        return "The Spotify redirect URI has an invalid format."
+    redirect_uri = raw_redirect.strip()
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     state = secrets.token_urlsafe(24)
@@ -173,36 +194,61 @@ def _connect(parameters: dict) -> str:
     event = threading.Event()
 
     def receive(query: dict):
+        # Ignore unrelated loopback requests rather than letting another local
+        # process consume and cancel the one-time OAuth flow.
+        supplied_state = (query.get("state") or [""])[0]
+        if not secrets.compare_digest(str(supplied_state), state):
+            return False
         received.update({key: values[0] for key, values in query.items() if values})
         event.set()
+        return True
 
     parsed = urllib.parse.urlparse(redirect_uri)
-    if parsed.hostname not in {"127.0.0.1", "localhost"}:
-        return "The Spotify redirect URI must point to localhost for the local OAuth callback."
     try:
-        server = http.server.HTTPServer((parsed.hostname, parsed.port or 80), _CallbackHandler)
+        port = parsed.port
+    except ValueError:
+        return "The Spotify redirect URI contains an invalid port."
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.path != "/callback" or parsed.username or parsed.password
+            or port is None or not 1024 <= port <= 65535):
+        return (
+            "The Spotify redirect URI must be an HTTP localhost /callback URL "
+            "using an unprivileged port."
+        )
+    handler = type(
+        "SpotifyCallbackHandler",
+        (_CallbackHandler,),
+        {"callback": staticmethod(receive), "expected_path": parsed.path},
+    )
+    try:
+        server = http.server.HTTPServer((parsed.hostname, port), handler)
     except OSError as exc:
-        return f"Could not start the Spotify OAuth callback on {redirect_uri}: {exc}"
-    _CallbackHandler.callback = receive
-    thread = threading.Thread(target=server.handle_request, daemon=True, name="spotify-oauth")
+        return f"Could not start the Spotify OAuth callback ({type(exc).__name__})."
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.2},
+        daemon=True,
+        name="spotify-oauth",
+    )
     thread.start()
     query = urllib.parse.urlencode({
         "client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
         "scope": SCOPES, "state": state, "code_challenge_method": "S256",
         "code_challenge": challenge,
     })
-    if not webbrowser.open(AUTH_URL + "?" + query):
-        server.server_close()
-        return "I could not open the Spotify authorization page. Open the returned authorization URL manually."
-    if not event.wait(120):
-        server.server_close()
-        return "Spotify authorization timed out."
-    thread.join(timeout=2)
+    opened = webbrowser.open(AUTH_URL + "?" + query)
+    completed = event.wait(120) if opened else False
+    server.shutdown()
     server.server_close()
+    thread.join(timeout=2)
+    if not opened:
+        return "I could not open the Spotify authorization page. Open the returned authorization URL manually."
+    if not completed:
+        return "Spotify authorization timed out."
     if received.get("state") != state:
         return "Spotify authorization state did not match; the connection was refused."
     if received.get("error"):
-        return f"Spotify authorization was cancelled: {received['error']}."
+        return "Spotify authorization was cancelled or refused."
     code = received.get("code")
     if not code:
         return "Spotify did not return an authorization code."
@@ -219,12 +265,12 @@ def _connect(parameters: dict) -> str:
         _save_token(token)
         return "Spotify is connected. Playback commands will use the active Connect device without bringing Spotify to the foreground."
     except Exception as exc:
-        return f"Spotify token exchange failed: {exc}"
+        return f"Spotify token exchange failed ({type(exc).__name__})."
 
 
 def media_control(parameters: dict | None = None, player=None) -> str:
-    p = parameters or {}
-    action = str(p.get("action") or "status").casefold().strip().replace(" ", "_")
+    p = parameters if isinstance(parameters, dict) else {}
+    action = str(p.get("action") or "status")[:32].casefold().strip().replace(" ", "_")
     if action in {"connect", "authorize", "login"}:
         return _connect(p)
     token_data = _load_token()
@@ -234,7 +280,7 @@ def media_control(parameters: dict | None = None, player=None) -> str:
         return "Spotify is not connected. Set a Spotify client ID and say connect Spotify once; playback itself will stay in the background."
 
     if action in {"search", "find"}:
-        query = str(p.get("query") or p.get("text") or "").strip()
+        query = str(p.get("query") or p.get("text") or "")[:500].strip()
         if not query:
             return "Tell me what to search for on Spotify."
         status, body = _request("GET", "/search", token, params={"q": query, "type": "track", "limit": 5})
@@ -324,13 +370,13 @@ TOOL = {
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "connect | search | play | pause | next | previous | volume | queue | status | devices"},
-            "query": {"type": "STRING", "description": "Song, artist, or search text."},
-            "track": {"type": "STRING", "description": "Track search text for play."},
-            "uri": {"type": "STRING", "description": "Spotify track URI for play or queue."},
-            "value": {"type": "INTEGER", "description": "Spotify volume from 0 to 100."},
-            "device": {"type": "STRING", "description": "Optional Spotify device name or ID."},
-            "client_id": {"type": "STRING", "description": "Spotify application client ID for the one-time connect flow."},
+            "action": {"type": "STRING", "enum": ["connect", "search", "play", "pause", "next", "previous", "volume", "queue", "status", "devices"], "maxLength": 16, "description": "connect | search | play | pause | next | previous | volume | queue | status | devices"},
+            "query": {"type": "STRING", "maxLength": 500, "description": "Song, artist, or search text."},
+            "track": {"type": "STRING", "maxLength": 500, "description": "Track search text for play."},
+            "uri": {"type": "STRING", "maxLength": 200, "description": "Spotify track URI for play or queue."},
+            "value": {"type": "INTEGER", "minimum": 0, "maximum": 100, "description": "Spotify volume from 0 to 100."},
+            "device": {"type": "STRING", "maxLength": 300, "description": "Optional Spotify device name or ID."},
+            "client_id": {"type": "STRING", "minLength": 16, "maxLength": 128, "description": "Spotify application client ID for the one-time connect flow."},
         },
         "required": ["action"],
     },

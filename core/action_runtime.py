@@ -8,11 +8,50 @@ existing action registry remains the policy boundary.
 """
 from __future__ import annotations
 
+import math
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+_SENSITIVE_KEY = re.compile(
+    r"(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|credential|"
+    r"(?:^|[_-])(?:text|content|message|query|instruction|clipboard|value)(?:$|[_-]))",
+    re.IGNORECASE,
+)
+
+
+def _safe_value(value: Any, depth: int = 0) -> Any:
+    if depth >= 4:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, (list, tuple)):
+        return [_safe_value(item, depth + 1) for item in value[:50]]
+    if isinstance(value, dict):
+        output = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 100:
+                break
+            clean_key = str(key)[:100]
+            output[clean_key] = (
+                "[redacted]" if _SENSITIVE_KEY.search(clean_key)
+                else _safe_value(item, depth + 1)
+            )
+        return output
+    return f"<{type(value).__name__}>"
+
+
+def _safe_parameters(parameters: dict | None) -> dict[str, Any]:
+    safe = _safe_value(parameters or {})
+    return safe if isinstance(safe, dict) else {}
 
 
 @dataclass
@@ -32,7 +71,7 @@ class ActionRun:
         return {
             "action_id": self.action_id,
             "action": self.action,
-            "parameters": dict(self.parameters),
+            "parameters": _safe_parameters(self.parameters),
             "source": self.source,
             "status": self.status,
             "progress": self.progress,
@@ -53,7 +92,10 @@ class ActionRuntime:
 
     def subscribe(self, listener: Callable[[dict], None]) -> None:
         with self._lock:
-            self._listeners.append(listener)
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+                if len(self._listeners) > 100:
+                    del self._listeners[: len(self._listeners) - 100]
 
     def _emit(self, run: ActionRun) -> None:
         event = run.as_dict()
@@ -67,7 +109,9 @@ class ActionRuntime:
               source: str = "voice", action_id: str | None = None) -> str:
         run = ActionRun(
             action_id=action_id or f"act-{uuid.uuid4().hex[:12]}",
-            action=str(action), parameters=dict(parameters or {}), source=source,
+            action=str(action)[:100],
+            parameters=_safe_parameters(parameters),
+            source=str(source)[:40],
         )
         with self._lock:
             self._runs[run.action_id] = run
@@ -78,8 +122,26 @@ class ActionRuntime:
         return run.action_id
 
     def get(self, action_id: str) -> ActionRun | None:
+        """Return a detached view so callers cannot mutate runtime state."""
         with self._lock:
-            return self._runs.get(str(action_id))
+            run = self._runs.get(str(action_id))
+            if run is None:
+                return None
+            cancel_event = threading.Event()
+            if run.cancel_event.is_set():
+                cancel_event.set()
+            return ActionRun(
+                action_id=run.action_id,
+                action=run.action,
+                parameters=_safe_parameters(run.parameters),
+                source=run.source,
+                status=run.status,
+                progress=run.progress,
+                message=run.message,
+                started_at=run.started_at,
+                finished_at=run.finished_at,
+                cancel_event=cancel_event,
+            )
 
     def cancellation_event(self, action_id: str | None) -> threading.Event | None:
         if not action_id:
@@ -102,13 +164,18 @@ class ActionRuntime:
                 run.message = str(message)[:500]
             self._emit(run)
 
-    def finish(self, action_id: str, *, ok: bool, message: str = "") -> None:
+    def finish(self, action_id: str, *, ok: bool, message: str = "",
+               status: str | None = None) -> None:
         with self._lock:
             run = self._runs.get(str(action_id))
             if not run:
                 return
             cancelled = run.cancel_event.is_set()
-            run.status = "cancelled" if cancelled else ("succeeded" if ok else "failed")
+            normalized = str(status or "").strip().casefold()
+            if normalized:
+                run.status = normalized[:64]
+            else:
+                run.status = "cancelled" if cancelled else ("succeeded" if ok else "failed")
             run.progress = 100 if ok and not cancelled else run.progress
             run.message = str(message or run.message)[:500]
             run.finished_at = time.time()

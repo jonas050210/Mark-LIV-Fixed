@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ipaddress
 import os
 import platform
+import secrets
 import shutil
+import stat
 import subprocess
 import threading
 import webbrowser
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus, urlsplit
+
+from core.path_policy import move_no_replace, resolve_user_path
 
 # Playwright is optional: native URL navigation remains useful without it.
 # Import the automation package only when an interactive browser action is
@@ -23,20 +29,45 @@ _PLAYWRIGHT_IMPORT_ERROR = ""
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
 
 def _normalize_url(url: str) -> str:
-    """
-    Bare words like "instagram" → "https://instagram.com"
-    Domains like "instagram.com" → "https://instagram.com"
-    Full URLs pass through unchanged.
-    """
-    url = url.strip()
+    """Normalize a web address while rejecting local-file/custom protocols."""
+    url = str(url or "").strip()
     if not url:
         return "about:blank"
-    if "://" in url:
-        return url
-    # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
-    if "." not in url:
-        url = url + ".com"
-    return "https://" + url
+    if len(url) > 4096 or any(ord(char) < 32 for char in url):
+        raise ValueError("The URL is too long or contains control characters.")
+    if "://" not in url:
+        if any(char.isspace() for char in url):
+            raise ValueError("A web address cannot contain spaces.")
+        # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
+        if "." not in url:
+            url += ".com"
+        url = "https://" + url
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("The web address contains an invalid port.") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Web addresses containing credentials are not allowed.")
+    host = parsed.hostname.rstrip(".").casefold()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError("Local-network web addresses are not available to browser automation.")
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("Private, local, and reserved network addresses are not allowed.")
+    return url
+
+
+def _is_global_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(str(value or "").split("%", 1)[0]).is_global
+    except ValueError:
+        return False
 
 
 def _user_agent() -> str:
@@ -105,12 +136,16 @@ def _real_profile_dir(browser: str) -> str:
 
     for p in candidates:
         if p.exists():
-            print(f"[Browser] ✅ Real profile found for {browser}: {p}")
+            print(f"[Browser] ✅ Real profile found for {browser}.")
             return str(p)
 
     fallback = home / ".jarvis_profiles" / browser
-    fallback.mkdir(parents=True, exist_ok=True)
-    print(f"[Browser] ⚠️  Real profile not found for {browser}, using: {fallback}")
+    fallback.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fallback.chmod(0o700)
+    except OSError:
+        pass
+    print(f"[Browser] ⚠️  Real profile not found for {browser}; using an isolated profile.")
     return str(fallback)
 
 def _firefox_profile_dir() -> Optional[str]:
@@ -129,8 +164,30 @@ def _firefox_profile_dir() -> Optional[str]:
 
     current: dict[str, str] = {}
     default_path: Optional[str] = None
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(ini, flags)
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or int(getattr(details, "st_file_attributes", 0)) & 0x400
+            or details.st_size > 128_000
+        ):
+            return None
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            profile_text = handle.read(128_001).decode("utf-8", "ignore")
+        if len(profile_text.encode("utf-8")) > 128_000:
+            return None
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
-    for line in ini.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for line in profile_text.splitlines():
         line = line.strip()
         if line.startswith("["):
             p = current.get("Path", "")
@@ -148,7 +205,7 @@ def _firefox_profile_dir() -> Optional[str]:
         default_path = str(base / p) if is_rel else p
 
     if default_path and Path(default_path).exists():
-        print(f"[Browser] Firefox real profile: {default_path}")
+        print("[Browser] Firefox profile detected.")
         return default_path
     return None
 
@@ -298,9 +355,15 @@ def _resolve_browser(name: str) -> dict | None:
         for app in app_names.get(name, []):
             app_dir = Path("/Applications") / app / "Contents" / "MacOS"
             if app_dir.exists():
-                found_bins = list(app_dir.iterdir())
-                if found_bins:
-                    exe = str(found_bins[0])
+                try:
+                    found_bin = next(
+                        (candidate for candidate in app_dir.iterdir() if candidate.is_file()),
+                        None,
+                    )
+                except OSError:
+                    found_bin = None
+                if found_bin is not None:
+                    exe = str(found_bin)
                     break
 
     if not exe and _OS == "Windows" and not channel:
@@ -398,7 +461,7 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                     subprocess.run(cmd, check=True, timeout=10)
                     return f"Opened in {name}: {url}" if url else f"Opened {name}."
                 except Exception as e:
-                    print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
+                    print(f"[Browser] Native browser launch failed ({type(e).__name__}); trying the binary.")
 
         spec = _resolve_browser(name)
         exe  = spec.get("exe") if spec else None
@@ -415,8 +478,8 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                 )
                 return f"Opened in {name}: {url}" if url else f"Opened {name}."
             except Exception as e:
-                print(f"[Browser] Native launch failed for {name}: {e}")
-        print(f"[Browser] '{name}' not found — falling back to default browser.")
+                print(f"[Browser] Native launch failed ({type(e).__name__}).")
+        print("[Browser] Requested browser was not found; falling back to the default.")
 
     if not url:
         return "Could not find a browser to open."
@@ -480,7 +543,7 @@ class _BrowserSession:
         try:
             self._loop.run_until_complete(self._async_init())
         except Exception as exc:
-            self._startup_error = str(exc)
+            self._startup_error = f"browser worker failed ({type(exc).__name__})"
             self._ready.set()
             return
         self._ready.set()
@@ -574,7 +637,7 @@ class _BrowserSession:
             try:
                 self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             except Exception as e:
-                print(f"[Browser] Firefox real profile failed ({e}), using JARVIS profile")
+                print(f"[Browser] Firefox profile launch failed ({type(e).__name__}); using the private profile.")
                 jarvis = str(Path.home() / ".jarvis_profiles" / "firefox_jarvis")
                 Path(jarvis).mkdir(parents=True, exist_ok=True)
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
@@ -632,7 +695,7 @@ class _BrowserSession:
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
-            print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
+            print(f"[Browser] ⚠️ Real profile launch failed ({type(e).__name__}).")
 
         # The real profile could not be opened (browser already open / locked
         # profile / newer Chrome versions block the real profile under
@@ -664,36 +727,66 @@ class _BrowserSession:
         url      = _normalize_url(url)
         page     = await self._get_page()
         prev_url = page.url
+        blocked_private_address = False
 
         async def _do_goto(p: Page) -> str:
             """Attempt navigation and return the resulting URL (may still be blank)."""
+            nonlocal blocked_private_address
             try:
-                await p.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                navigation = await p.goto(
+                    url, wait_until="domcontentloaded", timeout=30_000
+                )
+                if navigation is not None:
+                    try:
+                        server = await navigation.server_addr()
+                        address = server.get("ipAddress", "") if isinstance(server, dict) else ""
+                        if address and not _is_global_address(address):
+                            blocked_private_address = True
+                            try:
+                                await p.close()
+                            finally:
+                                if self._page is p:
+                                    self._page = None
+                            return ""
+                    except (AttributeError, KeyError, TypeError):
+                        pass
                 await asyncio.sleep(0.3)
             except PlaywrightTimeout:
                 pass   # page may have partially loaded — check URL below
             except Exception as e:
-                print(f"[Browser] goto exception (non-fatal): {e}")
+                print(f"[Browser] Navigation failed non-fatally ({type(e).__name__}).")
             return p.url
 
         result_url = await _do_goto(page)
+        if blocked_private_address:
+            return "Navigation was blocked because the server resolved to a private or reserved address."
 
         if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
-            print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
+            print("[Browser] Page remained blank after navigation; retrying in a new tab.")
             try:
                 new_page   = await self._context.new_page()
                 self._page = new_page
                 result_url = await _do_goto(new_page)
             except Exception as e:
-                print(f"[Browser] New-tab retry failed: {e}")
+                print(f"[Browser] New-tab retry failed ({type(e).__name__}).")
 
+        if blocked_private_address:
+            return "Navigation was blocked because the server resolved to a private or reserved address."
         if result_url and result_url not in ("about:blank", "", None):
+            try:
+                _normalize_url(result_url)
+            except ValueError:
+                try:
+                    await self._page.goto("about:blank")
+                except Exception:
+                    pass
+                return "Navigation was blocked after redirecting to a private or unsafe address."
             return f"Opened: {result_url}"
         return f"Could not open: {url}"
 
     async def search(self, query: str, engine: str = "google") -> str:
         base = _SEARCH_ENGINES.get(engine.lower(), _SEARCH_ENGINES["google"])
-        return await self.go_to(base + query.replace(" ", "+"))
+        return await self.go_to(base + quote_plus(query[:2_000]))
 
     async def click(self, selector: str = None, text: str = None) -> str:
         page = await self._get_page()
@@ -708,7 +801,7 @@ class _BrowserSession:
         except PlaywrightTimeout:
             return "Element not found (timeout)."
         except Exception as e:
-            return f"Click error: {e}"
+            return f"Click error: {type(e).__name__}"
 
     async def type_text(self, selector: str = None, text: str = "",
                         clear_first: bool = True) -> str:
@@ -720,7 +813,7 @@ class _BrowserSession:
             await el.type(text, delay=50)
             return "Text typed."
         except Exception as e:
-            return f"Type error: {e}"
+            return f"Type error: {type(e).__name__}"
 
     async def scroll(self, direction: str = "down", amount: int = 500) -> str:
         page = await self._get_page()
@@ -729,7 +822,7 @@ class _BrowserSession:
             await page.mouse.wheel(0, y)
             return f"Scrolled {direction}."
         except Exception as e:
-            return f"Scroll error: {e}"
+            return f"Scroll error: {type(e).__name__}"
 
     async def press(self, key: str) -> str:
         page = await self._get_page()
@@ -737,7 +830,7 @@ class _BrowserSession:
             await page.keyboard.press(key)
             return f"Pressed: {key}"
         except Exception as e:
-            return f"Key error: {e}"
+            return f"Key error: {type(e).__name__}"
 
     async def get_text(self) -> str:
         page = await self._get_page()
@@ -745,7 +838,7 @@ class _BrowserSession:
             text = await page.inner_text("body")
             return text[:4_000]
         except Exception as e:
-            return f"Could not get page text: {e}"
+            return f"Could not get page text: {type(e).__name__}"
 
     async def get_url(self) -> str:
         page = await self._get_page()
@@ -761,7 +854,7 @@ class _BrowserSession:
                 await el.type(str(value), delay=40)
                 results.append(f"✓ {selector}")
             except Exception as e:
-                results.append(f"✗ {selector}: {e}")
+                results.append(f"✗ {selector}: {type(e).__name__}")
         return "Form filled: " + ", ".join(results)
 
     async def smart_click(self, description: str) -> str:
@@ -831,12 +924,40 @@ class _BrowserSession:
 
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
+        staging = None
         try:
-            save_path = path or str(Path.home() / "Desktop" / "jarvis_screenshot.png")
-            await page.screenshot(path=save_path, full_page=False)
-            return f"Screenshot saved: {save_path}"
+            default_parent = Path.home() / "Desktop"
+            if not default_parent.is_dir():
+                default_parent = Path.home()
+            target = resolve_user_path(
+                path or (default_parent / "jarvis_screenshot.png"),
+                allow_missing=True,
+                reject_symlinks=True,
+            )
+            if target.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                return "Screenshot path must end in .png, .jpg, or .jpeg."
+            if target.exists():
+                return "Screenshot destination already exists; nothing was overwritten."
+            parent = resolve_user_path(
+                target.parent, allow_missing=False, reject_symlinks=True
+            )
+            if not parent.is_dir():
+                return "Screenshot destination folder does not exist."
+            staging = parent / (
+                f".{target.stem}.capturing-{secrets.token_hex(6)}{target.suffix}"
+            )
+            await page.screenshot(path=str(staging), full_page=False)
+            move_no_replace(staging, target)
+            staging = None
+            return f"Screenshot saved: {target}"
         except Exception as e:
-            return f"Screenshot error: {e}"
+            return f"Screenshot error: {type(e).__name__}"
+        finally:
+            if staging is not None:
+                try:
+                    staging.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def back(self) -> str:
         page = await self._get_page()
@@ -844,7 +965,7 @@ class _BrowserSession:
             await page.go_back(timeout=10_000)
             return f"Navigated back: {page.url}"
         except Exception as e:
-            return f"Back error: {e}"
+            return f"Back error: {type(e).__name__}"
 
     async def forward(self) -> str:
         page = await self._get_page()
@@ -852,7 +973,7 @@ class _BrowserSession:
             await page.go_forward(timeout=10_000)
             return f"Navigated forward: {page.url}"
         except Exception as e:
-            return f"Forward error: {e}"
+            return f"Forward error: {type(e).__name__}"
 
     async def reload(self) -> str:
         page = await self._get_page()
@@ -860,7 +981,7 @@ class _BrowserSession:
             await page.reload(timeout=15_000)
             return f"Page reloaded: {page.url}"
         except Exception as e:
-            return f"Reload error: {e}"
+            return f"Reload error: {type(e).__name__}"
 
     async def close_browser(self) -> str:
         await self._async_close()
@@ -956,13 +1077,21 @@ def browser_control(
     player=None,
     session_memory=None,
 ) -> str:
-    params  = parameters or {}
-    action  = params.get("action", "").lower().strip()
-    browser = params.get("browser", "").lower().strip() or None
+    params = parameters if isinstance(parameters, dict) else {}
+    raw_action = params.get("action", "")
+    raw_browser = params.get("browser", "")
+    action = raw_action[:32].lower().strip() if isinstance(raw_action, str) else ""
+    browser = (
+        raw_browser[:32].lower().strip() or None
+        if isinstance(raw_browser, str) else None
+    )
     result  = "Unknown action."
 
     if action == "switch":
-        target = browser or params.get("target", "").lower().strip()
+        raw_target = params.get("target", "")
+        target = browser or (
+            raw_target[:32].lower().strip() if isinstance(raw_target, str) else ""
+        )
         result = _registry.switch(target) if target else "Please specify a browser."
         _log(player, result)
         return result
@@ -1003,16 +1132,20 @@ def browser_control(
             except concurrent.futures.TimeoutError:
                 result = f"Browser action '{action}' timed out (60s)."
             except Exception as e:
-                result = f"Browser error ({action}): {e}"
+                result = f"Browser error ({action}): {type(e).__name__}"
             _log(player, result)
             return result
 
         if action == "search":
-            base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
-                                          _SEARCH_ENGINES["google"])
-            nav_url = base + params.get("query", "").replace(" ", "+")
+            raw_engine = params.get("engine", "google")
+            engine = raw_engine.lower() if isinstance(raw_engine, str) else "google"
+            raw_query = params.get("query", "")
+            query = raw_query[:2_000] if isinstance(raw_query, str) else ""
+            base = _SEARCH_ENGINES.get(engine, _SEARCH_ENGINES["google"])
+            nav_url = base + quote_plus(query)
         else:
-            nav_url = params.get("url", "").strip()
+            raw_url = params.get("url", "")
+            nav_url = raw_url[:4_096].strip() if isinstance(raw_url, str) else ""
 
         result = _open_native(nav_url, browser)
         if result.startswith("Opened") and nav_url:
@@ -1027,7 +1160,7 @@ def browser_control(
     try:
         sess = _registry.get(browser)
     except Exception as e:
-        result = f"Could not start browser session: {e}"
+        result = f"Could not start browser session: {type(e).__name__}"
         _log(player, result)
         return result
 
@@ -1037,7 +1170,7 @@ def browser_control(
             try:
                 sess.run(sess.go_to(last))
             except Exception as e:
-                print(f"[Browser] Could not resume last page ({last}): {e}")
+                print(f"[Browser] Could not resume the last page ({type(e).__name__}).")
 
         if action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
@@ -1047,7 +1180,15 @@ def browser_control(
         elif action == "scroll":
             result = sess.run(sess.scroll(params.get("direction", "down"), int(params.get("amount", 500))))
         elif action == "fill_form":
-            result = sess.run(sess.fill_form(params.get("fields", {})))
+            raw_fields = params.get("fields", [])
+            fields = {
+                item["selector"]: item["value"]
+                for item in raw_fields
+                if isinstance(item, dict)
+                and isinstance(item.get("selector"), str)
+                and isinstance(item.get("value"), str)
+            }
+            result = sess.run(sess.fill_form(fields))
         elif action == "smart_click":
             result = sess.run(sess.smart_click(params.get("description", "")))
         elif action == "smart_type":
@@ -1074,17 +1215,17 @@ def browser_control(
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
     except Exception as e:
-        result = f"Browser error ({action}): {e}"
+        result = f"Browser error ({action}): {type(e).__name__}"
 
     _log(player, result)
     return result
 
 
 def _log(player, text: str):
-    short = str(text)[:80]
-    print(f"[Browser] {short}")
+    size = len(str(text or ""))
+    print(f"[Browser] Action completed ({size} result characters).")
     if player:
-        player.write_log(f"[browser] {short[:60]}")
+        player.write_log("[browser] Action completed")
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
@@ -1096,55 +1237,87 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
+                "enum": ["go_to", "search", "click", "type", "scroll", "fill_form", "smart_click", "smart_type", "get_text", "get_url", "press", "new_tab", "close_tab", "screenshot", "back", "forward", "reload", "switch", "list_browsers", "close", "close_all"],
+                "maxLength": 32,
                 "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",
+                "enum": ["chrome", "edge", "firefox", "opera", "operagx", "brave", "vivaldi", "safari"],
+                "maxLength": 20,
                 "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
             },
             "url": {
                 "type": "STRING",
+                "maxLength": 4096,
                 "description": "URL for go_to / new_tab action"
             },
             "query": {
                 "type": "STRING",
+                "maxLength": 2000,
                 "description": "Search query for search action"
             },
             "engine": {
                 "type": "STRING",
+                "enum": ["google", "bing", "duckduckgo", "yandex"],
+                "maxLength": 20,
                 "description": "Search engine: google | bing | duckduckgo | yandex (default: google)"
             },
             "selector": {
                 "type": "STRING",
+                "maxLength": 1000,
                 "description": "CSS selector for click/type"
             },
             "text": {
                 "type": "STRING",
+                "maxLength": 10000,
                 "description": "Text to click or type"
             },
             "description": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "Element description for smart_click/smart_type"
             },
             "direction": {
                 "type": "STRING",
+                "enum": ["up", "down"],
+                "maxLength": 8,
                 "description": "up | down for scroll"
             },
             "amount": {
                 "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 5000,
                 "description": "Scroll amount in pixels (default: 500)"
             },
             "key": {
                 "type": "STRING",
+                "maxLength": 50,
                 "description": "Key name for press action (e.g. Enter, Escape, F5)"
             },
             "path": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "Save path for screenshot"
             },
-            "incognito": {
-                "type": "BOOLEAN",
-                "description": "Open in private/incognito mode"
+            "target": {
+                "type": "STRING",
+                "enum": ["chrome", "edge", "firefox", "opera", "operagx", "brave", "vivaldi", "safari"],
+                "maxLength": 20,
+                "description": "Browser name for switch; browser is preferred."
+            },
+            "fields": {
+                "type": "ARRAY",
+                "maxItems": 50,
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "selector": {"type": "STRING", "maxLength": 1000},
+                        "value": {"type": "STRING", "maxLength": 10000}
+                    },
+                    "required": ["selector", "value"]
+                },
+                "description": "Form fields as selector/value pairs for fill_form."
             },
             "clear_first": {
                 "type": "BOOLEAN",

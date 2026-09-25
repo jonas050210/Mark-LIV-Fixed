@@ -66,7 +66,7 @@ class WhisperSTT:
             )
             return " ".join(s.text for s in segments).strip()
         except Exception as e:
-            print(f"[STT] Transcription error: {e}")
+            print(f"[STT] Transcription error ({type(e).__name__}).")
             raise
 
 

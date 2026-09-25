@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 from array import array
+
+from core.process_runner import run_bounded
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Callable
@@ -126,7 +128,7 @@ def _download_models_child() -> int:
             download()
         return 0
     except Exception as exc:
-        print(f"model download failed: {exc}", file=sys.stderr, flush=True)
+        print(f"model download failed ({type(exc).__name__})", file=sys.stderr, flush=True)
         return 1
 
 
@@ -160,7 +162,7 @@ def _serve_child(threshold: float = DEFAULT_THRESHOLD) -> int:
                 inference_framework="onnx",
             )
     except Exception as exc:
-        print(f"wake engine failed to start: {exc}", file=sys.stderr, flush=True)
+        print(f"wake engine failed to start ({type(exc).__name__})", file=sys.stderr, flush=True)
         return 1
 
     _write_child_event("READY")
@@ -192,7 +194,7 @@ def _serve_child(threshold: float = DEFAULT_THRESHOLD) -> int:
             if score >= threshold:
                 _write_child_event("DETECT")
         except Exception as exc:
-            print(f"wake inference failed: {exc}", file=sys.stderr, flush=True)
+            print(f"wake inference failed ({type(exc).__name__})", file=sys.stderr, flush=True)
 
 
 def install_and_download(
@@ -211,16 +213,15 @@ def install_and_download(
             message = "Wake word: installing openwakeword (one-time)…"
             logger(message)
             tell(message)
-            result = subprocess.run(
+            result = run_bounded(
                 [sys.executable, "-m", "pip", "install", "openwakeword"],
-                capture_output=True,
-                text=True,
                 timeout=_DOWNLOAD_TIMEOUT,
+                max_output=100_000,
             )
+            if result.timed_out:
+                return False, "pip install timed out after 15 minutes."
             if result.returncode != 0:
-                details = (result.stderr or result.stdout or "").strip().splitlines()
-                detail = details[-1][:240] if details else "pip returned a failure"
-                return False, f"pip install failed: {detail}"
+                return False, f"pip install failed (exit code {result.returncode})."
             importlib.invalidate_caches()
 
         if not is_installed():
@@ -232,15 +233,13 @@ def install_and_download(
         command = [sys.executable, str(Path(__file__).resolve()), "--download-models"]
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=_DOWNLOAD_TIMEOUT,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
+        result = run_bounded(
+            command,
+            timeout=_DOWNLOAD_TIMEOUT,
+            env=env,
+            max_output=100_000,
+        )
+        if result.timed_out:
             return False, "model download timed out after 15 minutes."
 
         # Forward useful child progress to the existing console/activity log.
@@ -249,11 +248,9 @@ def install_and_download(
             if line:
                 logger(f"Wake word: {line}")
         if result.returncode != 0:
-            details = (result.stderr or result.stdout or "").strip().splitlines()
-            detail = details[-1][:240] if details else f"helper exited with code {result.returncode}"
-            if result.returncode < 0:
-                detail = f"download helper terminated by signal {-result.returncode}"
-            return False, f"model download failed: {detail}"
+            if result.returncode is not None and result.returncode < 0:
+                return False, f"model download helper stopped by signal {-result.returncode}."
+            return False, f"model download failed (exit code {result.returncode})."
 
         importlib.invalidate_caches()
         if not is_ready():
@@ -261,7 +258,7 @@ def install_and_download(
         logger("Wake word: ready.")
         return True, "Wake word installed and ready."
     except Exception as exc:
-        return False, f"setup error: {exc}"
+        return False, f"setup failed ({type(exc).__name__})."
 
 
 class WakeWordDetector:
@@ -317,7 +314,9 @@ class WakeWordDetector:
                 creationflags=flags,
             )
         except Exception as exc:
-            self._logger(f"Wake word: could not start isolated engine — {exc}")
+            self._logger(
+                f"Wake word: could not start isolated engine ({type(exc).__name__})."
+            )
             self._notify("Wake word unavailable — use the WAKE NOW button.")
             return False
 
@@ -439,7 +438,9 @@ class WakeWordDetector:
                     try:
                         self._on_detect()
                     except Exception as exc:
-                        self._logger(f"Wake word: on_detect error — {exc}")
+                        self._logger(
+                            f"Wake word: on_detect error ({type(exc).__name__})."
+                        )
                 elif line:
                     # Be tolerant if a native dependency writes text to stdout.
                     self._logger(f"Wake word: engine: {line[:240]}")

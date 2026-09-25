@@ -11,6 +11,8 @@ import os
 import platform
 import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -21,6 +23,7 @@ class ProcessResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    cancelled: bool = False
 
     @property
     def combined(self) -> str:
@@ -69,10 +72,77 @@ def run_bounded(
     timeout: float = 30.0,
     env: Mapping[str, str] | None = None,
     max_output: int = 32_000,
+    cancel_event: threading.Event | None = None,
 ) -> ProcessResult:
-    """Run ``argv`` without a shell and kill its process group on timeout."""
+    """Run without a shell; bound captured output and kill the process group."""
     timeout = max(0.5, min(float(timeout), 900.0))
-    proc = None
+    max_output = max(1_024, min(int(max_output), 1_000_000))
+    proc: subprocess.Popen | None = None
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+    capture_threads: list[threading.Thread] = []
+
+    def drain(stream, tail: bytearray) -> None:
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                overflow = len(tail) - max_output
+                if overflow > 0:
+                    del tail[:overflow]
+        except (OSError, ValueError):
+            return
+
+    def stop_process() -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        _terminate(proc)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        if platform.system() != "Windows":
+            # The direct child may exit while a descendant ignores SIGTERM.
+            # Escalate against the original process group even in that case.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        elif proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def captured() -> tuple[str, str]:
+        # A descendant should not be able to keep inherited pipes open forever.
+        streams = (getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+        for thread in capture_threads:
+            thread.join(timeout=0.25)
+        for stream, thread in zip(streams, capture_threads):
+            if stream is not None and thread.is_alive():
+                try:
+                    os.close(stream.fileno())
+                except OSError:
+                    pass
+        for stream, thread in zip(streams, capture_threads):
+            thread.join(timeout=0.75)
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return (
+            bytes(stdout_tail).decode("utf-8", "replace"),
+            bytes(stderr_tail).decode("utf-8", "replace"),
+        )
+
     try:
         proc = subprocess.Popen(
             [str(x) for x in argv],
@@ -81,35 +151,36 @@ def run_bounded(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             start_new_session=(platform.system() != "Windows"),
             creationflags=_creationflags(),
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return ProcessResult(proc.returncode, stdout[-max_output:], stderr[-max_output:])
-    except subprocess.TimeoutExpired as exc:
-        if proc is not None:
-            _terminate(proc)
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                stdout, stderr = proc.communicate()
-        else:
-            stdout, stderr = "", ""
-        # communicate() may contain bytes only in unusual mocked callers.
-        stdout = stdout if isinstance(stdout, str) else (stdout or b"").decode("utf-8", "replace")
-        stderr = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
-        return ProcessResult(None, stdout[-max_output:], stderr[-max_output:] or str(exc), True)
-    except FileNotFoundError as exc:
-        return ProcessResult(127, "", str(exc))
+        for stream, tail in ((proc.stdout, stdout_tail), (proc.stderr, stderr_tail)):
+            thread = threading.Thread(target=drain, args=(stream, tail), daemon=True)
+            thread.start()
+            capture_threads.append(thread)
+
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                stop_process()
+                stdout, stderr = captured()
+                return ProcessResult(None, stdout, stderr, cancelled=True)
+            if time.monotonic() >= deadline:
+                stop_process()
+                stdout, stderr = captured()
+                return ProcessResult(
+                    None, stdout, stderr or f"Process timed out after {timeout:g} seconds.",
+                    timed_out=True,
+                )
+            time.sleep(0.05)
+
+        stdout, stderr = captured()
+        return ProcessResult(proc.returncode, stdout, stderr)
+    except FileNotFoundError:
+        return ProcessResult(127, "", "executable was not found")
     except Exception as exc:
-        return ProcessResult(1, "", str(exc))
+        stop_process()
+        return ProcessResult(1, "", f"process failed ({type(exc).__name__})")
 
 
 __all__ = ["ProcessResult", "run_bounded"]

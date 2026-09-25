@@ -12,7 +12,7 @@ from actions import file_controller, open_app
 
 class ExplorerTests(unittest.TestCase):
     def test_resolve_location_alias_and_subpath(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             home = Path(directory)
             docs = home / "Documents"
             with patch.object(explorer, "locations", return_value={"home": home, "documents": docs}):
@@ -20,7 +20,7 @@ class ExplorerTests(unittest.TestCase):
                 self.assertEqual(explorer.resolve_location("docs"), docs)
 
     def test_search_detects_exact_file_and_lists_ambiguous_matches(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             root = Path(directory)
             first = root / "one" / "notes.txt"
             second = root / "two" / "notes.txt"
@@ -38,7 +38,7 @@ class ExplorerTests(unittest.TestCase):
             self.assertIn("exact path", result)
 
     def test_windows_file_selection_uses_argument_list(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             target = Path(directory) / "report.pdf"
             target.write_text("report", encoding="utf-8")
             with patch.object(explorer, "_OS", "Windows"), \
@@ -58,7 +58,7 @@ class FileControllerTests(unittest.TestCase):
         self.assertEqual(find.call_args.kwargs["path"], "home")
 
     def test_explorer_does_not_guess_between_duplicate_file_names(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             root = Path(directory)
             for folder in (root / "one", root / "two"):
                 folder.mkdir()
@@ -71,7 +71,7 @@ class FileControllerTests(unittest.TestCase):
         open_in_explorer.assert_not_called()
 
     def test_explorer_candidate_number_can_select_a_reported_match(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
             root = Path(directory)
             first = root / "one" / "notes.txt"
             second = root / "two" / "notes.txt"

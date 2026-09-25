@@ -1,50 +1,96 @@
-import json
+"""Validated, atomic access to MARK LIV's runtime configuration."""
+from __future__ import annotations
+
 import sys
 from pathlib import Path
+from typing import Any
+
+from core.json_store import JsonStore, JsonStoreCorruptError
+
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
-BASE_DIR    = get_base_dir()
-CONFIG_DIR  = BASE_DIR / "config"
+
+BASE_DIR = get_base_dir()
+CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_keys.json"
+
+
+def _new_config() -> dict[str, Any]:
+    return {}
+
+
+def _is_config(value: object) -> bool:
+    return isinstance(value, dict)
+
+
+def _stored_bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _require_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be true or false")
+    return value
+
+
+def _clean_display_name(value: object, default: str = "") -> str:
+    if not isinstance(value, str):
+        return default
+    cleaned = " ".join(
+        "".join(char for char in value if ord(char) >= 32 and char != "\x7f").split()
+    )[:80]
+    return cleaned or default
+
+
+def _store() -> JsonStore[dict[str, Any]]:
+    # Constructing this lightweight wrapper on demand lets tests safely patch
+    # CONFIG_FILE without also having to replace a module-global store object.
+    return JsonStore(CONFIG_FILE, _new_config, validator=_is_config, private=True)
+
 
 def ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def config_exists() -> bool:
-    return CONFIG_FILE.exists()
+    return CONFIG_FILE.is_file()
 
-def save_api_keys(gemini_api_key: str) -> None:
-    ensure_config_dir()
-
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-
-    data["gemini_api_key"] = gemini_api_key.strip()
-
-    CONFIG_FILE.write_text(
-        json.dumps(data, indent=2),
-        encoding="utf-8"
-    )
 
 def load_api_keys() -> dict:
     if not CONFIG_FILE.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
+        return _store().read()
+    except JsonStoreCorruptError as exc:
+        # Do not overwrite a malformed configuration with defaults. Setters use
+        # the same store and will fail until a backup can be recovered or the
+        # corrupt file is repaired.
+        print(f"❌ Failed to load api_keys.json safely ({type(exc).__name__}).")
         return {}
 
+
+def patch_config(**fields: Any) -> dict:
+    """Atomically merge fields into the configuration and return the result."""
+    ensure_config_dir()
+
+    def mutate(data: dict[str, Any]) -> None:
+        data.update(fields)
+
+    return _store().update(mutate)
+
+
+def save_api_keys(gemini_api_key: str) -> None:
+    patch_config(gemini_api_key=str(gemini_api_key or "").strip())
+
+
 def get_gemini_key() -> str | None:
-    return load_api_keys().get("gemini_api_key")
+    value = load_api_keys().get("gemini_api_key")
+    return str(value).strip() if isinstance(value, str) and value.strip() else None
+
 
 def is_configured() -> bool:
     key = get_gemini_key()
@@ -52,333 +98,221 @@ def is_configured() -> bool:
 
 
 def get_assistant_name() -> str:
-    """Return the configured assistant name, or 'JARVIS' if not set."""
-    return load_api_keys().get("assistant_name", "JARVIS") or "JARVIS"
+    return _clean_display_name(
+        load_api_keys().get("assistant_name", "JARVIS"), "JARVIS"
+    )
 
 
 def get_user_name() -> str:
-    """Return the configured user name for addressing."""
-    return load_api_keys().get("user_name", "")
+    return _clean_display_name(load_api_keys().get("user_name", ""))
 
 
 def save_assistant_config(assistant_name: str, user_name: str) -> None:
-    """Persist assistant name and user name to config."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data["assistant_name"] = assistant_name.strip() or "JARVIS"
-    data["user_name"] = user_name.strip()
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    patch_config(
+        assistant_name=_clean_display_name(assistant_name, "JARVIS"),
+        user_name=_clean_display_name(user_name),
+    )
 
 
-# ── Assistant voice ──────────────────────────────────────────────────────────
-# Gemini Live prebuilt voices. Names are proper nouns — identical in every
-# language, so this list is safe to show verbatim in any locale.
 AVAILABLE_VOICES = ["Charon", "Puck", "Kore", "Fenrir", "Aoede"]
-DEFAULT_VOICE    = "Charon"
+DEFAULT_VOICE = "Charon"
 
 
 def get_voice() -> str:
-    """Return the configured Live voice, falling back to the default if unset
-    or if the stored value is not a voice we recognise."""
-    v = load_api_keys().get("voice_name", DEFAULT_VOICE) or DEFAULT_VOICE
-    return v if v in AVAILABLE_VOICES else DEFAULT_VOICE
+    value = load_api_keys().get("voice_name", DEFAULT_VOICE)
+    return value if isinstance(value, str) and value in AVAILABLE_VOICES else DEFAULT_VOICE
 
 
 def save_voice(voice_name: str) -> None:
-    """Persist the chosen Live voice. Unknown names collapse to the default so a
-    bad value can never reach the API and break the session."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    v = (voice_name or "").strip()
-    data["voice_name"] = v if v in AVAILABLE_VOICES else DEFAULT_VOICE
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    value = str(voice_name or "").strip()
+    patch_config(voice_name=value if value in AVAILABLE_VOICES else DEFAULT_VOICE)
 
 
 def get_wake_word_enabled() -> bool:
-    """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
-    return load_api_keys().get("wake_word_enabled", False)
+    return _stored_bool(load_api_keys().get("wake_word_enabled"), False)
 
 
 def save_wake_word_enabled(enabled: bool) -> None:
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data["wake_word_enabled"] = bool(enabled)
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    patch_config(wake_word_enabled=_require_bool(enabled, "wake_word_enabled"))
 
 
 def get_push_to_talk_enabled() -> bool:
-    """Hold-a-key-to-speak. When on, the mic is closed unless the chord is held."""
-    return load_api_keys().get("push_to_talk_enabled", False)
+    return _stored_bool(load_api_keys().get("push_to_talk_enabled"), False)
 
 
 def save_push_to_talk_enabled(enabled: bool) -> None:
-    _save_flag("push_to_talk_enabled", enabled)
+    patch_config(push_to_talk_enabled=_require_bool(enabled, "push_to_talk_enabled"))
 
 
 HUD_STYLES = ("face", "core")
 
 
 def get_hud_style() -> str:
-    """Which centrepiece the HUD draws: the animated head, or the reactor core.
-
-    Taste, not capability — both render in the same software painter and cost
-    about the same. Defaults to the head because that is what MARK LIV shipped
-    with; anyone who preferred the older look can switch back in ⚙ and the
-    choice survives a restart.
-    """
-    v = str(load_api_keys().get("hud_style", "face")).strip().lower()
-    return v if v in HUD_STYLES else "face"
+    value = load_api_keys().get("hud_style", "face")
+    normalized = str(value).strip().lower() if isinstance(value, str) else "face"
+    return normalized if normalized in HUD_STYLES else "face"
 
 
 def save_hud_style(style: str) -> None:
-    s = str(style or "").strip().lower()
-    _save_flag("hud_style", s if s in HUD_STYLES else "face")
+    normalized = str(style or "").strip().lower()
+    patch_config(hud_style=normalized if normalized in HUD_STYLES else "face")
 
-
-# ── Live-session tuning ──────────────────────────────────────────────────────
-# Everything here is optional and has a working default, so an untouched
-# config behaves exactly like a configured one. Each value is also a way out:
-# if a future model dislikes one of these, set it back and nothing else changes.
 
 def get_thinking_enabled() -> bool:
-    """Whether the Live model may spend tokens thinking before it answers.
-
-    Off by default. A voice assistant is judged on how fast it starts talking,
-    and the reasoning that actually needs deliberation in this app is delegated
-    to the planning tools, which run on a separate non-Live model.
-    """
-    return bool(load_api_keys().get("thinking_enabled", False))
+    return _stored_bool(load_api_keys().get("thinking_enabled"), False)
 
 
 def save_thinking_enabled(enabled: bool) -> None:
-    _save_flag("thinking_enabled", enabled)
+    patch_config(thinking_enabled=_require_bool(enabled, "thinking_enabled"))
 
 
 def get_turn_tuning() -> dict:
-    """How eagerly the server decides you have stopped speaking.
+    value = load_api_keys().get("turn_tuning")
+    cfg = value if isinstance(value, dict) else {}
 
-    OFF by default, and that default was earned. Cutting turns shorter looks
-    like a free speed win and is not: proactive audio has to judge whether an
-    utterance was even addressed to the assistant, and a turn clipped early
-    gives it less to judge, so it stays quiet — and the reply to your first
-    sentence only arrives once your second one has given it enough context.
-    That reads as the assistant being a turn behind, which is far worse than
-    the fraction of a second the tuning saves.
-
-    Turn it on with "turn_tuning": {"enabled": true} if your own microphone and
-    speaking pace suit it. `silence_ms` is the one that is felt: the pause the
-    server sits through before accepting your turn is over.
-    """
-    cfg = load_api_keys().get("turn_tuning")
-    cfg = cfg if isinstance(cfg, dict) else {}
-
-    def _int(key, default, lo, hi):
+    def bounded_int(key: str, default: int, low: int, high: int) -> int:
         try:
-            return max(lo, min(hi, int(cfg.get(key, default))))
+            return max(low, min(high, int(cfg.get(key, default))))
         except (TypeError, ValueError):
             return default
 
+    end = str(cfg.get("end_sensitivity", "high") or "high").strip().lower()
+    start = str(cfg.get("start_sensitivity", "default") or "default").strip().lower()
+    if end not in {"low", "default", "medium", "high"}:
+        end = "high"
+    if start not in {"low", "default", "medium", "high"}:
+        start = "default"
     return {
-        "enabled":    bool(cfg.get("enabled", False)),
-        "silence_ms": _int("silence_ms", 550, 200, 3000),
-        "prefix_ms":  _int("prefix_ms", 150, 0, 1000),
-        # "high" = quicker to decide speech has ended.
-        "end_sensitivity":   str(cfg.get("end_sensitivity", "high")).lower(),
-        "start_sensitivity": str(cfg.get("start_sensitivity", "default")).lower(),
+        "enabled": _stored_bool(cfg.get("enabled"), False),
+        "silence_ms": bounded_int("silence_ms", 550, 200, 3000),
+        "prefix_ms": bounded_int("prefix_ms", 150, 0, 1000),
+        "end_sensitivity": end,
+        "start_sensitivity": start,
     }
 
 
 def save_turn_tuning(values: dict) -> None:
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    cur = data.get("turn_tuning")
-    cur = dict(cur) if isinstance(cur, dict) else {}
-    cur.update(values or {})
-    data["turn_tuning"] = cur
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    updates = dict(values) if isinstance(values, dict) else {}
+
+    def mutate(data: dict[str, Any]) -> None:
+        current = data.get("turn_tuning")
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(updates)
+        data["turn_tuning"] = merged
+
+    _store().update(mutate)
 
 
 def get_proactive_audio_enabled() -> bool:
-    """Whether the model gets to decide an utterance was not aimed at it and
-    stay quiet.
-
-    On by default — it is what stops the assistant answering the room. But it
-    is also the first thing to switch off if replies ever seem to arrive a turn
-    late: what looks like lag is usually the model having judged your previous
-    sentence as not addressed to it, and only changing its mind once the next
-    one arrives.
-    """
-    return bool(load_api_keys().get("proactive_audio", True))
+    return _stored_bool(load_api_keys().get("proactive_audio"), True)
 
 
 def save_proactive_audio_enabled(enabled: bool) -> None:
-    _save_flag("proactive_audio", enabled)
+    patch_config(proactive_audio=_require_bool(enabled, "proactive_audio"))
 
 
 MEDIA_RESOLUTIONS = ("default", "low", "medium", "high")
 
 
 def get_media_resolution() -> str:
-    """How finely the model tokenises the screenshots and camera frames it is
-    sent. 'medium' keeps on-screen text readable at a fraction of the tokens a
-    full-resolution frame costs; 'low' is cheaper still but starts losing small
-    text, which is most of what screen captures are for."""
-    v = str(load_api_keys().get("media_resolution", "medium")).strip().lower()
-    return v if v in MEDIA_RESOLUTIONS else "medium"
+    value = load_api_keys().get("media_resolution", "medium")
+    normalized = str(value).strip().lower() if isinstance(value, str) else "medium"
+    return normalized if normalized in MEDIA_RESOLUTIONS else "medium"
 
 
 def save_media_resolution(value: str) -> None:
-    v = str(value or "").strip().lower()
-    _save_flag("media_resolution", v if v in MEDIA_RESOLUTIONS else "medium")
+    normalized = str(value or "").strip().lower()
+    patch_config(
+        media_resolution=normalized if normalized in MEDIA_RESOLUTIONS else "medium"
+    )
 
 
 def _save_flag(key: str, value) -> None:
-    """Read-modify-write one key without disturbing the rest of the config."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data[key] = bool(value) if isinstance(value, bool) else value
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    patch_config(**{key: _require_bool(value, key)})
 
 
 def get_brief_enabled() -> bool:
-    return load_api_keys().get("morning_brief_enabled", True)
+    return _stored_bool(load_api_keys().get("morning_brief_enabled"), True)
 
 
 def save_brief_enabled(enabled: bool) -> None:
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data["morning_brief_enabled"] = enabled
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    patch_config(morning_brief_enabled=_require_bool(enabled, "morning_brief_enabled"))
 
-
-# ── Audio devices ────────────────────────────────────────────────────────────
-# Stored as device NAMES, not sounddevice indices. Indices shift every time a
-# USB device is plugged in or removed, so a saved index silently starts pointing
-# at a different microphone. The empty string means "system default", which is
-# both the factory setting and what an unresolvable saved device falls back to —
-# so unplugging a headset degrades to the built-in speakers instead of crashing.
 
 def _patch_config(**fields) -> None:
-    """Read-modify-write one or more keys in api_keys.json.
+    """Backward-compatible private alias used by older call sites."""
+    patch_config(**fields)
 
-    Every setter in this file open-coded this. Collapsing it here means a new
-    setting is one line, and there is one place where a corrupt config file is
-    handled instead of nine."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data.update(fields)
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+def _clean_device_name(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(
+        "".join(char for char in value if ord(char) >= 32 and char != "\x7f").split()
+    )[:300]
 
 
 def get_input_device() -> str:
-    """Microphone device name, or '' for the system default."""
-    return (load_api_keys().get("input_device", "") or "").strip()
+    return _clean_device_name(load_api_keys().get("input_device", ""))
 
 
 def save_input_device(name: str) -> None:
-    _patch_config(input_device=(name or "").strip())
+    patch_config(input_device=_clean_device_name(name))
 
 
 def get_output_device() -> str:
-    """Speaker device name, or '' for the system default."""
-    return (load_api_keys().get("output_device", "") or "").strip()
+    return _clean_device_name(load_api_keys().get("output_device", ""))
 
 
 def save_output_device(name: str) -> None:
-    _patch_config(output_device=(name or "").strip())
+    patch_config(output_device=_clean_device_name(name))
 
 
 def get_plugin_enabled(plugin_name: str) -> bool:
-    """Plugins are enabled by default the moment they're discovered (opt-out model)."""
-    return load_api_keys().get("plugins_enabled", {}).get(plugin_name, True)
+    value = load_api_keys().get("plugins_enabled")
+    plugins = value if isinstance(value, dict) else {}
+    return _stored_bool(plugins.get(str(plugin_name)), True)
 
 
-# ── Per-plugin settings ("tokens" / connection details) ───────────────────────
-# Generic store so a plugin can declare its own config fields (PLUGIN_SETTINGS)
-# and the settings UI renders + persists them WITHOUT any core edit — keeping the
-# drop-in model intact. Values live under plugin_config[<namespace>][<key>].
-# A namespace defaults to the plugin name, but a suite of plugins (e.g. the
-# several printer plugins) can share ONE namespace.
 def get_plugin_config(namespace: str) -> dict:
-    """All stored values for a namespace (empty dict if none set yet)."""
-    cfg = load_api_keys().get("plugin_config")
-    val = cfg.get(namespace) if isinstance(cfg, dict) else None
-    return dict(val) if isinstance(val, dict) else {}
+    value = load_api_keys().get("plugin_config")
+    all_config = value if isinstance(value, dict) else {}
+    section = all_config.get(str(namespace))
+    return dict(section) if isinstance(section, dict) else {}
 
 
 def get_plugin_setting(namespace: str, key: str, default=None):
-    """A single value from a namespace, or `default` if unset."""
     return get_plugin_config(namespace).get(key, default)
 
 
 def save_plugin_config(namespace: str, values: dict) -> None:
-    """Merge `values` into a namespace's stored config (read-modify-write, like
-    every other helper here). Only the provided keys are touched."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    pc = data.get("plugin_config")
-    if not isinstance(pc, dict):
-        pc = {}
-    cur = pc.get(namespace)
-    if not isinstance(cur, dict):
-        cur = {}
-    cur.update(values)
-    pc[namespace] = cur
-    data["plugin_config"] = pc
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    if not isinstance(values, dict):
+        raise TypeError("plugin configuration must be a dictionary")
+    namespace = str(namespace or "").strip()
+    if not namespace:
+        raise ValueError("plugin configuration namespace is required")
+
+    def mutate(data: dict[str, Any]) -> None:
+        raw = data.get("plugin_config")
+        all_config = dict(raw) if isinstance(raw, dict) else {}
+        existing = all_config.get(namespace)
+        section = dict(existing) if isinstance(existing, dict) else {}
+        section.update(values)
+        all_config[namespace] = section
+        data["plugin_config"] = all_config
+
+    _store().update(mutate)
 
 
 def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    plugins_cfg = data.get("plugins_enabled")
-    if not isinstance(plugins_cfg, dict):
-        plugins_cfg = {}
-    plugins_cfg[plugin_name] = enabled
-    data["plugins_enabled"] = plugins_cfg
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    name = str(plugin_name or "").strip()
+    if not name:
+        raise ValueError("plugin name is required")
+
+    def mutate(data: dict[str, Any]) -> None:
+        raw = data.get("plugins_enabled")
+        plugins = dict(raw) if isinstance(raw, dict) else {}
+        plugins[name] = _require_bool(enabled, "plugin enabled")
+        data["plugins_enabled"] = plugins
+
+    _store().update(mutate)

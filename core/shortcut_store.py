@@ -1,22 +1,14 @@
-"""Small, deterministic store for user-defined application shortcuts.
-
-Shortcut resolution happens before the language model is asked to improvise an
-application name. The file contains only aliases and launch targets; it never
-executes a command or stores credentials.
-"""
+"""Validated transactional store for user-defined application shortcuts."""
 from __future__ import annotations
 
-import json
-import os
 import re
-import tempfile
-import threading
 from pathlib import Path
+
+from core.json_store import JsonStore, JsonStoreCorruptError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SHORTCUTS_FILE = BASE_DIR / "config" / "shortcuts.json"
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
-_lock = threading.RLock()
 
 
 def _clean_alias(value: str) -> str:
@@ -33,35 +25,30 @@ def _clean_target(value: str) -> str:
     return target
 
 
+def _valid_shortcuts(value: object) -> bool:
+    if not isinstance(value, dict) or len(value) > 1_000:
+        return False
+    try:
+        for alias, target in value.items():
+            if _clean_alias(alias) != alias or _clean_target(target) != target:
+                return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _store() -> JsonStore[dict[str, str]]:
+    return JsonStore(SHORTCUTS_FILE, dict, validator=_valid_shortcuts, private=True)
+
+
 def _read() -> dict[str, str]:
-    try:
-        raw = json.loads(SHORTCUTS_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return {}
-        return {
-            _clean_alias(key): _clean_target(value)
-            for key, value in raw.items()
-            if isinstance(key, str) and isinstance(value, str)
-        }
-    except (OSError, ValueError, json.JSONDecodeError):
+    if not SHORTCUTS_FILE.exists():
         return {}
-
-
-def _write(values: dict[str, str]) -> None:
-    SHORTCUTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix="shortcuts-", suffix=".json", dir=SHORTCUTS_FILE.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(sorted(values.items())), handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, SHORTCUTS_FILE)
-    finally:
-        try:
-            Path(temporary).unlink()
-        except FileNotFoundError:
-            pass
+        return _store().read()
+    except JsonStoreCorruptError as exc:
+        print(f"[Shortcuts] Store is corrupt ({type(exc).__name__}).")
+        return {}
 
 
 def resolve(value: str) -> str:
@@ -71,8 +58,7 @@ def resolve(value: str) -> str:
         alias = _clean_alias(raw)
     except ValueError:
         return raw
-    with _lock:
-        return _read().get(alias, raw)
+    return _read().get(alias, raw)
 
 
 def save(alias: str, target: str) -> str:
@@ -80,24 +66,26 @@ def save(alias: str, target: str) -> str:
     target = _clean_target(target)
     if alias == target.casefold():
         raise ValueError("a shortcut cannot point to itself")
-    with _lock:
-        values = _read()
+
+    def update(values: dict[str, str]) -> None:
         values[alias] = target
-        _write(values)
+
+    _store().update(update)
     return target
 
 
 def remove(alias: str) -> bool:
     alias = _clean_alias(alias)
-    with _lock:
-        values = _read()
+    existed = False
+
+    def update(values: dict[str, str]) -> None:
+        nonlocal existed
         existed = alias in values
         values.pop(alias, None)
-        if existed:
-            _write(values)
-        return existed
+
+    _store().update(update)
+    return existed
 
 
 def all_shortcuts() -> dict[str, str]:
-    with _lock:
-        return dict(_read())
+    return dict(_read())

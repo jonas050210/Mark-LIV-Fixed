@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
+from core import action_loader
 from core.action_loader import discover_actions
 from core.action_result import ActionResult
 from core import confirm
-from core.action_runtime import runtime as action_runtime
+from core.action_runtime import ActionRuntime, runtime as action_runtime
 
 
 class ActionRuntimeTests(unittest.TestCase):
@@ -16,6 +19,57 @@ class ActionRuntimeTests(unittest.TestCase):
         # Do not let a pending confirmation leak into another test process.
         confirm.resolve(False)
         confirm.bind(None, None)
+
+    def test_runtime_snapshots_redact_and_copy_sensitive_parameters(self) -> None:
+        runtime = ActionRuntime()
+        nested = {
+            "api_key": "secret",
+            "text": "private prompt",
+            "options": {
+                "token": "private",
+                "value": [1, 2],
+                "choices": [1, 2],
+            },
+        }
+        run_id = runtime.start("demo", nested)
+        snapshot = runtime.snapshots()[0]
+        self.assertEqual(snapshot["parameters"]["api_key"], "[redacted]")
+        self.assertEqual(snapshot["parameters"]["text"], "[redacted]")
+        self.assertEqual(snapshot["parameters"]["options"]["token"], "[redacted]")
+        self.assertEqual(snapshot["parameters"]["options"]["value"], "[redacted]")
+        snapshot["parameters"]["options"]["choices"].append(3)
+        detached = runtime.get(run_id)
+        self.assertEqual(detached.parameters["options"]["choices"], [1, 2])
+        detached.status = "forged"
+        detached.cancel_event.set()
+        self.assertEqual(runtime.get(run_id).status, "queued")
+        self.assertFalse(runtime.cancellation_event(run_id).is_set())
+
+    def test_runtime_deduplicates_and_bounds_listeners(self) -> None:
+        runtime = ActionRuntime()
+        repeated = lambda _event: None
+        runtime.subscribe(repeated)
+        runtime.subscribe(repeated)
+        for _ in range(120):
+            runtime.subscribe(lambda _event: None)
+        self.assertEqual(len(runtime._listeners), 100)
+        self.assertEqual(sum(listener is repeated for listener in runtime._listeners), 0)
+
+    def test_confirmation_actively_expires_and_notifies_cancellation(self) -> None:
+        hidden = threading.Event()
+        cancelled = []
+        confirm.bind(lambda _title, _detail: None, hidden.set)
+        with mock.patch.object(confirm, "TIMEOUT_SECONDS", 0.03):
+            confirm.request(
+                "expiring-action",
+                "Expire me",
+                "This should disappear.",
+                lambda: "must not run",
+                on_cancel=cancelled.append,
+            )
+            self.assertTrue(hidden.wait(1.0))
+        self.assertEqual(cancelled, ["expired"])
+        self.assertEqual(confirm.pending_key(), "")
 
     def test_plain_handler_is_wrapped_in_structured_result(self) -> None:
         with TemporaryDirectory() as temp:
@@ -174,6 +228,39 @@ class ActionRuntimeTests(unittest.TestCase):
             worker.join(1)
             self.assertTrue(result_box)
             self.assertEqual(result_box[0].status, "cancelled")
+
+    def test_action_worker_capacity_fails_fast_when_exhausted(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "blocked.py"
+            path.write_text(
+                "import threading\n"
+                "gate = threading.Event()\n"
+                "entered = threading.Event()\n"
+                "def handler(parameters): entered.set(); gate.wait(5); return 'done'\n"
+                "TOOL = {'name': 'blocked', 'description': 'blocked', 'handler': handler, 'timeout_seconds': 2}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            record = registry.record("blocked")
+            original = action_loader._ACTION_WORKER_SLOTS
+            action_loader._ACTION_WORKER_SLOTS = threading.BoundedSemaphore(1)
+            results = []
+            worker = threading.Thread(
+                target=lambda: results.append(registry.execute("blocked", {}))
+            )
+            try:
+                worker.start()
+                self.assertTrue(record.handler.__globals__["entered"].wait(1))
+                started = time.monotonic()
+                busy = registry.execute("blocked", {})
+                self.assertEqual(busy.status, "busy")
+                self.assertLess(time.monotonic() - started, 0.2)
+            finally:
+                record.handler.__globals__["gate"].set()
+                worker.join(2)
+                action_loader._ACTION_WORKER_SLOTS = original
+            self.assertTrue(results)
+            self.assertEqual(results[0].status, "succeeded")
 
     def test_legacy_handler_gets_a_deadline(self) -> None:
         with TemporaryDirectory() as temp:

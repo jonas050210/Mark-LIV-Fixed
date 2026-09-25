@@ -31,7 +31,7 @@ MAX_PY = (3, 13)        # highest version this is actually tested on
 
 def _run(label: str, args: list[str]) -> None:
     print(f"\n▶ {label}")
-    subprocess.run(args, check=True)
+    subprocess.run(args, check=True, timeout=1800)
 
 
 def _check_python() -> None:

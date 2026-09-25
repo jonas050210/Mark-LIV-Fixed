@@ -1,22 +1,20 @@
 import json
-import os
 import platform
 import shutil
 import subprocess
 import sys
+import secrets
+import shlex
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
+
+from core.path_policy import atomic_create_text, resolve_user_path
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}
     if platform.system() == "Windows" else {}
 )
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
 
 def _get_os() -> str:
     _sys = platform.system()
@@ -28,19 +26,25 @@ def _get_os() -> str:
 
 
 def _scripts_dir() -> Path:
-    d = Path.home() / ".jarvis" / "reminders"
-    d.mkdir(parents=True, exist_ok=True)
+    d = resolve_user_path(
+        Path.home() / ".jarvis" / "reminders",
+        allow_missing=True,
+        allow_protected=True,
+        reject_symlinks=True,
+    )
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if d.is_symlink() or not d.is_dir():
+        raise OSError("The reminder storage path is not a safe directory.")
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
     return d
 
 
 def _sanitise(text: str, max_len: int = 200) -> str:
-    return (
-        text.replace("\\", "")
-            .replace('"', "")
-            .replace("'", "")
-            .replace("\n", " ")
-            .replace("\r", "")
-            .strip()
+    return " ".join(
+        "".join(char for char in str(text or "") if ord(char) >= 32 and char != "\x7f").split()
     )[:max_len]
 
 def _write_notify_script(task_name: str, message: str, os_name: str) -> Path:
@@ -70,7 +74,7 @@ if not notified:
 if not notified:
     try:
         import subprocess
-        subprocess.run(["msg", "*", "/TIME:30", message], check=False)
+        subprocess.run(["msg", "*", "/TIME:30", message], check=False, timeout=10)
     except Exception:
         pass
 
@@ -101,7 +105,7 @@ if not notified:
         script = 'display notification "{{}}" with title "J.A.R.V.I.S Reminder"'.format(
             message.replace('"', '')
         )
-        subprocess.run(["osascript", "-e", script], check=False)
+        subprocess.run(["osascript", "-e", script], check=False, timeout=10)
     except Exception:
         pass
 """
@@ -124,7 +128,7 @@ if not notified:
         subprocess.run(
             ["notify-send", "--urgency=normal", "--expire-time=15000",
              "J.A.R.V.I.S Reminder", message],
-            check=False
+            check=False, timeout=10
         )
     except Exception:
         pass
@@ -139,8 +143,7 @@ try:
 except Exception:
     pass
 """
-    script_path.write_text(script_body, encoding="utf-8")
-    script_path.chmod(0o600)   # owner read/write only
+    atomic_create_text(script_path, script_body)
     return script_path
 
 def _schedule_windows(target_dt: datetime, task_name: str,
@@ -151,6 +154,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         python_exe = pythonw
 
     xml_path = _scripts_dir() / f"{task_name}.xml"
+    command_xml = xml_escape(str(python_exe))
+    script_xml = xml_escape(str(script_path), {'"': "&quot;"})
     xml_content = (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
@@ -160,8 +165,8 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         '    <Enabled>true</Enabled>\n'
         '  </TimeTrigger></Triggers>\n'
         '  <Actions><Exec>\n'
-        f'    <Command>{python_exe}</Command>\n'
-        f'    <Arguments>"{script_path}"</Arguments>\n'
+        f'    <Command>{command_xml}</Command>\n'
+        f'    <Arguments>&quot;{script_xml}&quot;</Arguments>\n'
         '  </Exec></Actions>\n'
         '  <Settings>\n'
         '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
@@ -178,22 +183,22 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         '</Task>'
     )
 
-    xml_path.write_text(xml_content, encoding="utf-16")
-
-    result = subprocess.run(
-        ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
-        capture_output=True, text=True, **_CNW,
-    )
+    atomic_create_text(xml_path, xml_content, encoding="utf-16")
 
     try:
-        xml_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+        result = subprocess.run(
+            ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
+            capture_output=True, text=True, timeout=20, **_CNW,
+        )
+    finally:
+        try:
+            xml_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         script_path.unlink(missing_ok=True)
-        err = (result.stderr or result.stdout).strip()
-        print(f"[Reminder] ❌ schtasks: {err}")
+        print(f"[Reminder] ❌ schtasks failed with exit code {result.returncode}.")
         return ""  
 
     return task_name
@@ -201,11 +206,17 @@ def _schedule_windows(target_dt: datetime, task_name: str,
 
 def _schedule_mac(target_dt: datetime, task_name: str,
                   script_path: Path) -> str:
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
+    agents_dir = resolve_user_path(
+        Path.home() / "Library" / "LaunchAgents",
+        allow_missing=True,
+        reject_symlinks=True,
+    )
     agents_dir.mkdir(parents=True, exist_ok=True)
 
-    label     = f"com.jarvis.reminder.{task_name}"
+    label = f"com.jarvis.reminder.{task_name}"
     plist_path = agents_dir / f"{label}.plist"
+    executable_xml = xml_escape(str(sys.executable))
+    script_xml = xml_escape(str(script_path))
 
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -215,8 +226,8 @@ def _schedule_mac(target_dt: datetime, task_name: str,
   <key>Label</key>             <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{sys.executable}</string>
-    <string>{script_path}</string>
+    <string>{executable_xml}</string>
+    <string>{script_xml}</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -232,18 +243,17 @@ def _schedule_mac(target_dt: datetime, task_name: str,
 </dict>
 </plist>
 """
-    plist_path.write_text(plist_content, encoding="utf-8")
-    plist_path.chmod(0o644)
+    atomic_create_text(plist_path, plist_content)
 
     result = subprocess.run(
         ["launchctl", "load", str(plist_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=20,
     )
 
     if result.returncode != 0:
         plist_path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
-        print(f"[Reminder] ❌ launchctl: {result.stderr.strip()}")
+        print(f"[Reminder] ❌ launchctl failed with exit code {result.returncode}.")
         return ""
 
     return label
@@ -263,22 +273,22 @@ def _schedule_linux(target_dt: datetime, task_name: str,
                 "--",
                 sys.executable, str(script_path),
             ],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=20,
         )
         if result.returncode == 0:
             return task_name
-        print(f"[Reminder] ⚠️ systemd-run failed: {result.stderr.strip()}, trying 'at'")
+        print(f"[Reminder] ⚠️ systemd-run failed with exit code {result.returncode}; trying 'at'.")
 
     if shutil.which("at"):
         at_time = target_dt.strftime("%H:%M %Y-%m-%d")
-        cmd_str = f"{sys.executable} {script_path}\n"
-        result  = subprocess.run(
+        cmd_str = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}\n"
+        result = subprocess.run(
             ["at", at_time],
-            input=cmd_str, capture_output=True, text=True,
+            input=cmd_str, capture_output=True, text=True, timeout=20,
         )
         if result.returncode == 0:
             return task_name
-        print(f"[Reminder] ❌ at: {result.stderr.strip()}")
+        print(f"[Reminder] ❌ at failed with exit code {result.returncode}.")
         return ""
 
     print("[Reminder] ❌ Neither systemd-run nor at found on this Linux system.")
@@ -291,9 +301,13 @@ def reminder(
     session_memory=None,
 ) -> str:
 
-    date_str = parameters.get("date", "").strip()
-    time_str = parameters.get("time", "").strip()
-    message  = parameters.get("message", "Reminder").strip()
+    params = parameters if isinstance(parameters, dict) else {}
+    raw_date = params.get("date", "")
+    raw_time = params.get("time", "")
+    raw_message = params.get("message", "Reminder")
+    date_str = raw_date.strip()[:10] if isinstance(raw_date, str) else ""
+    time_str = raw_time.strip()[:5] if isinstance(raw_time, str) else ""
+    message = raw_message.strip()[:200] if isinstance(raw_message, str) else "Reminder"
 
     if not date_str or not time_str:
         return "I need both a date and a time to set a reminder."
@@ -308,12 +322,16 @@ def reminder(
 
     os_name    = _get_os()
     safe_msg   = _sanitise(message)
-    task_name  = f"JARVISReminder_{target_dt.strftime('%Y%m%d_%H%M%S')}"
+    task_name = (
+        f"JARVISReminder_{target_dt.strftime('%Y%m%d_%H%M%S')}_"
+        f"{secrets.token_hex(3)}"
+    )
 
     try:
         script_path = _write_notify_script(task_name, safe_msg, os_name)
     except Exception as e:
-        return f"Could not prepare the reminder script: {e}"
+        print(f"[Reminder] ❌ Script preparation failed ({type(e).__name__}).")
+        return "Could not prepare the reminder script."
 
     try:
         if os_name == "windows":
@@ -324,14 +342,14 @@ def reminder(
             job_id = _schedule_linux(target_dt, task_name, script_path)
     except Exception as e:
         script_path.unlink(missing_ok=True)
-        print(f"[Reminder] ❌ Scheduling exception: {e}")
+        print(f"[Reminder] ❌ Scheduling failed ({type(e).__name__}).")
         return "Something went wrong while scheduling the reminder."
 
     if not job_id:
         return "I couldn't register the reminder with the system scheduler."
 
     if player:
-        player.write_log(f"[Reminder] ✅ {date_str} {time_str} — {safe_msg[:40]}")
+        player.write_log(f"[Reminder] ✅ {date_str} {time_str}")
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
     return f"Reminder set for {friendly_time}."
@@ -346,14 +364,20 @@ TOOL = {
         "properties": {
             "date": {
                 "type": "STRING",
+                "minLength": 10,
+                "maxLength": 10,
                 "description": "Date in YYYY-MM-DD format"
             },
             "time": {
                 "type": "STRING",
+                "minLength": 5,
+                "maxLength": 5,
                 "description": "Time in HH:MM format (24h)"
             },
             "message": {
                 "type": "STRING",
+                "minLength": 1,
+                "maxLength": 200,
                 "description": "Reminder message text"
             }
         },

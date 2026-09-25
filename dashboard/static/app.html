@@ -247,13 +247,15 @@
       return fetch(url, opts);
     }
 
-    // ── AES-256-CBC encryption (CryptoJS) ────────────────────────────────────
+    // ── Encrypt-then-MAC command protection (CryptoJS) ───────────────────────
     const _AES_SALT = 'JARVIS-DASHBOARD-v1';
     let _aesKey = null;
+    let _macKey = null;
 
     function _initCrypto(key) {
       if (typeof CryptoJS === 'undefined') return false;
       _aesKey = CryptoJS.SHA256(key + _AES_SALT);
+      _macKey = CryptoJS.SHA256(key + _AES_SALT + '-MAC');
       return true;
     }
 
@@ -265,13 +267,9 @@
           CryptoJS.enc.Utf8.parse(plaintext), _aesKey,
           { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
         );
-        const ivHex = iv.toString(CryptoJS.enc.Hex);
-        const ctHex = enc.ciphertext.toString(CryptoJS.enc.Hex);
-        const hex   = ivHex + ctHex;
-        const bytes = new Uint8Array(hex.length / 2);
-        for (let i = 0; i < bytes.length; i++)
-          bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-        return btoa(String.fromCharCode(...bytes));
+        const signed = iv.clone().concat(enc.ciphertext);
+        const mac = CryptoJS.HmacSHA256(signed, _macKey);
+        return CryptoJS.enc.Base64.stringify(signed.clone().concat(mac));
       } catch { return null; }
     }
 
@@ -287,8 +285,8 @@
     const wake  = document.getElementById('wake');
 
     const _wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const _wsUrl   = `${_wsProto}://${location.host}/ws?token=${encodeURIComponent(_authToken)}`;
-    const ws       = new WebSocket(_wsUrl);
+    const _wsUrl   = `${_wsProto}://${location.host}/ws`;
+    const ws       = new WebSocket(_wsUrl, ['mark-auth', _authToken]);
 
     ws.onopen    = () => { sys('Remote session active.'); toast('Connected to JARVIS'); };
     ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
@@ -337,6 +335,24 @@
     }
 
     // ── File helpers ──────────────────────────────────────────────────────────
+    async function _downloadFile(name) {
+      try {
+        const response = await _authFetch(`/uploads/${encodeURIComponent(name)}`);
+        if (!response.ok) throw new Error('Download failed');
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = name;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (error) {
+        toast(error.message || 'Download failed');
+      }
+    }
+
     function _fileIcon(name) {
       const ext = (name.split('.').pop() || '').toLowerCase();
       if (['jpg','jpeg','png','gif','webp','heic','heif','avif','bmp','svg'].includes(ext)) return '🖼️';
@@ -400,12 +416,11 @@
         if (xhr.status === 200) {
           let savedName = file.name;
           try { savedName = JSON.parse(xhr.responseText).name || file.name; } catch {}
-          const dlUrl = `/uploads/${encodeURIComponent(savedName)}?token=${encodeURIComponent(_authToken)}`;
           if (bar)  { bar.style.width = '100%'; bar.style.background = 'var(--green)'; }
           if (st)   { st.textContent = '✓'; st.className = 'fc-status done'; }
           if (lbl)  lbl.textContent = 'Sent';
           if (meta) meta.insertAdjacentHTML('beforeend',
-            `<a class="fc-dl" href="${dlUrl}" download="${esc(savedName)}">⬇ Download back</a>`);
+            `<a class="fc-dl" href="#" data-name="${esc(savedName)}" onclick="_downloadFile(this.dataset.name);return false">⬇ Download back</a>`);
           toast('File sent!');
         } else {
           let errMsg = 'Upload failed';
@@ -430,7 +445,6 @@
 
     // File received by another WebSocket client (e.g., second open tab)
     function _onFileReceived(m) {
-      const dlUrl = `/uploads/${encodeURIComponent(m.name)}?token=${encodeURIComponent(_authToken)}`;
       const card  = document.createElement('div');
       card.className = 'msg-file';
       card.innerHTML = `
@@ -439,7 +453,7 @@
           <div class="fc-lbl">Received</div>
           <div class="fc-name">${esc(m.name)}</div>
           <div class="fc-size">${_fmtSize(m.size)}</div>
-          <a class="fc-dl" href="${dlUrl}" download="${esc(m.name)}">⬇ Download</a>
+          <a class="fc-dl" href="#" data-name="${esc(m.name)}" onclick="_downloadFile(this.dataset.name);return false">⬇ Download</a>
         </div>
         <div class="fc-status done">✓</div>
       `;
@@ -594,7 +608,7 @@
       const active = values.filter(x => !x.finished_at);
       document.getElementById('action-summary').textContent = active.length ? `(${active.length} active)` : '';
       box.innerHTML = values.map(x => {
-        const cancel = x.finished_at ? '' : `<button class="cancel-btn" onclick="cancelAction('${esc(x.action_id)}')">CANCEL</button>`;
+        const cancel = x.finished_at ? '' : `<button class="cancel-btn" data-action-id="${esc(x.action_id)}" onclick="cancelAction(this.dataset.actionId)">CANCEL</button>`;
         return `<div class="action-run"><div class="action-run-main"><b>${esc(x.action)}</b><small>${esc(x.message || x.status)}</small></div><progress max="100" value="${x.progress || 0}"></progress>${cancel}</div>`;
       }).join('') || 'No actions yet.';
     }
@@ -757,7 +771,7 @@
 
       const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(
-        `${wsProto}://${location.host}/ws/phone-audio?token=${encodeURIComponent(_authToken)}`
+        `${wsProto}://${location.host}/ws/phone-audio`, ['mark-auth', _authToken]
       );
       ws.binaryType = 'arraybuffer';
 

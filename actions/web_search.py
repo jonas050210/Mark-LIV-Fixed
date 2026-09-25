@@ -1,9 +1,6 @@
 #web_search.py
-import json
-import sys
 import threading
 import time
-from pathlib import Path
 
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
@@ -13,6 +10,7 @@ from pathlib import Path
 _QUOTA_COOLDOWN_SEC  = 900          # 15 minutes
 _quota_blocked_until = 0.0
 _quota_lock          = threading.Lock()
+_search_slots         = threading.BoundedSemaphore(4)
 
 
 def _gemini_available() -> bool:
@@ -43,18 +41,24 @@ def _log_gemini_failure(context: str, exc: Exception) -> None:
     """Log a Gemini failure — silently when it is just the expected cooldown."""
     if isinstance(exc, _QuotaCooldown):
         return          # announced once when the breaker tripped; not a warning
-    print(f"[WebSearch] \u26a0\ufe0f {context} failed ({exc}) — using DDG instead")
+    print(f"[WebSearch] ⚠️ {context} failed ({type(exc).__name__}) — using DDG instead")
 
 
 def _run_bounded(fn, timeout: float, label: str = "task"):
-    """Run fn() in a daemon thread; return its result, or None if it overruns."""
+    """Run fn in one of a bounded number of daemon fallback workers."""
     box = [None]
+    slots = _search_slots
+    if not slots.acquire(blocking=False):
+        print(f"[WebSearch] {label} skipped because search workers are busy")
+        return None
 
     def _run():
         try:
             box[0] = fn()
         except Exception as e:
             _log_gemini_failure(label, e)
+        finally:
+            slots.release()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -62,21 +66,6 @@ def _run_bounded(fn, timeout: float, label: str = "task"):
     if t.is_alive():
         print(f"[WebSearch] {label} exceeded {timeout:.0f}s — moving on")
     return box[0]
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
 
 def _gemini_search(query: str) -> str:
     if not _gemini_available():
@@ -104,7 +93,7 @@ def _gemini_search(query: str) -> str:
     text = text.strip()
     if not text:
         raise ValueError("Gemini returned an empty response.")
-    return text
+    return text[:100_000]
 
 
 def _get_ddgs():
@@ -139,7 +128,7 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
                     "url":     r.get("href",   ""),
                 })
     except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG text() failed: {e}")
+        print(f"[WebSearch] ⚠️ DDG text search failed ({type(e).__name__}).")
     return results
 
 
@@ -157,7 +146,7 @@ def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
                     "source":  r.get("source", ""),
                 })
     except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
+        print(f"[WebSearch] ⚠️ DDG news search failed ({type(e).__name__}); falling back to text search.")
     # Also covers the legacy-package case, where news() returns an empty list
     # instead of raising.
     if not results:
@@ -165,36 +154,53 @@ def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
     return results
 
 
-def _format_ddg(query: str, results: list[dict]) -> str:
-    if not results:
-        return f"No results found for: {query}"
+def _clean_result(value, maximum: int) -> str:
+    text = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in str(value or "")
+    )
+    return " ".join(text.split())[:maximum]
 
-    lines = [f"Search results for: {query}\n"]
-    for i, r in enumerate(results, 1):
-        if r.get("title"):   lines.append(f"{i}. {r['title']}")
-        if r.get("snippet"): lines.append(f"   {r['snippet']}")
-        if r.get("url"):     lines.append(f"   Source: {r['url']}")
+
+def _format_ddg(query: str, results: list[dict]) -> str:
+    clean_query = _clean_result(query, 500)
+    if not results:
+        return f"No results found for: {clean_query}"
+
+    lines = [f"Search results for: {clean_query}\n"]
+    for i, r in enumerate(results[:10], 1):
+        title = _clean_result(r.get("title"), 500)
+        snippet = _clean_result(r.get("snippet"), 1_500)
+        url = _clean_result(r.get("url"), 2_048)
+        if title: lines.append(f"{i}. {title}")
+        if snippet: lines.append(f"   {snippet}")
+        if url.startswith(("http://", "https://")):
+            lines.append(f"   Source: {url}")
         lines.append("")
-    return "\n".join(lines).strip()
+    return "\n".join(lines).strip()[:30_000]
 
 
 def _format_news(query: str, results: list[dict]) -> str:
+    clean_query = _clean_result(query, 500)
     if not results:
-        return f"No news found for: {query}"
+        return f"No news found for: {clean_query}"
 
-    lines = [f"Latest news: {query}\n"]
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
+    lines = [f"Latest news: {clean_query}\n"]
+    for i, r in enumerate(results[:10], 1):
+        title = _clean_result(r.get("title"), 500)
         if not title:
             continue
-        src = f"  [{r['source']}]" if r.get("source") else ""
+        source = _clean_result(r.get("source"), 100)
+        src = f"  [{source}]" if source else ""
         lines.append(f"{i}. {title}{src}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:140]}")
-        if r.get("url"):
-            lines.append(f"   {r['url']}")
+        snippet = _clean_result(r.get("snippet"), 140)
+        if snippet:
+            lines.append(f"   {snippet}")
+        url = _clean_result(r.get("url"), 2_048)
+        if url.startswith(("http://", "https://")):
+            lines.append(f"   {url}")
         lines.append("")
-    return "\n".join(lines).strip()
+    return "\n".join(lines).strip()[:30_000]
 
 
 # ── Briefing helper ────────────────────────────────────────────────────────────
@@ -222,8 +228,9 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
         if hasattr(part, "text") and part.text:
             raw += part.text
 
+    raw = raw.strip()[:100_000]
     headlines = []
-    for line in raw.strip().split("\n"):
+    for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -232,6 +239,7 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
             continue
         clean = re.sub(r'^[\d]+[.\)\-]\s*', '', line)
         clean = re.sub(r'^\*+\s*',          '', clean).strip()
+        clean = _clean_result(clean, 500)
         if clean and len(clean) > 10:
             headlines.append(clean)
 
@@ -246,7 +254,9 @@ def _search(query: str) -> str:
         return _gemini_search(query)
     except Exception as e:
         _log_gemini_failure("Gemini search", e)
-        results = _ddg_search(query)
+        results = _run_bounded(
+            lambda: _ddg_search(query), timeout=5.0, label="DDG search"
+        ) or []
         return _format_ddg(query, results)
 
 
@@ -297,7 +307,11 @@ def _research(query: str) -> str:
         return _gemini_search(research_query)
     except Exception as e:
         _log_gemini_failure("Gemini research", e)
-        results = _ddg_search(query, max_results=10)
+        results = _run_bounded(
+            lambda: _ddg_search(query, max_results=10),
+            timeout=5.0,
+            label="DDG research",
+        ) or []
         return _format_ddg(query, results)
 
 
@@ -308,7 +322,11 @@ def _price(query: str) -> str:
         return _gemini_search(price_query)
     except Exception as e:
         _log_gemini_failure("Gemini price", e)
-        results = _ddg_search(f"{query} price buy", max_results=6)
+        results = _run_bounded(
+            lambda: _ddg_search(f"{query} price buy", max_results=6),
+            timeout=5.0,
+            label="DDG price",
+        ) or []
         return _format_ddg(query, results)
 
 
@@ -325,19 +343,25 @@ def _compare(items: list[str], aspect: str) -> str:
     all_results: dict[str, list] = {}
     for item in items:
         try:
-            all_results[item] = _ddg_search(f"{item} {aspect}", max_results=3)
+            all_results[item] = _run_bounded(
+                lambda item=item: _ddg_search(f"{item} {aspect}", max_results=3),
+                timeout=5.0,
+                label="DDG comparison",
+            ) or []
         except Exception:
             all_results[item] = []
 
-    lines = [f"Comparison — {aspect.upper()}", "─" * 40]
+    lines = [f"Comparison — {_clean_result(aspect, 200).upper()}", "─" * 40]
     for item in items:
-        lines.append(f"\n▸ {item}")
+        lines.append(f"\n▸ {_clean_result(item, 200)}")
         for r in all_results.get(item, [])[:2]:
-            if r.get("snippet"):
-                lines.append(f"  • {r['snippet']}")
-            if r.get("url"):
-                lines.append(f"    {r['url']}")
-    return "\n".join(lines)
+            snippet = _clean_result(r.get("snippet"), 1_500)
+            if snippet:
+                lines.append(f"  • {snippet}")
+            url = _clean_result(r.get("url"), 2_048)
+            if url.startswith(("http://", "https://")):
+                lines.append(f"    {url}")
+    return "\n".join(lines)[:30_000]
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
@@ -348,11 +372,16 @@ def web_search(
     player=None,
     session_memory=None,
 ) -> str:
-    params = parameters or {}
-    query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
-    items  = params.get("items", [])
-    aspect = params.get("aspect", "general").strip() or "general"
+    params = parameters if isinstance(parameters, dict) else {}
+    raw_query = params.get("query", "")
+    raw_mode = params.get("mode", "search")
+    raw_items = params.get("items", [])
+    raw_aspect = params.get("aspect", "general")
+    query = raw_query[:500].strip() if isinstance(raw_query, str) else ""
+    mode = raw_mode[:16].lower().strip() if isinstance(raw_mode, str) else "search"
+    items = [str(item)[:200] for item in raw_items[:10]] if isinstance(raw_items, list) else []
+    aspect = raw_aspect[:200].strip() if isinstance(raw_aspect, str) else "general"
+    aspect = aspect or "general"
 
     if not query and not items:
         return "Please provide a search query."
@@ -361,9 +390,9 @@ def web_search(
         mode = "compare"
 
     if player:
-        player.write_log(f"[Search:{mode}] {query or ', '.join(items)}")
+        player.write_log(f"[Search:{mode}] request received")
 
-    print(f"[WebSearch] 🔍 mode={mode!r}  query={query!r}")
+    print(f"[WebSearch] 🔍 mode={mode!r}  query_length={len(query)}")
 
     try:
         if mode == "compare" and items:
@@ -377,8 +406,8 @@ def web_search(
         return _search(query)
 
     except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
-        return f"Search failed: {e}"
+        print(f"[WebSearch] ❌ All backends failed ({type(e).__name__}).")
+        return f"Search failed ({type(e).__name__})."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
@@ -390,27 +419,31 @@ TOOL = {
         "properties": {
             "query": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "Search query or topic"
             },
             "mode": {
                 "type": "STRING",
+                "enum": ["search", "news", "research", "price", "compare"],
+                "maxLength": 16,
                 "description": "search | news | research | price | compare"
             },
             "items": {
                 "type": "ARRAY",
+                "maxItems": 10,
                 "items": {
-                    "type": "STRING"
+                    "type": "STRING",
+                    "maxLength": 200
                 },
                 "description": "Items to compare (compare mode)"
             },
             "aspect": {
                 "type": "STRING",
+                "maxLength": 100,
                 "description": "Comparison aspect: price | specs | reviews | features"
             }
         },
-        "required": [
-            "query"
-        ]
+        "required": []
     },
     "handler": web_search,
 }
