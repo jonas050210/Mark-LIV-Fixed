@@ -332,6 +332,7 @@ COVERAGE_FLOORS = {
     "actions/layout_manager.py": 74,
     "actions/open_app.py": 60,
     "actions/reminder.py": 58,
+    "dashboard/server.py": 40,
 }
 
 

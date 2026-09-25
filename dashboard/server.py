@@ -78,6 +78,10 @@ DEVICE_TOKEN_TTL = 30 * 24 * 60 * 60
 MAX_REQUEST_BYTES = 2_000_000
 
 
+class _RegistryNotReady(RuntimeError):
+    """The assistant has not connected its action registry to the dashboard yet."""
+
+
 class _RequestBodyTooLarge(ValueError):
     pass
 
@@ -472,6 +476,20 @@ class DashboardServer:
             self._mac_cache[session_key] = _derive_mac_key(session_key)
         return self._mac_cache[session_key]
 
+    async def _close_other_sockets(self) -> None:
+        """Drop live websockets after a revocation.
+
+        A socket that was accepted with a token now revoked would otherwise
+        keep receiving broadcasts for as long as it stayed connected.
+        """
+        for socket in list(self._clients) + list(self._phone_clients):
+            try:
+                await socket.close(code=1008)
+            except Exception:
+                pass
+        self._clients.clear()
+        self._phone_clients.clear()
+
     def _issue_token(self, session_key: str) -> str:
         now = time.time()
         token = secrets.token_urlsafe(32)
@@ -487,6 +505,23 @@ class DashboardServer:
                 self._tokens.pop(oldest, None)
                 self._token_keys.pop(oldest, None)
         return token
+
+    def revoke_all_sessions(self, *, keep: str = "") -> dict[str, int]:
+        """Cut off every remote session, optionally sparing the caller's own.
+
+        Clearing the remembered devices is not enough on its own: a phone that
+        is already logged in holds a bearer token in memory, and that token
+        stays valid until it expires on its own. Someone revoking access after
+        losing a device would have been told the job was done while the lost
+        device still had a live session.
+        """
+        devices = len(self._device_sessions)
+        self._device_sessions.clear()
+        doomed = [token for token in self._tokens if token != keep]
+        for token in doomed:
+            self._tokens.pop(token, None)
+            self._token_keys.pop(token, None)
+        return {"devices": devices, "sessions": len(doomed)}
 
     def _valid_token(self, token: str) -> bool:
         if not isinstance(token, str) or not token or len(token) > 256:
@@ -602,7 +637,10 @@ class DashboardServer:
     # ── FastAPI app ───────────────────────────────────────────────────────
 
     def _build_app(self) -> "FastAPI":
-        app = FastAPI(docs_url=None, redoc_url=None)
+        # The interactive docs were already disabled; the schema they are generated
+        # from was not, so /openapi.json handed an unauthenticated caller on the
+        # network the full list of routes and their parameters.
+        app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
         @app.middleware("http")
         async def security_headers(req: Request, call_next):
@@ -641,8 +679,20 @@ class DashboardServer:
         def action_registry_run(name: str, parameters: dict) -> str:
             """Execute one registered action, or explain that none is wired up."""
             if self._action_callback is None:
-                raise RuntimeError("the action registry is not connected yet")
+                raise _RegistryNotReady("the action registry is not connected yet")
             return str(self._action_callback(name, parameters))
+
+        def _registry_unavailable() -> JSONResponse:
+            """The assistant is not running yet — that is not a server fault.
+
+            Answering 500 with a bare exception name told the user nothing and
+            implied a defect. The dashboard can be reached while MARK LIV is
+            still starting, and the honest answer is to say so.
+            """
+            return JSONResponse(
+                {"ok": False, "error": "MARK LIV is not ready yet. Try again in a moment."},
+                status_code=503,
+            )
 
         def _auth(req: Request) -> bool:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -829,12 +879,22 @@ class DashboardServer:
 
         @app.post("/api/revoke-devices")
         async def revoke_devices(req: Request):
-            """Invalidate all persistent device tokens (admin action)."""
+            """Sign out every remote device, including live sessions.
+
+            The session making the request keeps working; everything else —
+            remembered devices and any bearer token already handed out — stops
+            immediately.
+            """
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            count = len(self._device_sessions)
-            self._device_sessions.clear()
-            return JSONResponse({"ok": True, "revoked": count})
+            caller = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            removed = self.revoke_all_sessions(keep=caller)
+            self._spawn(self._close_other_sockets())
+            return JSONResponse({
+                "ok": True,
+                "revoked": removed["devices"],
+                "sessions_closed": removed["sessions"],
+            })
 
         @app.post("/api/command")
         async def command(req: Request):
@@ -1074,6 +1134,8 @@ class DashboardServer:
                 result = await asyncio.to_thread(
                     action_registry_run, "open_app", parameters
                 )
+            except _RegistryNotReady:
+                return _registry_unavailable()
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Launch failed: {type(exc).__name__}"},
                                     status_code=500)
@@ -1184,6 +1246,8 @@ class DashboardServer:
                 parameters["name"] = name
             try:
                 result = await asyncio.to_thread(action_registry_run, "layout_manager", parameters)
+            except _RegistryNotReady:
+                return _registry_unavailable()
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Layout command failed: {type(exc).__name__}"},
                                     status_code=500)
@@ -1242,6 +1306,8 @@ class DashboardServer:
                 result = await asyncio.to_thread(
                     action_registry_run, "media_control", parameters
                 )
+            except _RegistryNotReady:
+                return _registry_unavailable()
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Spotify command failed: {type(exc).__name__}"},
                                     status_code=500)
