@@ -90,7 +90,9 @@ def _advisory_lock(path: Path):
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
             os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            _acquire_windows_lock(
+                lambda: msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1), str(lock_path)
+            )
         else:
             import fcntl
 
@@ -110,6 +112,44 @@ def _advisory_lock(path: Path):
         except OSError:
             pass
         os.close(descriptor)
+
+
+LOCK_TIMEOUT_SECONDS = 60.0
+
+
+def _acquire_windows_lock(
+    try_lock,
+    description: str,
+    *,
+    timeout: float = LOCK_TIMEOUT_SECONDS,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> None:
+    """Take a Windows byte-range lock, waiting for it properly.
+
+    ``msvcrt.locking`` with ``LK_LOCK`` is not a blocking acquire: it retries
+    ten times at one-second intervals and then raises. Under real contention —
+    several threads updating the same store — a caller could therefore fail
+    after ten seconds, and in a background thread that exception is nobody's
+    to catch, so the write was simply lost. This retries until the timeout with
+    a short backoff and then fails with a message that says what happened.
+
+    The lock call is injected so the behaviour can be tested anywhere, not only
+    on Windows.
+    """
+    deadline = monotonic() + max(1.0, float(timeout))
+    delay = 0.005
+    while True:
+        try:
+            try_lock()
+            return
+        except OSError as exc:
+            if monotonic() >= deadline:
+                raise JsonStoreError(
+                    f"could not lock {description} within {timeout:.0f}s"
+                ) from exc
+            sleep(delay)
+            delay = min(delay * 2, 0.1)
 
 
 def _read_json(path: Path, max_bytes: int):

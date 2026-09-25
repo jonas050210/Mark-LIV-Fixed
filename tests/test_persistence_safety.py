@@ -362,3 +362,75 @@ class JsonStoreRecoveryTests(unittest.TestCase):
             self.skipTest("POSIX permission bits do not apply on Windows")
         mode = stat_module.S_IMODE(self.path.stat().st_mode)
         self.assertEqual(mode & 0o077, 0, oct(mode))
+
+
+class WindowsLockAcquisitionTests(unittest.TestCase):
+    """The Windows lock has to wait, not give up.
+
+    msvcrt.locking with LK_LOCK retries ten times at one-second intervals and
+    then raises, which is not the blocking acquire the store assumed. Under
+    contention a background thread could therefore fail after ten seconds, and
+    in a thread nobody is watching that means a write vanished without a word.
+    The retry is injected here so it can be exercised away from Windows.
+    """
+
+    def test_a_lock_that_is_free_is_taken_immediately(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        calls = []
+        _acquire_windows_lock(lambda: calls.append(1), "store.lock")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_busy_lock_is_retried_until_it_is_free(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        attempts = {"count": 0}
+
+        def try_lock():
+            attempts["count"] += 1
+            if attempts["count"] < 25:
+                raise OSError(13, "Permission denied")
+
+        slept = []
+        _acquire_windows_lock(
+            try_lock, "store.lock", sleep=slept.append, monotonic=lambda: 0.0
+        )
+        self.assertEqual(attempts["count"], 25)
+        self.assertEqual(len(slept), 24)
+
+    def test_the_backoff_is_bounded(self) -> None:
+        from core.json_store import _acquire_windows_lock
+
+        attempts = {"count": 0}
+
+        def try_lock():
+            attempts["count"] += 1
+            if attempts["count"] < 40:
+                raise OSError(13, "Permission denied")
+
+        slept = []
+        _acquire_windows_lock(
+            try_lock, "store.lock", sleep=slept.append, monotonic=lambda: 0.0
+        )
+        self.assertLessEqual(max(slept), 0.1)
+
+    def test_a_lock_that_never_frees_fails_with_an_explanation(self) -> None:
+        from core.json_store import JsonStoreError, _acquire_windows_lock
+
+        clock = {"now": 0.0}
+
+        def monotonic():
+            clock["now"] += 5.0
+            return clock["now"]
+
+        def try_lock():
+            raise OSError(13, "Permission denied")
+
+        with self.assertRaises(JsonStoreError) as caught:
+            _acquire_windows_lock(
+                try_lock, "config.json.lock", timeout=30,
+                sleep=lambda _seconds: None, monotonic=monotonic,
+            )
+        message = str(caught.exception)
+        self.assertIn("config.json.lock", message)
+        self.assertIn("30s", message)
