@@ -465,16 +465,22 @@ def _score_window(window: WindowInfo, target: str) -> tuple[int, WindowInfo]:
     return ((int(best * 60) if best >= 0.75 else 0), window)
 
 
-def find_windows(target: str) -> list[WindowInfo]:
-    """Return every visible window matching a named application or title."""
+def find_windows(target: str, *, min_score: int = 1) -> list[WindowInfo]:
+    """Return visible windows matching an app/title above a score threshold.
+
+    Interactive focus can accept fuzzy matches, while batch or destructive
+    callers pass ``min_score=80`` so a typo cannot close several unrelated
+    windows merely because their titles are vaguely similar.
+    """
     wanted = str(target or "").strip()
     if not wanted:
         return []
+    threshold = max(1, min(100, int(min_score)))
     scored = sorted(
         (_score_window(window, wanted) for window in list_windows()),
         key=lambda item: item[0], reverse=True,
     )
-    return [window for score, window in scored if score > 0]
+    return [window for score, window in scored if score >= threshold]
 
 
 def find_window(target: str = "") -> WindowInfo | None:

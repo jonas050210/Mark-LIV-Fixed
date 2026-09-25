@@ -265,7 +265,7 @@ def _shortcut_metadata(path: Path) -> tuple[str, str]:
         return "", ""
 
     arguments = ""
-    for attribute in ("arguments", "command_line_arguments", "command_line_args"):
+    for attribute in ("arguments", "_arguments", "command_line_arguments", "command_line_args"):
         value = str(getattr(link, attribute, "") or "").strip()
         if value:
             arguments = value

@@ -69,6 +69,18 @@ def _restart(name: str) -> str:
     if not windows and not entries:
         return f"I could not find an installed application called '{name}'."
 
+    if entries and entries[0].source == "webapp" and windows:
+        browser_processes = ("chrome", "msedge", "brave", "vivaldi", "opera")
+        if any(
+            any(name in str(window.process or "").casefold() for name in browser_processes)
+            for window in windows
+        ):
+            return (
+                f"I found the {name} web-app shortcut, but Windows exposes its window "
+                "as a browser process. I cannot safely distinguish that app window from "
+                "an ordinary browser tab, so I did not close either one."
+            )
+
     for window in windows:
         try:
             operate(window, "close")

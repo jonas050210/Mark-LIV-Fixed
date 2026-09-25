@@ -1,6 +1,8 @@
 """Named window and multi-monitor control for MARK LIV."""
 from __future__ import annotations
 
+import time
+
 from core.undo import push_undo
 from core.window_manager import (
     describe_monitors,
@@ -46,6 +48,21 @@ def _remember_window(window, label: str, state) -> None:
     push_undo(f"window layout of {label}", lambda: _restore_window_state(window, state))
 
 
+def _wait_for_closed(handles: set[int], timeout: float = 3.0) -> set[int]:
+    """Return handles still visible after a bounded graceful-close wait."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    remaining = set(handles)
+    while remaining and time.monotonic() < deadline:
+        try:
+            visible = {int(window.handle) for window in list_windows()}
+        except Exception:
+            break
+        remaining &= visible
+        if remaining:
+            time.sleep(0.1)
+    return remaining
+
+
 def window_manager(parameters: dict | None = None, player=None) -> str:
     p = parameters if isinstance(parameters, dict) else {}
     action = str(p.get("action") or "list_windows")[:32].strip().casefold().replace(" ", "_")
@@ -58,7 +75,7 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     if action in {"list_app_windows", "app_windows", "close_all", "minimize_all"}:
         if not target:
             return f"A target application is required for {action}."
-        matches = find_windows(target)
+        matches = find_windows(target, min_score=80)
         if not matches:
             return f"I could not find a visible window matching '{target}'."
         if action in {"list_app_windows", "app_windows"}:
@@ -68,17 +85,29 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
             ]
             return f"Windows matching '{target}':\n" + "\n".join(rows)
         operation = "close" if action == "close_all" else "minimize"
-        completed = 0
+        requested = []
         for item in matches:
             try:
                 operate(item, operation)
-                completed += 1
+                requested.append(item)
             except Exception:
                 continue
-        verb = "Closed" if operation == "close" else "Minimized"
-        return f"{verb} {completed} of {len(matches)} window(s) matching '{target}'."
+        if operation == "close":
+            remaining = _wait_for_closed({int(item.handle) for item in requested})
+            closed = len(requested) - len(remaining)
+            if remaining:
+                return (
+                    f"Closed {closed} of {len(matches)} window(s) matching '{target}'; "
+                    f"{len(remaining)} still open, possibly because the app is showing a save prompt."
+                )
+            return f"Closed {closed} of {len(matches)} window(s) matching '{target}'."
+        return f"Minimized {len(requested)} of {len(matches)} window(s) matching '{target}'."
 
-    window = find_window(target)
+    if action in {"close", "quit"} and target:
+        strict_matches = find_windows(target, min_score=80)
+        window = strict_matches[0] if strict_matches else None
+    else:
+        window = find_window(target)
     if window is None:
         return f"I could not find a visible window matching '{target or 'the active window'}'."
 
@@ -104,6 +133,11 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         # The application may still show its own native save prompt when it
         # genuinely owns unsaved work; MARK LIV does not add another prompt.
         operate(window, "close")
+        if _wait_for_closed({int(window.handle)}):
+            return (
+                f"I asked {_target_label(window)} to close, but its window is still open. "
+                "The application may be showing its own save prompt."
+            )
         return f"Closed {_target_label(window)}."
     if action in {"fullscreen", "full_screen", "full"}:
         monitor = monitor_for(p.get("monitor")) if p.get("monitor") else None

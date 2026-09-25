@@ -926,6 +926,8 @@ def open_explorer(
                 return explorer.format_matches(matches, name)
             else:
                 target = matches[0]
+    if not _is_safe_path(target):
+        return f"Access denied: {target}"
     try:
         return explorer.open_in_explorer(target, select=select)
     except FileNotFoundError:
@@ -968,6 +970,8 @@ def open_with_application(
                 return explorer.format_matches(matches, name)
             else:
                 target = matches[0]
+    if not _is_safe_path(target):
+        return f"Access denied: {target}"
     if not target.exists() or not target.is_file():
         return f"I could not find a file to open at {target}."
     from actions.open_app import open_app
