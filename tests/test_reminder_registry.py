@@ -151,3 +151,85 @@ class ScheduledJobCancellationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReminderUndoTests(unittest.TestCase):
+    """Cancelling a reminder must be reversible.
+
+    Cancellation deletes the scheduler job and the registry entry together, so
+    without an undo entry "no, not that one" means dictating the date, the time
+    and the message again. Re-scheduling is the exact inverse, which is what
+    makes it an honest undo rather than an approximation.
+    """
+
+    def setUp(self) -> None:
+        from core import undo
+
+        self.undo = undo
+        undo.clear()
+        self.directory = tempfile.TemporaryDirectory()
+        self.previous = reminder_module.REMINDER_FILE
+        reminder_module.REMINDER_FILE = Path(self.directory.name) / "reminders.json"
+        self.script = Path(self.directory.name) / "notify.py"
+        self.script.write_text("# notify", encoding="utf-8")
+        self.when = datetime.now() + timedelta(days=1)
+
+    def tearDown(self) -> None:
+        reminder_module.REMINDER_FILE = self.previous
+        self.undo.clear()
+        self.directory.cleanup()
+
+    def _set(self, message: str = "dentist") -> str:
+        with patch.object(reminder_module, "_get_os", return_value="linux"), \
+             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_linux", return_value=("77", "systemd")):
+            return reminder_module.reminder({
+                "action": "set",
+                "date": self.when.strftime("%Y-%m-%d"),
+                "time": self.when.strftime("%H:%M"),
+                "message": message,
+            })
+
+    def test_a_cancelled_reminder_can_be_restored(self) -> None:
+        self._set()
+        with patch.object(reminder_module, "_run", return_value=(True, "")):
+            reminder_module.reminder({"action": "cancel", "index": 1})
+        self.assertIn("no reminders", reminder_module.reminder({"action": "list"}))
+
+        with patch.object(reminder_module, "_get_os", return_value="linux"), \
+             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_linux", return_value=("78", "systemd")):
+            message = self.undo.undo_last()
+        self.assertIn("Restored", message)
+        self.assertIn("dentist", reminder_module.reminder({"action": "list"}))
+
+    def test_a_newly_set_reminder_can_be_taken_back(self) -> None:
+        self._set("gym")
+        with patch.object(reminder_module, "_run", return_value=(True, "")):
+            message = self.undo.undo_last()
+        self.assertIn("Removed the reminder", message)
+        self.assertIn("no reminders", reminder_module.reminder({"action": "list"}))
+
+    def test_taking_back_a_reminder_the_scheduler_will_not_drop_is_reported(self) -> None:
+        self._set("gym")
+        with patch.object(reminder_module, "_run", return_value=(False, "unit not found")):
+            message = self.undo.undo_last()
+        self.assertIn("could not remove", message.lower())
+        self.assertIn("gym", reminder_module.reminder({"action": "list"}))
+
+    def test_a_reminder_whose_time_has_passed_is_not_restored(self) -> None:
+        past = datetime.now() - timedelta(hours=2)
+        result = reminder_module._restore_reminder({"message": "old"}, past)
+        self.assertIn("already passed", result)
+
+    def test_a_failed_schedule_registers_no_undo(self) -> None:
+        with patch.object(reminder_module, "_get_os", return_value="linux"), \
+             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_linux", return_value=("", "")):
+            reminder_module.reminder({
+                "action": "set",
+                "date": self.when.strftime("%Y-%m-%d"),
+                "time": self.when.strftime("%H:%M"),
+                "message": "ghost",
+            })
+        self.assertFalse(self.undo.can_undo())

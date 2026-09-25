@@ -11,6 +11,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
 from core.json_store import JsonStore, JsonStoreCorruptError
+from core.undo import push_undo
 from core.path_policy import atomic_create_text, resolve_user_path
 
 _CNW: dict = (
@@ -541,7 +542,45 @@ def _cancel_reminder(params: dict) -> str:
     _write_registry([item for item in pending if item.get("id") != target.get("id")])
     when = _parse_when(target.get("when", ""))
     stamp = when.strftime("%B %d at %H:%M") if when else target.get("when", "")
+
+    # Cancelling is otherwise unrecoverable: the scheduler job is gone and the
+    # registry entry with it, so "no, not that one" would mean dictating the
+    # date, time and text again. Re-scheduling is the exact inverse.
+    if when is not None:
+        push_undo(
+            f"cancelled reminder '{target.get('message', '')}'",
+            lambda item=dict(target), moment=when: _restore_reminder(item, moment),
+        )
     return f"Cancelled the reminder for {stamp} — {target.get('message', 'Reminder')}."
+
+
+def _undo_set(task_name: str) -> str:
+    """Take back a reminder that was just scheduled."""
+    for item in _read_registry():
+        if item.get("id") == task_name:
+            removed, detail = _cancel_job(item)
+            if not removed:
+                return f"I could not remove that reminder again ({detail})."
+            _delete_script(item.get("script", ""))
+            _write_registry([
+                other for other in _read_registry() if other.get("id") != task_name
+            ])
+            return "Removed the reminder again."
+    return "That reminder is no longer scheduled."
+
+
+def _restore_reminder(item: dict, when: datetime) -> str:
+    """Put a cancelled reminder back, if its time has not already passed."""
+    if when <= datetime.now():
+        return "That reminder's time has already passed, so I cannot restore it."
+    result = _set_reminder({
+        "date": when.strftime("%Y-%m-%d"),
+        "time": when.strftime("%H:%M"),
+        "message": item.get("message", "Reminder"),
+    })
+    if result.startswith("Reminder set"):
+        return f"Restored the reminder for {when.strftime('%B %d at %H:%M')}."
+    return f"I could not restore that reminder: {result}"
 
 
 def _set_reminder(params: dict, player=None) -> str:
@@ -606,6 +645,11 @@ def _set_reminder(params: dict, player=None) -> str:
 
     if player:
         player.write_log(f"[Reminder] ✅ {date_str} {time_str}")
+
+    push_undo(
+        f"reminder for {target_dt.strftime('%Y-%m-%d %H:%M')}",
+        lambda task=task_name: _undo_set(task),
+    )
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
     if backend == "at" and not handle:

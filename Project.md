@@ -292,6 +292,11 @@ nothing more.
 - A cancellation the scheduler refuses is reported as a failure, because the
   job is still registered and will still fire. Nothing is removed from the
   registry in that case.
+- Both `set` and `cancel` are undoable. Cancelling otherwise destroys the
+  scheduler job and the registry entry together, so "no, not that one" would
+  mean dictating the date, the time and the message again; the undo
+  re-schedules exactly what was removed, and refuses when that time has since
+  passed.
 - `at` is the one backend that can schedule a job it cannot describe: if it
   prints no job number, the reminder is still set, and the answer says plainly
   that it will not be cancellable.
@@ -334,6 +339,24 @@ every tick, and one failing job cannot stop the others.
 Reminders stay outside this loop on purpose: they are registered with the
 operating system's scheduler so that they fire while MARK LIV is closed, which
 no in-process loop can do.
+
+### Dashboard authentication
+
+Every route under `/api` and `/uploads` requires a bearer token; a test walks
+the route table and fails if a new endpoint appears without one. The generated
+OpenAPI schema is disabled along with the interactive docs, so an
+unauthenticated caller on the network cannot read the list of routes.
+
+`POST /api/revoke-devices` ends **every** session, not just the remembered
+devices: a phone that is already signed in holds its bearer token in memory,
+and clearing only the device records left that token working while telling the
+user access had been revoked. The session issuing the request keeps working,
+open websockets are closed, and both counts are reported.
+
+A request that arrives before the assistant has connected its action registry
+answers `503` with "MARK LIV is not ready yet" rather than `500` with an
+exception name: the dashboard is reachable during start-up, and that is not a
+fault.
 
 ### Two browsers, one page
 
