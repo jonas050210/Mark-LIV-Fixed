@@ -23,9 +23,11 @@ import time
 from pathlib import Path
 
 from core.action_runtime import runtime as action_runtime
+from core import app_index
 from core import undo as undo_stack
 from core import confirm as confirm_gate
 from core import explorer as explorer_core
+from actions import media_control as media_control_core
 from core.path_policy import (
     PathPolicyError,
     atomic_write_bytes,
@@ -58,6 +60,17 @@ MAX_UPLOAD_MB = 100
 LOGIN_ATTEMPT_WINDOW = 300.0
 MAX_LOGIN_ATTEMPTS = 10
 AUTH_TOKEN_TTL = 12 * 60 * 60
+# Window states and Spotify verbs the panels may request. Anything outside these
+# sets is rejected before it reaches an action, so the browser cannot widen the
+# action surface beyond what the voice layer already exposes.
+_APP_LAUNCH_STATES = frozenset({
+    "normal", "maximized", "fullscreen", "minimized",
+    "left", "right", "top", "bottom",
+})
+_SPOTIFY_PANEL_ACTIONS = frozenset({
+    "status", "devices", "play", "pause", "next", "previous",
+    "shuffle", "repeat", "seek", "volume", "search", "queue",
+})
 DEVICE_TOKEN_TTL = 30 * 24 * 60 * 60
 MAX_REQUEST_BYTES = 2_000_000
 
@@ -369,6 +382,7 @@ class DashboardServer:
         self._connect_callback            = None
         self._capabilities_callback       = None
         self._desktop_callback            = None
+        self._action_callback             = None
         self._pending_keys: dict[str, float] = {}
         self._login_attempts: dict[str, list[float]] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
@@ -513,6 +527,10 @@ class DashboardServer:
         """Provide the same action registry used by voice commands."""
         self._capabilities_callback = fn
 
+    def set_action_callback(self, fn) -> None:
+        """Route panel buttons through the same action registry as voice commands."""
+        self._action_callback = fn
+
     def set_desktop_callback(self, fn) -> None:
         """Provide a live window/monitor snapshot for the admin panel."""
         self._desktop_callback = fn
@@ -616,6 +634,12 @@ class DashboardServer:
                 "base-uri 'none'; frame-ancestors 'none'"
             )
             return response
+
+        def action_registry_run(name: str, parameters: dict) -> str:
+            """Execute one registered action, or explain that none is wired up."""
+            if self._action_callback is None:
+                raise RuntimeError("the action registry is not connected yet")
+            return str(self._action_callback(name, parameters))
 
         def _auth(req: Request) -> bool:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -948,6 +972,154 @@ class DashboardServer:
                 return JSONResponse({"ok": True, "path": str(target), "select": select, "message": message})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Could not open Explorer: {type(exc).__name__}"}, status_code=500)
+
+        @app.get("/api/apps")
+        async def app_list(req: Request, query: str = "", refresh: str = "", limit: int = 40):
+            """List indexed installed applications, or rank them against a query.
+
+            Read-only: building the index only reads registry keys, shortcut
+            folders, and desktop entries. Nothing is launched here.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            query = str(query or "").strip()[:160]
+            want_refresh = str(refresh or "").strip().casefold() in {"1", "true", "yes"}
+            try:
+                entries = await asyncio.to_thread(app_index.load_index, refresh=want_refresh)
+                if query:
+                    entries = await asyncio.to_thread(
+                        app_index.resolve, query, limit=max(1, min(int(limit), 50)), entries=entries
+                    )
+                rows = [
+                    {"name": entry.name, "kind": entry.kind, "source": entry.source}
+                    for entry in entries[: max(1, min(int(limit), 200))]
+                ]
+                return JSONResponse({"ok": True, "query": query, "count": len(rows), "apps": rows})
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "Invalid parameters."}, status_code=400)
+            except Exception as exc:
+                return JSONResponse(
+                    {"ok": False, "error": f"Application index failed: {type(exc).__name__}"},
+                    status_code=500,
+                )
+
+        @app.post("/api/apps/launch")
+        async def app_launch(req: Request):
+            """Launch an indexed application through the normal action pipeline.
+
+            The panel sends a name, never a path or command line, so the
+            dashboard cannot be used to execute arbitrary binaries.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            if not name or len(name) > 160 or any(ord(char) < 32 for char in name):
+                return JSONResponse({"ok": False, "error": "A valid application name is required."},
+                                    status_code=400)
+
+            parameters: dict = {"app_name": name}
+            foreground = body.get("foreground", True)
+            if not isinstance(foreground, bool):
+                return JSONResponse({"ok": False, "error": "foreground must be true or false."},
+                                    status_code=400)
+            parameters["foreground"] = foreground
+
+            monitor = body.get("monitor")
+            if monitor not in (None, ""):
+                try:
+                    monitor_index = int(monitor)
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": "monitor must be a number."},
+                                        status_code=400)
+                if not 1 <= monitor_index <= 32:
+                    return JSONResponse({"ok": False, "error": "monitor must be between 1 and 32."},
+                                        status_code=400)
+                parameters["monitor"] = monitor_index
+
+            state = body.get("state")
+            if state not in (None, ""):
+                state = str(state).casefold().strip()[:16]
+                if state not in _APP_LAUNCH_STATES:
+                    return JSONResponse({"ok": False, "error": "Unsupported window state."},
+                                        status_code=400)
+                parameters["state"] = state
+
+            try:
+                result = await asyncio.to_thread(
+                    action_registry_run, "open_app", parameters
+                )
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Launch failed: {type(exc).__name__}"},
+                                    status_code=500)
+            await self.broadcast({"type": "sys", "text": result})
+            return JSONResponse({"ok": True, "result": result})
+
+        @app.get("/api/spotify")
+        async def spotify_status(req: Request):
+            """Current Spotify playback state for the media panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                snapshot = await asyncio.to_thread(media_control_core.playback_snapshot)
+                return JSONResponse({"ok": True, **snapshot})
+            except Exception as exc:
+                return JSONResponse(
+                    {"ok": False, "error": f"Spotify status failed: {type(exc).__name__}"},
+                    status_code=500,
+                )
+
+        @app.post("/api/spotify")
+        async def spotify_command(req: Request):
+            """Run one Spotify transport command from the media panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+
+            action = body.get("action")
+            action = action.strip().casefold() if isinstance(action, str) else ""
+            if action not in _SPOTIFY_PANEL_ACTIONS:
+                return JSONResponse({"ok": False, "error": "Unsupported Spotify action."},
+                                    status_code=400)
+
+            parameters: dict = {"action": action}
+            for key in ("query", "uri", "device", "mode"):
+                value = body.get(key)
+                if isinstance(value, str) and value.strip():
+                    parameters[key] = value.strip()[:500]
+            value = body.get("value")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if not 0 <= float(value) <= 86_400:
+                    return JSONResponse({"ok": False, "error": "value is out of range."},
+                                        status_code=400)
+                parameters["value"] = value
+            if isinstance(body.get("enabled"), bool):
+                parameters["enabled"] = body["enabled"]
+
+            try:
+                result = await asyncio.to_thread(
+                    action_registry_run, "media_control", parameters
+                )
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Spotify command failed: {type(exc).__name__}"},
+                                    status_code=500)
+            return JSONResponse({"ok": True, "result": result})
 
         @app.get("/api/actions")
         async def action_runs(req: Request):

@@ -104,16 +104,86 @@ def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
     return f"Clicked at current position [{button}]"
 
 
+# Key combinations that act on "whatever currently has focus" rather than on a
+# named target.  The model reaches for these when asked to close or switch an
+# application, which closes the wrong window whenever focus is not where it
+# assumed.  window_manager addresses a window by handle, so it cannot miss.
+_BLOCKED_COMBOS: dict[frozenset[str], str] = {
+    frozenset({"alt", "f4"}): "close a specific window",
+    frozenset({"command", "q"}): "quit a specific application",
+    frozenset({"command", "w"}): "close a specific window",
+    frozenset({"ctrl", "w"}): "close a specific window",
+    frozenset({"ctrl", "shift", "w"}): "close a specific window",
+    frozenset({"alt", "tab"}): "switch to a named window",
+    frozenset({"command", "tab"}): "switch to a named window",
+    frozenset({"ctrl", "alt", "delete"}): "reach the Windows security screen",
+    frozenset({"win", "d"}): "minimise windows",
+    frozenset({"win", "m"}): "minimise windows",
+    frozenset({"win", "l"}): "lock the workstation",
+}
+_BLOCKED_SINGLE_KEYS = {
+    "win": "open the Start menu",
+    "winleft": "open the Start menu",
+    "winright": "open the Start menu",
+    "command": "open Spotlight",
+    "super": "open the application launcher",
+}
+_KEY_ALIASES = {
+    "windows": "win", "winleft": "win", "winright": "win", "super": "win",
+    "cmd": "command", "meta": "command", "control": "ctrl", "del": "delete",
+    "escape": "esc", "return": "enter",
+}
+
+
+def _canonical_keys(keys) -> list[str]:
+    canonical = []
+    for key in keys:
+        name = str(key or "").strip().casefold()
+        if not name:
+            continue
+        canonical.append(_KEY_ALIASES.get(name, name))
+    return canonical
+
+
+def _guard_hotkey(keys: list[str]) -> str:
+    """Refuse focus-dependent combinations and name the safe alternative."""
+    if not keys:
+        return ""
+    combo = frozenset(keys)
+    intent = _BLOCKED_COMBOS.get(combo)
+    if intent is None and len(keys) == 1:
+        intent = _BLOCKED_SINGLE_KEYS.get(keys[0])
+    if intent is None:
+        return ""
+    return (
+        f"Refused '{'+'.join(keys)}': that combination acts on whichever window "
+        f"currently has focus, so it can hit the wrong application. "
+        f"Use window_manager to {intent} by name, or open_app to launch one."
+    )
+
+
 def _hotkey(*keys) -> str:
+    canonical = _canonical_keys(keys)
+    if not canonical:
+        return "No keys were supplied for the hotkey."
+    refusal = _guard_hotkey(canonical)
+    if refusal:
+        return refusal
     _require_pyautogui()
-    pyautogui.hotkey(*keys)
-    return f"Hotkey: {'+'.join(keys)}"
+    pyautogui.hotkey(*canonical)
+    return f"Hotkey: {'+'.join(canonical)}"
 
 
 def _press(key: str) -> str:
+    canonical = _canonical_keys([key])
+    if not canonical:
+        return "No key was supplied."
+    refusal = _guard_hotkey(canonical)
+    if refusal:
+        return refusal
     _require_pyautogui()
-    pyautogui.press(key)
-    return f"Pressed: {key}"
+    pyautogui.press(canonical[0])
+    return f"Pressed: {canonical[0]}"
 
 
 def _scroll(direction: str = "down", amount: int = 3) -> str:
@@ -395,7 +465,7 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": "Direct computer control inside the window that already has focus: type, click, in-app hotkeys, scroll, move mouse, screenshots, find elements on screen. Do NOT use this to open, close, minimise, maximise, or switch applications: alt+f4, command+q, ctrl+w, alt+tab and the Windows/Command key are refused because they hit whichever window happens to have focus. Use window_manager for window operations and open_app to launch applications.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -429,7 +499,7 @@ TOOL = {
             "keys": {
                 "type": "STRING",
                 "maxLength": 100,
-                "description": "Key combination e.g. 'ctrl+c'"
+                "description": "In-application key combination, e.g. 'ctrl+c' or 'ctrl+s'. Window and application management (closing, switching, launching) is refused here; use window_manager or open_app instead."
             },
             "key": {
                 "type": "STRING",

@@ -464,6 +464,58 @@ def operate(window: WindowInfo, operation: str, *args) -> None:
         raise ValueError(f"unsupported window operation: {operation}")
 
 
+def foreground_window() -> WindowInfo | None:
+    """The window that currently owns input focus, when the platform reports it."""
+    if _OS != "Windows":
+        return None
+    try:
+        handle = int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return None
+    if not handle:
+        return None
+    for window in list_windows():
+        if window.handle == handle:
+            return window
+    return None
+
+
+def restore_foreground(window: WindowInfo | None) -> bool:
+    """Give focus back to a window that was in front before a launch."""
+    if window is None:
+        return False
+    try:
+        operate(window, "focus")
+        return True
+    except Exception:
+        return False
+
+
+def _descendant_pids(pid: int) -> set[int]:
+    pids = {int(pid)}
+    try:
+        import psutil
+
+        for child in psutil.Process(pid).children(recursive=True):
+            pids.add(int(child.pid))
+    except Exception:
+        pass
+    return pids
+
+
+def windows_for_pid(pid: int | None) -> list[WindowInfo]:
+    """Visible windows owned by a process or any of its children.
+
+    Many launchers (Chrome, Steam, Electron apps) hand off to a second process,
+    so the window that appears frequently belongs to a child rather than to the
+    pid returned by the spawn itself.
+    """
+    if not pid:
+        return []
+    wanted = _descendant_pids(int(pid))
+    return [window for window in list_windows() if int(window.pid or 0) in wanted]
+
+
 def monitor_for(index: int | str | None) -> MonitorInfo:
     monitors = list_monitors()
     try:
@@ -528,3 +580,87 @@ def snap_window(window: WindowInfo, monitor: MonitorInfo, side: str) -> None:
     operate(window, "restore")
     operate(window, "move", *rect)
     operate(window, "focus")
+
+
+PLACEMENT_STATES = (
+    "normal", "maximized", "fullscreen", "minimized",
+    "left", "right", "top", "bottom",
+)
+
+
+def window_on_monitor(window: WindowInfo, monitor: MonitorInfo) -> bool:
+    """True when the window's centre point lies inside the monitor's bounds."""
+    center_x = (int(window.left) + int(window.right)) // 2
+    center_y = (int(window.top) + int(window.bottom)) // 2
+    return (
+        monitor.left <= center_x < monitor.right and
+        monitor.top <= center_y < monitor.bottom
+    )
+
+
+def monitor_of(window: WindowInfo) -> MonitorInfo | None:
+    for monitor in list_monitors():
+        if window_on_monitor(window, monitor):
+            return monitor
+    return None
+
+
+def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
+                 state: str = "normal", *, focus: bool = True) -> WindowInfo:
+    """Move a window to a monitor and apply a window state, then re-read it.
+
+    The returned WindowInfo is a fresh reading rather than the caller's stale
+    one, so the result can be verified instead of assumed.
+    """
+    state = str(state or "normal").casefold().strip()
+    if state in {"full", "full_screen", "full screen"}:
+        state = "fullscreen"
+    if state in {"maximize", "maximised"}:
+        state = "maximized"
+    if state in {"minimize", "minimised"}:
+        state = "minimized"
+    if state not in PLACEMENT_STATES:
+        raise ValueError(f"state must be one of: {', '.join(PLACEMENT_STATES)}")
+
+    if state == "minimized":
+        operate(window, "minimize")
+        return refresh_window(window) or window
+
+    if monitor is not None:
+        # Maximised or snapped windows ignore MoveWindow, so restore first.
+        operate(window, "restore")
+        if state == "fullscreen":
+            operate(window, "move", monitor.left, monitor.top, monitor.width, monitor.height)
+        elif state in {"left", "right", "top", "bottom"}:
+            snap_window(window, monitor, state)
+        else:
+            move_to_monitor(window, monitor)
+            if state == "maximized":
+                operate(window, "maximize")
+    else:
+        if state == "maximized":
+            operate(window, "maximize")
+        elif state == "fullscreen":
+            target = monitor_of(window) or list_monitors()[0]
+            operate(window, "restore")
+            operate(window, "move", target.left, target.top, target.width, target.height)
+        elif state in {"left", "right", "top", "bottom"}:
+            target = monitor_of(window) or list_monitors()[0]
+            snap_window(window, target, state)
+        else:
+            operate(window, "restore")
+
+    if focus:
+        try:
+            operate(window, "focus")
+        except Exception:
+            pass
+    return refresh_window(window) or window
+
+
+def refresh_window(window: WindowInfo) -> WindowInfo | None:
+    """Re-read a window by handle so callers can verify a placement."""
+    for candidate in list_windows():
+        if candidate.handle == window.handle:
+            return candidate
+    return None

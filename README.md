@@ -42,6 +42,34 @@ The restart command saves the current session, stops audio/wake-word workers, la
 
 The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It is the primary control surface rather than a hotkey collection: press **Ctrl/Cmd-K** for the command palette, use quick cards for windows, monitors, audio, Explorer, Task Manager, and relaunch, and use the per-window FOCUS/MIN/MAX/CLOSE controls. The FILE EXPLORER panel searches Home, Desktop, Downloads, Documents, or Pictures and offers separate OPEN and SELECT actions for each verified result. It shows live action IDs, progress, cancellation, confirmations, named-window occupancy, monitor tiles, audio health, and undo history. It is a control surface, not an unrestricted way around Windows security.
 
+MARK LIV launches applications from a real index of what is installed on the
+machine — Windows `App Paths` registry entries, Start-menu shortcuts and
+`shell:AppsFolder` package ids, macOS application bundles, and Linux desktop
+entries. It never presses the Windows key and types a name into the Start menu,
+so a launch cannot land in a search box, and it reports honestly when an
+application is not installed or when no window appeared instead of claiming
+success. Say `rescan my apps` after installing something new.
+
+Placement is part of the same request:
+
+- `Open Chrome on monitor 2 in fullscreen`
+- `Open Spotify in the background` (focus stays where it is)
+- `Open Discord snapped left on monitor 1`
+
+Closing, minimising and switching are always done by window handle. Focus-
+dependent key combinations — `alt+f4`, `command+q`, `ctrl+w`, `alt+tab`, and the
+bare Windows/Command key — are refused by `computer_control` and redirected to
+`window_manager`, because they act on whichever window happens to have focus and
+can close the wrong program.
+
+Spotify is controlled through the Spotify Web API rather than its window: play,
+pause, skip, search, queue, shuffle, repeat, seek, volume, and device selection.
+When no Spotify Connect device is active, plain transport commands fall back to
+the operating system's media keys. The dashboard's **SPOTIFY** panel shows the
+current track, artwork, a seek bar, and those controls; the **APP LAUNCHER**
+panel searches the same application index and opens an app on a chosen monitor
+and state.
+
 Application and Explorer control are deliberately conservative. `open Chrome` or `open Roblox` focuses an existing window instead of silently creating another one. A second Roblox client is only attempted for an explicit request such as `open another Roblox`; MARK LIV verifies the new window and moves it to the opposite monitor when a second display is available, otherwise it reports the limitation. File searches resolve Windows known folders, search the user's home folder by default, use Everything when installed, and show numbered candidates when more than one file matches. `open` and `select` only act on a unique exact or search result, so MARK LIV does not guess between similarly named files.
 
 Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.

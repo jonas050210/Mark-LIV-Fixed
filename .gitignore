@@ -5,25 +5,43 @@
 # never be.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/spotify_token.json     # Spotify OAuth access/refresh token
-config/shortcuts.json         # personal application and URL aliases
-config/*.json.*               # private-store backups, locks, quarantine, and temp files
-config/.*.json.*              # hidden private-store sidecars
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# git does NOT support trailing comments on a pattern line: everything after the
+# pattern, including the '#', is treated as part of the filename to match. Each
+# note therefore has to live on its own line above its pattern.
+
+# your Gemini API key, plus per-plugin credentials
+config/api_keys.json
+# Spotify OAuth access/refresh token
+config/spotify_token.json
+# personal application and URL aliases
+config/shortcuts.json
+# the local index of every application installed on this machine
+config/app_index.json
+# private-store backups, locks, quarantine, and temp files
+config/*.json.*
+# hidden private-store sidecars
+config/.*.json.*
+# the dashboard's TLS private key and certificate
+config/certs/
+# a LINKED WhatsApp session — committing it hands somebody your WhatsApp
+# account, not just a key
+config/whatsapp_web/
+# Google OAuth tokens (Gmail / Calendar plugins)
+**/token*.json
+# Google OAuth client secrets
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
-memory/sessions.json          # explicitly saved private conversation snapshots
-memory/*.json.*               # private-store backups, locks, quarantine, and temp files
-memory/.*.json.*              # hidden private-store sidecars
+# explicitly saved private conversation snapshots
+memory/sessions.json
+# private-store backups, locks, quarantine, and temp files
+memory/*.json.*
+# hidden private-store sidecars
+memory/.*.json.*
 memory/*.db
 
 # ── Python build noise ────────────────────────────────────────────────────────

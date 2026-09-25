@@ -189,6 +189,68 @@ Action and plugin discovery validates schemas, source locations, file types, per
 
 ---
 
+## 4.8 Application index and launch safety
+
+`core/app_index.py` holds the list of applications installed on the machine and
+is the only component allowed to start one. It exists because the previous
+launcher fell back to pressing the Windows key, typing the application name into
+the Start menu, pressing Enter, and then returning `True` unconditionally. That
+fallback sent keystrokes to whichever window had focus, could resolve to a web
+search or a different program, and reported success for launches that never
+happened.
+
+Discovery sources, in preference order:
+
+| Platform | Source | Covers |
+| --- | --- | --- |
+| Windows | `App Paths` registry keys (HKLM 64/32-bit and HKCU) | classic installers: Chrome, Firefox, VS Code, Steam |
+| Windows | Start-menu `.lnk` trees under `ProgramData` and `APPDATA` | anything with a shortcut; launched through the `.lnk`, so no COM dependency |
+| Windows | `Get-StartApps` AUMIDs launched via `shell:AppsFolder` | Store/UWP applications |
+| macOS | `.app` bundles in the standard Applications folders | everything, launched with `open -a` |
+| Linux | XDG desktop entries plus `PATH` resolution | everything with a `.desktop` file |
+
+The index is cached in `config/app_index.json` with a 24-hour TTL, is capped at
+4,000 entries, and is validated on read. A miss triggers exactly one silent
+rebuild before the request is reported as a failure, which is what makes a
+freshly installed application work without a manual step.
+
+Matching is ordered: exact key, whole-name prefix/suffix, full token subset, and
+only then a bounded `difflib` ratio above 0.62. The previous substring test
+matched `code` inside `vscode` and `git` inside `digital`, and resolved to the
+first alias in declaration order rather than the best one. When two candidates
+are within 15 points of each other, MARK LIV asks which one is meant instead of
+guessing.
+
+Verification replaced the fixed `time.sleep()` calls. After a launch the caller
+polls for a window owned by the spawned pid or any of its children — many
+launchers hand off to a second process — and falls back to title matching. A
+launch that produces no window within the budget is reported as exactly that.
+Spawned `Popen` handles are reaped so a long session does not accumulate
+zombies.
+
+### Focus-dependent key combinations
+
+`actions/computer_control.py` refuses `alt+f4`, `command+q`, `ctrl+w`,
+`ctrl+shift+w`, `alt+tab`, `command+tab`, `ctrl+alt+delete`, `win+d`, `win+m`,
+`win+l`, and the bare Windows/Command/Super key. Key names are canonicalised
+first, so `cmd`+`Q` is caught as well as `command`+`q`. The refusal names
+`window_manager` as the correct tool. This was not a code bug: the model chose
+the generic hotkey tool over the window tool, and the resulting `alt+f4` closed
+whichever application had focus rather than the one the user named. The guard
+runs before the PyAutoGUI availability check, so a refusal is an explanation
+rather than a missing-dependency error.
+
+### Placement
+
+`core/window_manager.place_window()` moves a window to a monitor and applies a
+state (`normal`, `maximized`, `fullscreen`, `minimized`, or a snap side), then
+re-reads the window so the result can be verified rather than assumed.
+`open_app` exposes this through `monitor` and `state` parameters, and a
+`foreground` parameter that records the previously focused window before the
+launch and restores it afterwards.
+
+---
+
 ## 5. Application launching and Roblox
 
 ### 5.1 `actions/open_app.py`

@@ -1056,6 +1056,23 @@ class JarvisLive:
             })
         return inline + self._action_registry.admin_manifest()
 
+    def _run_dashboard_action(self, name: str, parameters: dict) -> str:
+        """Run one registered action for a dashboard panel button.
+
+        Panels go through the same registry as the voice layer, so schema
+        validation, the confirmation gate, the live run list, and undo all
+        apply exactly as they do for a spoken command.  Only actions that are
+        actually registered can be reached.
+        """
+        if not self._action_registry.has(name):
+            return f"'{name}' is not an available action."
+        ctx = {
+            "player": self.ui,
+            "speak": self.speak,
+            "session_memory": None,
+        }
+        return self._action_registry.run(name, parameters, ctx)
+
     def _admin_desktop(self) -> dict:
         """Read-only snapshot used by the admin panel; never executes a command."""
         from dataclasses import asdict
@@ -2702,6 +2719,7 @@ class JarvisLive:
             self._dashboard.set_connect_callback(self._on_phone_connected)
             self._dashboard.set_capabilities_callback(self._admin_capabilities)
             self._dashboard.set_desktop_callback(self._admin_desktop)
+            self._dashboard.set_action_callback(self._run_dashboard_action)
             self._spawn_background(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             self._spawn_background(self._process_dashboard_commands())

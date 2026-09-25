@@ -240,16 +240,29 @@ def _setup_and_requirements() -> str:
 
 
 def _secret_hygiene() -> str:
-    ignore = (REPO / ".gitignore").read_text(encoding="utf-8")
     expected = (
         "config/api_keys.json",
         "config/spotify_token.json",
+        "config/app_index.json",
+        "config/certs/jarvis.key",
         "memory/long_term.json",
         "memory/sessions.json",
     )
-    missing = [entry for entry in expected if entry not in ignore]
+    # Ask git itself rather than searching .gitignore for a substring. A pattern
+    # written as "config/api_keys.json  # comment" appears in the file but
+    # matches nothing, because git has no trailing-comment syntax.
+    missing = [
+        entry for entry in expected
+        if subprocess.run(
+            ["git", "check-ignore", "-q", entry],
+            cwd=REPO, capture_output=True, check=False, timeout=10,
+        ).returncode != 0
+    ]
     if missing:
-        raise RuntimeError(".gitignore does not protect: " + ", ".join(missing))
+        raise RuntimeError(
+            ".gitignore does not actually ignore: " + ", ".join(missing)
+            + " (a trailing '# comment' on a pattern line breaks it)"
+        )
     forbidden_names = {
         "api_keys.json", "spotify_token.json", "client_secret.json",
         "token.json", "jarvis.key", "jarvis.crt",
