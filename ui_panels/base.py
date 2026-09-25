@@ -33,6 +33,22 @@ _FALLBACK = {
 }
 
 
+class _Palette:
+    """Attribute access to the running UI's palette.
+
+    The extracted panels were written against ``ui.C`` and read it inside
+    stylesheet strings at construction time. Importing ``ui`` here would be a
+    cycle, so this proxy resolves each attribute when it is asked for — which
+    also means a live theme change is picked up the next time a panel is built.
+    """
+
+    def __getattr__(self, name: str) -> str:
+        return colour(name)
+
+
+C = _Palette()
+
+
 def colour(name: str) -> str:
     """One palette entry, from the running UI when there is one."""
     try:
@@ -41,6 +57,16 @@ def colour(name: str) -> str:
         return str(getattr(ui.C, name))
     except Exception:
         return _FALLBACK.get(name, "#8ffcff")
+
+
+def default_accent() -> str:
+    """The palette's default accent colour, for the appearance panel."""
+    try:
+        import ui
+
+        return str(ui.DEFAULT_UI_COLOR)
+    except Exception:
+        return _FALLBACK["PRI"]
 
 
 class HudPanel(QWidget):

@@ -354,16 +354,28 @@ searching a blank page and blaming the element for not existing.
 
 ### Panels outside ui.py
 
-`ui.py` is 5500 lines. New HUD panels therefore live in `ui_panels/`, and
-`ui.py` only learns how to open them — two buttons in the drawer, and two
-methods that import the panel lazily so a broken panel cannot stop the HUD from
-starting.
+`ui.py` was 5600 lines, and every panel added to it made the next one harder to
+place. All floating panels now live in `ui_panels/`; `ui.py` is down to 4170
+lines and only learns how to open them.
 
 | Module | Panel |
 | --- | --- |
-| `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette access, shared widget styling |
-| `ui_panels/launcher.py` | `LauncherOverlay` — search the application index, pin, rescan, launch |
-| `ui_panels/layouts.py` | `LayoutOverlay` — save, restore and delete window layouts |
+| `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette proxy, shared widget styling |
+| `ui_panels/launcher.py` | search the application index, pin, rescan, launch |
+| `ui_panels/layouts.py` | save, restore and delete window layouts |
+| `ui_panels/setup.py` | first-run API key entry |
+| `ui_panels/customize.py` | accent colour wheel, avatar and identity |
+| `ui_panels/plugins.py` | plugin manager and plugin settings |
+| `ui_panels/confirm.py` | the confirmation gate for irreversible actions |
+| `ui_panels/audio_devices.py` | microphone and speaker selection |
+| `ui_panels/memory.py` | browse, search and forget memory entries |
+| `ui_panels/remote_key.py` | dashboard pairing, QR code and PIN |
+
+The palette is reached through a proxy that resolves `ui.C` at attribute-access
+time rather than importing it, because `ui` imports this package; that also
+means a live theme change is picked up the next time a panel is built. A widget
+test constructs all of them, because a panel that fails to build is otherwise
+noticed only when a user clicks the button that opens it.
 
 The palette is read from `ui.C` at call time rather than imported, because
 `ui` imports these modules; the indirection also means a live theme change is

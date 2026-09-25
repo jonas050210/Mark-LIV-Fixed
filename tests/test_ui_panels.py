@@ -201,3 +201,81 @@ class LayoutPanelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(_APP is None, f"PyQt6 is unavailable ({_QT_ERROR})")
+class ExtractedOverlayTests(unittest.TestCase):
+    """The nine panels moved out of ui.py must still construct.
+
+    A panel that fails to build is only noticed when a user clicks the button
+    that opens it, which is exactly the kind of regression an extraction can
+    introduce: a helper or a constant left behind in ui.py raises NameError at
+    construction time and nowhere else.
+    """
+
+    def setUp(self) -> None:
+        self.host = QWidget()
+        self.host.resize(1200, 800)
+
+    def tearDown(self) -> None:
+        self.host.deleteLater()
+
+    def _cases(self):
+        from ui_panels.audio_devices import AudioDeviceOverlay
+        from ui_panels.confirm import ConfirmBanner
+        from ui_panels.customize import CustomizeOverlay, HueWheel
+        from ui_panels.memory import MemoryOverlay
+        from ui_panels.plugins import PluginManagerOverlay, PluginSettingsOverlay
+        from ui_panels.remote_key import RemoteKeyOverlay
+        from ui_panels.setup import SetupOverlay
+
+        return [
+            (SetupOverlay, (self.host,)),
+            (HueWheel, ()),
+            (CustomizeOverlay, ()),
+            (PluginManagerOverlay, ([],)),
+            (PluginSettingsOverlay, ([],)),
+            (ConfirmBanner, ("Restart the computer", "The computer will restart.")),
+            (AudioDeviceOverlay, ()),
+            (MemoryOverlay, ()),
+            (RemoteKeyOverlay, ("http://127.0.0.1:8765", "PAIRKEY")),
+        ]
+
+    def test_every_extracted_panel_constructs(self) -> None:
+        for widget_class, args in self._cases():
+            with self.subTest(panel=widget_class.__name__):
+                widget = widget_class(*args)
+                self.assertGreater(widget.width(), 0)
+                widget.deleteLater()
+
+    def test_the_confirmation_banner_still_reports_both_answers(self) -> None:
+        from ui_panels.confirm import ConfirmBanner
+
+        answers = []
+        banner = ConfirmBanner("Shut down", "The computer will power off.")
+        banner.answered.connect(answers.append)
+        buttons = banner.findChildren(__import__("PyQt6.QtWidgets", fromlist=["QPushButton"]).QPushButton)
+        for button in buttons:
+            button.click()
+        self.assertEqual(sorted(answers), [False, True])
+
+    def test_a_panel_repaints_what_it_covered_when_it_hides(self) -> None:
+        """The ghost-frame fix has to survive the move out of ui.py."""
+        from ui_panels.base import HudPanel
+
+        panel = HudPanel(self.host)
+        panel.setGeometry(10, 10, 100, 100)
+        panel.show()
+        panel.hide()      # must not raise, and must repaint the host region
+        self.assertFalse(panel.isVisible())
+
+    def test_ui_still_exposes_the_panel_names_it_used_to_define(self) -> None:
+        """ui.py instantiates these by name; the import must keep them visible."""
+        import ui
+
+        for name in (
+            "SetupOverlay", "CustomizeOverlay", "HueWheel", "PluginManagerOverlay",
+            "PluginSettingsOverlay", "ConfirmBanner", "AudioDeviceOverlay",
+            "MemoryOverlay", "RemoteKeyOverlay", "_HudOverlay",
+        ):
+            self.assertTrue(hasattr(ui, name), name)

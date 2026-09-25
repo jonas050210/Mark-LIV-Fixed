@@ -314,10 +314,17 @@ python main.py
 Mark LIV/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, viseme extraction, tool dispatch
 ├── ui.py                     # PyQt6 HUD — avatar canvas, waveform, log panel, settings drawer, camera feed
-├── ui_panels/                # HUD panels kept out of ui.py
-│   ├── base.py               # panel base class, palette access, shared widget styling
+├── ui_panels/                # every floating HUD panel, kept out of ui.py
+│   ├── base.py               # panel base class, palette proxy, shared widget styling
 │   ├── launcher.py           # search, pin and start any indexed application
-│   └── layouts.py            # save, restore and delete window layouts
+│   ├── layouts.py            # save, restore and delete window layouts
+│   ├── setup.py              # first-run API key entry
+│   ├── customize.py          # accent colour, avatar and identity
+│   ├── plugins.py            # plugin manager and plugin settings
+│   ├── confirm.py            # the confirmation gate for irreversible actions
+│   ├── audio_devices.py      # microphone and speaker selection
+│   ├── memory.py             # browse, search and forget memory entries
+│   └── remote_key.py         # dashboard pairing, QR code and PIN
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
 ├── .gitignore                # Keeps your API key, TLS key and memories out of the repository
 ├── plugins/
