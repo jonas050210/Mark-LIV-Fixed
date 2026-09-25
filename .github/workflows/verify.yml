@@ -53,4 +53,4 @@ jobs:
         run: python .github/scripts/run_tests.py
 
       - name: Run overall verification
-        run: python test_overall.py
+        run: python .github/scripts/run_overall.py

@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from actions import file_controller, file_processor
-from core import undo
+from core import path_policy, undo
 from core.path_policy import PathPolicyError, resolve_user_path
 
 
@@ -34,6 +34,15 @@ class PathPolicyTests(unittest.TestCase):
                 self.skipTest("symbolic links are unavailable")
             with self.assertRaises(PathPolicyError):
                 resolve_user_path(link / "file.txt", reject_symlinks=True)
+
+    def test_atomic_write_works_when_fchmod_is_unavailable(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            target = Path(directory) / "note.txt"
+            target.write_text("original", encoding="utf-8")
+            with patch.object(path_policy.os, "fchmod", None, create=True):
+                path_policy.atomic_write_text(target, "replacement")
+            self.assertEqual(target.read_text(encoding="utf-8"), "replacement")
+            self.assertEqual(list(target.parent.glob(".*.tmp")), [])
 
 
 class FileControllerSafetyTests(unittest.TestCase):

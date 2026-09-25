@@ -46,7 +46,8 @@ class ExplorerTests(unittest.TestCase):
                 result = explorer.open_in_explorer(target, select=True)
         self.assertIn("selected report.pdf", result)
         popen.assert_called_once_with(
-            ["explorer.exe", f"/select,{target}"], creationflags=0
+            ["explorer.exe", f"/select,{target}"],
+            creationflags=explorer._windows_flags(),
         )
 
 

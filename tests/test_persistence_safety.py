@@ -127,6 +127,17 @@ class JsonStoreSafetyTests(unittest.TestCase):
             with self.assertRaises(JsonStoreCorruptError):
                 store.read(recover=False)
 
+    def test_private_store_works_when_fchmod_is_unavailable(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            path = root / "state.json"
+            store = JsonStore(path, dict)
+            with patch.object(json_store.os, "fchmod", None, create=True):
+                store.write({"version": 1})
+                store.write({"version": 2})
+                self.assertEqual(store.read(), {"version": 2})
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits are not authoritative on Windows")
     def test_private_store_files_have_private_permissions(self) -> None:
         with TemporaryDirectory(dir=Path.home()) as directory:

@@ -187,7 +187,9 @@ class BackgroundMonitorSafetyTests(unittest.TestCase):
 
 class ReminderSafetyTests(unittest.TestCase):
     def test_private_reminder_script_uses_the_shared_path_policy(self) -> None:
-        with TemporaryDirectory() as directory:
+        # Keep the temporary home in the real home so Windows does not mix a
+        # short (RUNNER~1) TEMP spelling with Path.home's long spelling.
+        with TemporaryDirectory(dir=Path.home()) as directory:
             home = Path(directory)
             with patch("actions.reminder.Path.home", return_value=home):
                 script = reminder_action._write_notify_script(
@@ -291,7 +293,12 @@ class ProcessCancellationTests(unittest.TestCase):
             try:
                 os.kill(child_pid, 0)
                 stat_path = Path(f"/proc/{child_pid}/stat")
-                if stat_path.exists() and stat_path.read_text().split()[2] == "Z":
+                try:
+                    process_state = stat_path.read_text().split()[2]
+                except FileNotFoundError:
+                    alive = False
+                    break
+                if process_state == "Z":
                     alive = False
                     break
             except ProcessLookupError:

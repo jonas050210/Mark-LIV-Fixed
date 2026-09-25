@@ -160,6 +160,16 @@ def resolve_user_path(
     return resolved
 
 
+def _set_descriptor_mode(descriptor: int, mode: int) -> None:
+    operation = getattr(os, "fchmod", None)
+    if not callable(operation):
+        return
+    try:
+        operation(descriptor, mode)
+    except OSError:
+        pass
+
+
 def validate_child_name(name: str) -> str:
     value = str(name or "").strip()
     if not value or value in {".", ".."}:
@@ -185,18 +195,23 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
+    descriptor_open = True
     try:
         if existing_mode is not None:
-            try:
-                os.fchmod(descriptor, existing_mode)
-            except OSError:
-                pass
-        with os.fdopen(descriptor, "wb") as handle:
+            _set_descriptor_mode(descriptor, existing_mode)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor_open = False
+        with handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -318,13 +333,13 @@ def atomic_replace_bytes_if_unchanged(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
+    descriptor_open = True
     try:
         if existing_mode is not None:
-            try:
-                os.fchmod(descriptor, existing_mode)
-            except OSError:
-                pass
-        with os.fdopen(descriptor, "wb") as handle:
+            _set_descriptor_mode(descriptor, existing_mode)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor_open = False
+        with handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -332,6 +347,11 @@ def atomic_replace_bytes_if_unchanged(
             raise FileExistsError("the file changed before it could be replaced")
         os.replace(temporary, path)
     finally:
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink()
         except FileNotFoundError:

@@ -51,6 +51,17 @@ def _thread_lock(path: Path) -> threading.RLock:
         return _LOCKS.setdefault(key, threading.RLock())
 
 
+def _set_descriptor_mode(descriptor: int, mode: int) -> None:
+    """Apply POSIX descriptor permissions where the platform supports them."""
+    operation = getattr(os, "fchmod", None)
+    if not callable(operation):
+        return
+    try:
+        operation(descriptor, mode)
+    except OSError:
+        pass
+
+
 @contextmanager
 def _advisory_lock(path: Path):
     """Best-effort blocking advisory lock shared by application processes."""
@@ -72,10 +83,7 @@ def _advisory_lock(path: Path):
         lock_details = os.fstat(descriptor)
         if not stat.S_ISREG(lock_details.st_mode) or _is_reparse_point(lock_details):
             raise JsonStoreError(f"lock path is not a regular file: {lock_path}")
-        try:
-            os.fchmod(descriptor, 0o600)
-        except (AttributeError, OSError):
-            pass
+        _set_descriptor_mode(descriptor, 0o600)
         if os.name == "nt":  # pragma: no cover - exercised on Windows
             import msvcrt
 
@@ -136,10 +144,7 @@ def _private(path: Path) -> None:
         details = os.fstat(descriptor)
         if not stat.S_ISREG(details.st_mode) or _is_reparse_point(details):
             return
-        try:
-            os.fchmod(descriptor, 0o600)
-        except (AttributeError, OSError):
-            pass
+        _set_descriptor_mode(descriptor, 0o600)
     finally:
         os.close(descriptor)
 
@@ -168,10 +173,7 @@ def _atomic_backup(
     output_owns_descriptor = False
     try:
         if private:
-            try:
-                os.fchmod(descriptor, 0o600)
-            except OSError:
-                pass
+            _set_descriptor_mode(descriptor, 0o600)
         source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         source_descriptor = os.open(source, source_flags)
         source_details = os.fstat(source_descriptor)
@@ -326,13 +328,13 @@ class JsonStore(Generic[T]):
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
         )
         temporary = Path(temporary_name)
+        descriptor_open = True
         try:
             if self._private_file:
-                try:
-                    os.fchmod(descriptor, 0o600)
-                except OSError:
-                    pass
-            with os.fdopen(descriptor, "wb") as handle:
+                _set_descriptor_mode(descriptor, 0o600)
+            handle = os.fdopen(descriptor, "wb")
+            descriptor_open = False
+            with handle:
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -341,6 +343,11 @@ class JsonStore(Generic[T]):
                 _private(self.path)
             _sync_directory(self.path.parent)
         finally:
+            if descriptor_open:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             try:
                 temporary.unlink()
             except FileNotFoundError:
