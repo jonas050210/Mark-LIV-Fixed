@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -17,7 +18,14 @@ from memory import config_manager, memory_manager
 
 class JsonStoreSafetyTests(unittest.TestCase):
     def test_concurrent_updates_do_not_lose_changes(self) -> None:
-        with TemporaryDirectory(dir=Path.home()) as directory:
+        # Every update is a locked read, an atomic write and an fsync. On a
+        # Windows CI runner with a virus scanner in the path that is tens of
+        # milliseconds each, so 120 of them can take the better part of a
+        # minute — the budget is generous on purpose. A genuine deadlock still
+        # fails the test, it just takes longer to say so.
+        deadline = 60
+        started = time.monotonic()
+        with TemporaryDirectory(dir=Path.home(), ignore_cleanup_errors=True) as directory:
             path = Path(directory) / "state.json"
             store = JsonStore(
                 path,
@@ -36,8 +44,11 @@ class JsonStoreSafetyTests(unittest.TestCase):
             for thread in threads:
                 thread.start()
             for thread in threads:
-                thread.join(10)
-                self.assertFalse(thread.is_alive())
+                thread.join(deadline)
+                self.assertFalse(
+                    thread.is_alive(),
+                    f"a writer was still blocked after {time.monotonic() - started:.0f}s",
+                )
 
             value = store.read()
             self.assertEqual(value["count"], 120)
