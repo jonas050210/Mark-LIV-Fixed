@@ -178,6 +178,67 @@ class CacheLifecycleTests(unittest.TestCase):
             self.assertEqual(app_index.build_index(), [])
 
 
+class WindowsSpecialApplicationDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_parameterised_shortcut_is_not_flattened_to_browser_executable(self) -> None:
+        """A Chromium PWA must keep the shortcut that carries its app id."""
+        import sys
+        from types import SimpleNamespace
+
+        programs = self.root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        programs.mkdir(parents=True)
+        shortcut = programs / "YouTube.lnk"
+        shortcut.write_bytes(b"shortcut")
+        browser = self.root / "chrome.exe"
+        browser.write_bytes(b"binary")
+        fake_link = SimpleNamespace(
+            path=str(browser),
+            arguments="--profile-directory=Default --app-id=abcdefghijklmnop",
+        )
+        fake_module = SimpleNamespace(parse=lambda _path: fake_link)
+        with patch.dict(sys.modules, {"pylnk3": fake_module}), \
+             patch.dict(os.environ, {"ProgramData": str(self.root), "APPDATA": ""}):
+            entries = app_index._windows_start_menu_entries()
+        youtube = next(entry for entry in entries if entry.name == "YouTube")
+        self.assertEqual(youtube.kind, "lnk")
+        self.assertEqual(Path(youtube.target), shortcut)
+
+    def test_argument_free_shortcut_still_resolves_to_its_executable(self) -> None:
+        import sys
+        from types import SimpleNamespace
+
+        programs = self.root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        programs.mkdir(parents=True)
+        (programs / "Editor.lnk").write_bytes(b"shortcut")
+        executable = self.root / "editor.exe"
+        executable.write_bytes(b"binary")
+        fake_module = SimpleNamespace(parse=lambda _path: SimpleNamespace(
+            path=str(executable), arguments=""))
+        with patch.dict(sys.modules, {"pylnk3": fake_module}), \
+             patch.dict(os.environ, {"ProgramData": str(self.root), "APPDATA": ""}):
+            entries = app_index._windows_start_menu_entries()
+        editor = next(entry for entry in entries if entry.name == "Editor")
+        self.assertEqual(editor.kind, "exec")
+        self.assertEqual(Path(editor.target), executable)
+
+    def test_local_roblox_version_is_discovered_without_app_paths(self) -> None:
+        versions = self.root / "Roblox" / "Versions" / "version-current"
+        versions.mkdir(parents=True)
+        executable = versions / "RobloxPlayerBeta.exe"
+        executable.write_bytes(b"binary")
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}):
+            entries = app_index._windows_roblox_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].name, "Roblox Player")
+        self.assertEqual(Path(entries[0].target), executable.resolve())
+
+
 class LaunchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()

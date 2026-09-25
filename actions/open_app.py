@@ -3,7 +3,6 @@ import time
 
 from core.app_index import (
     LaunchError,
-    build_index,
     record_launch,
     sanitise_arguments,
     is_uri,
@@ -81,7 +80,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "obsidian":           {"Windows": "Obsidian",                "Darwin": "Obsidian",             "Linux": "obsidian"},
     "capcut":             {"Windows": "CapCut",                  "Darwin": "CapCut",               "Linux": "capcut"},
     "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
-    "roblox":             {"Windows": "RobloxPlayerBeta.exe",     "Darwin": "Roblox",              "Linux": "roblox"},
+    "roblox":             {"Windows": "Roblox Player",            "Darwin": "Roblox",              "Linux": "roblox"},
     "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
     "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
 }
@@ -609,14 +608,6 @@ def _second_roblox_instance(app_name: str, normalized: str, existing, existing_k
     if not _window_on_monitor(moved, target_monitor):
         return "A second Roblox window opened, but I could not verify its opposite-monitor placement."
     return f"Opened a second Roblox window on monitor {target_monitor.index}."
-
-
-def refresh_app_index(parameters=None, response=None, player=None, session_memory=None) -> str:
-    """Rescan installed applications; used after installing something new."""
-    entries = build_index()
-    if not entries:
-        return "I could not build an application index on this system."
-    return f"Rebuilt the application index: {len(entries)} installed applications found."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────

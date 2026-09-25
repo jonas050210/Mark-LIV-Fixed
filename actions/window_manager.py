@@ -77,9 +77,9 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         operate(window, "focus")
         return f"Switched to {_target_label(window)}."
     if action in {"close", "quit"}:
-        # The action registry parks this operation behind the shared human
-        # confirmation gate.  Keeping the actual close here makes the policy
-        # impossible to bypass through a second caller.
+        # Closing a named window is deterministic and intentionally immediate.
+        # The application may still show its own native save prompt when it
+        # genuinely owns unsaved work; MARK LIV does not add another prompt.
         operate(window, "close")
         return f"Closed {_target_label(window)}."
     if action in {"fullscreen", "full_screen", "full"}:
@@ -134,7 +134,7 @@ TOOL = {
     "description": (
         "Controls a named desktop window and the user's monitors. Use this instead "
         "of a blind hotkey when the user names an app: list open windows, focus, "
-        "minimize, maximize, fullscreen, restore, close with confirmation, move an app to a "
+        "minimize, maximize, fullscreen, restore, close immediately, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "
         "If no target is supplied, use the currently active window."
@@ -177,6 +177,5 @@ TOOL = {
     },
     "handler": window_manager,
     "risk": "medium",
-    "confirmation_actions": ["close"],
     "undoable": True,
 }

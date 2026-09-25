@@ -147,6 +147,9 @@ def _source_directories() -> list[Path]:
             base = os.environ.get(variable, "")
             if base:
                 directories.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            directories.append(Path(local) / "Roblox" / "Versions")
     elif _OS == "Darwin":
         directories += [Path("/Applications"), Path.home() / "Applications"]
     else:
@@ -242,16 +245,14 @@ def _windows_registry_entries() -> list[AppEntry]:
     return entries
 
 
-def _resolve_shortcut_target(path: Path) -> tuple[str, str]:
-    """Read a Windows ``.lnk`` and return its (executable, working name).
+def _shortcut_metadata(path: Path) -> tuple[str, str]:
+    """Return the executable and command-line arguments stored in a shortcut.
 
-    Resolving the shortcut matters for more than tidiness: a ``.lnk`` launched
-    through ``os.startfile`` reports no process id and cannot carry arguments,
-    so the launcher can neither verify the window by pid nor open a document
-    with the application. Pointing at the real executable restores both.
-
-    ``pylnk3`` is optional; without it the shortcut is still launchable, just
-    without pid tracking.
+    Chrome/Edge installed web apps are ordinary ``.lnk`` files whose target is
+    the browser and whose arguments contain the profile and application id. If
+    those arguments are discarded, opening "YouTube" starts a normal browser
+    window. The index therefore resolves only argument-free shortcuts and lets
+    Windows launch parameterised shortcuts itself.
     """
     try:
         import pylnk3  # type: ignore
@@ -261,19 +262,31 @@ def _resolve_shortcut_target(path: Path) -> tuple[str, str]:
         link = pylnk3.parse(str(path))
     except Exception:
         return "", ""
+
+    arguments = ""
+    for attribute in ("arguments", "command_line_arguments", "command_line_args"):
+        value = str(getattr(link, attribute, "") or "").strip()
+        if value:
+            arguments = value
+            break
+
     for attribute in ("path", "local_base_path"):
         candidate = str(getattr(link, attribute, "") or "").strip().strip('"')
-        if not candidate:
-            continue
-        if not candidate.casefold().endswith(".exe"):
+        if not candidate or not candidate.casefold().endswith(".exe"):
             continue
         try:
             resolved = Path(os.path.expandvars(candidate))
             if resolved.is_file():
-                return str(resolved), resolved.stem
+                return str(resolved), arguments
         except OSError:
             continue
-    return "", ""
+    return "", arguments
+
+
+def _resolve_shortcut_target(path: Path) -> tuple[str, str]:
+    """Backward-compatible executable lookup used by tests and callers."""
+    executable, _arguments = _shortcut_metadata(path)
+    return executable, Path(executable).stem if executable else ""
 
 
 def _windows_start_menu_entries() -> list[AppEntry]:
@@ -295,8 +308,8 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                 name = path.stem
                 if not name or name.casefold().startswith(("uninstall", "remove ")):
                     continue
-                executable, _ = _resolve_shortcut_target(path)
-                if executable:
+                executable, shortcut_arguments = _shortcut_metadata(path)
+                if executable and not shortcut_arguments:
                     entries.append(AppEntry(
                         name=name,
                         kind=_KIND_EXEC,
@@ -304,6 +317,8 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                         source="startmenu",
                     ))
                 else:
+                    # Parameterised shortcuts must remain shortcuts. This is
+                    # how Chromium PWAs retain their --app-id and profile.
                     entries.append(AppEntry(
                         name=name,
                         kind=_KIND_LNK,
@@ -312,6 +327,59 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                     ))
         except OSError:
             continue
+    return entries
+
+
+def _windows_roblox_entries() -> list[AppEntry]:
+    """Discover Roblox installations that do not register in App Paths.
+
+    The current Roblox bootstrapper commonly installs a versioned executable
+    below LOCALAPPDATA and registers the ``roblox-player`` URL protocol, but it
+    does not always create an App Paths entry. Both sources are restricted to
+    the expected executable name before they become launchable index entries.
+    """
+    entries: list[AppEntry] = []
+    candidates: list[Path] = []
+
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        winreg = None
+
+    if winreg is not None:
+        subkey = r"Software\Classes\roblox-player\shell\open\command"
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as node:
+                    command, _ = winreg.QueryValueEx(node, None)
+            except OSError:
+                continue
+            text = os.path.expandvars(str(command or "").strip())
+            match = re.match(r'^\s*"([^"]+\.exe)"|^\s*([^\s]+\.exe)', text, re.IGNORECASE)
+            if match:
+                candidates.append(Path(match.group(1) or match.group(2)))
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    versions = Path(local) / "Roblox" / "Versions" if local else None
+    if versions and versions.is_dir():
+        try:
+            candidates.extend(versions.glob("*/RobloxPlayerBeta.exe"))
+        except OSError:
+            pass
+
+    valid: list[tuple[float, Path]] = []
+    for candidate in candidates:
+        try:
+            if candidate.name.casefold() == "robloxplayerbeta.exe" and candidate.is_file():
+                resolved = candidate.resolve()
+                valid.append((resolved.stat().st_mtime, resolved))
+        except OSError:
+            continue
+    if valid:
+        # Version directory names are not reliably sortable. The newest binary
+        # is the version the Roblox updater most recently installed.
+        _modified, newest = max(valid, key=lambda item: item[0])
+        entries.append(AppEntry("Roblox Player", _KIND_EXEC, str(newest), "roblox"))
     return entries
 
 
@@ -354,6 +422,7 @@ def _scan_windows() -> list[AppEntry]:
     entries = list(_WINDOWS_URI_ENTRIES)
     entries += _windows_registry_entries()
     entries += _windows_start_menu_entries()
+    entries += _windows_roblox_entries()
     entries += _windows_store_entries()
     return entries
 

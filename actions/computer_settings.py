@@ -1040,7 +1040,7 @@ TOOL = {
         "required": []
     },
     "handler": computer_settings,
-    "confirmation_actions": ["close_app", "close_window", "restart", "shutdown", "toggle_wifi"],
+    "confirmation_actions": ["restart", "shutdown", "toggle_wifi"],
     "undoable": True,
     "requires_admin": True,
 }
