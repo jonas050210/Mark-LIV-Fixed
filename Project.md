@@ -1141,6 +1141,31 @@ build: the registry scan, a check that every indexed executable exists on disk,
 native `user32` window backend, and a real Task Scheduler reminder being
 created, listed and cancelled.
 
+### Windows code executed off Windows
+
+About a fifth of the project only runs on Windows — registry scanning, `.lnk`
+resolution, Store application ids, `user32` window enumeration, Task Scheduler,
+WMI brightness. On a Linux or macOS machine none of it was executed by
+anything: not the suite, not CI, not a developer. A wrong registry key or a
+swapped argument pair would survive every green build and fail the first time a
+Windows user asked for it.
+
+`tests/windows_fakes.py` supplies stand-ins for those interfaces — a fake
+`winreg` tree, a fake `pylnk3`, a fake `user32` — and
+`tests/test_windows_paths_simulated.py` drives the real code against them, 49
+tests that run on every platform. `core/app_index.py` went from 66% to 83%
+coverage as a result.
+
+The tests were checked by breaking the code on purpose: dropping the 32-bit
+registry view, removing the window visibility check, dropping `schtasks /F`,
+and letting `.lnk` resolution accept a document instead of an executable. Each
+mutation was caught.
+
+What this proves is that the code asks for the right things in the right order
+and handles what comes back. What it cannot prove is that the real Windows API
+behaves as assumed — for that, `tests/test_windows_integration.py` still has to
+run on a Windows machine. This is the floor, not a replacement.
+
 ### What is still unverified
 
 No physical Windows desktop with two monitors, no Roblox, no real audio

@@ -319,7 +319,7 @@ def _run_unit_tests() -> str:
 COVERAGE_FLOORS = {
     "core/action_result.py": 90,
     "core/action_runtime.py": 85,
-    "core/app_index.py": 62,
+    "core/app_index.py": 76,
     "core/background_scheduler.py": 88,
     "core/browser_handoff.py": 90,
     "core/confirm.py": 70,
@@ -331,7 +331,7 @@ COVERAGE_FLOORS = {
     "memory/session_store.py": 88,
     "actions/layout_manager.py": 74,
     "actions/open_app.py": 60,
-    "actions/reminder.py": 58,
+    "actions/reminder.py": 65,
     "dashboard/server.py": 40,
     "core/speech_shaping.py": 85,
     "core/untrusted.py": 85,
