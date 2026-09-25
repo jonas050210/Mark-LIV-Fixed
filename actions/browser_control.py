@@ -128,6 +128,27 @@ def _user_agent() -> str:
     )
 
 
+def _automation_profile(name: str) -> str:
+    """A private directory for an automation browser profile.
+
+    These profiles hold cookies and signed-in sessions — the comment further
+    down says as much: "accounts logged in here once stay logged in". They were
+    created with the default umask, which on a shared machine means every other
+    user could read them. The reminder scripts and every JSON store are already
+    owner-only; these are now too.
+    """
+    directory = Path.home() / ".jarvis_profiles" / name
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+        directory.parent.chmod(0o700)
+    except OSError:
+        # Windows has no POSIX mode bits; the per-user profile root already
+        # sits inside the user's own home directory there.
+        pass
+    return str(directory)
+
+
 def _real_profile_dir(browser: str) -> str:
     home  = Path.home()
     local = os.environ.get("LOCALAPPDATA", "")
@@ -660,9 +681,7 @@ class _BrowserSession:
         engine_obj  = getattr(self._pw, engine_name)
 
         if engine_name == "firefox":
-            profile = _firefox_profile_dir() or str(
-                Path.home() / ".jarvis_profiles" / "firefox"
-            )
+            profile = _firefox_profile_dir() or _automation_profile("firefox")
             kwargs: dict = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -676,8 +695,7 @@ class _BrowserSession:
                 self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             except Exception as e:
                 print(f"[Browser] Firefox profile launch failed ({type(e).__name__}); using the private profile.")
-                jarvis = str(Path.home() / ".jarvis_profiles" / "firefox_jarvis")
-                Path(jarvis).mkdir(parents=True, exist_ok=True)
+                jarvis = _automation_profile("firefox_jarvis")
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
             self._page = await self._adopt_page()
@@ -685,8 +703,7 @@ class _BrowserSession:
             return
 
         if engine_name == "webkit":
-            safari_profile = str(Path.home() / ".jarvis_profiles" / "safari")
-            Path(safari_profile).mkdir(parents=True, exist_ok=True)
+            safari_profile = _automation_profile("safari")
             kwargs = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -739,8 +756,7 @@ class _BrowserSession:
         # profile / newer Chrome versions block the real profile under
         # automation). Fall back to a persistent JARVIS automation profile —
         # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
-        Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
+        jarvis_profile = _automation_profile(self.browser_name)
         print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
 
         try:

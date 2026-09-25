@@ -151,3 +151,52 @@ class RefusedOperationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomationProfileTests(unittest.TestCase):
+    """The automation profile holds signed-in sessions, so it is owner-only.
+
+    The fallback profile exists precisely so that accounts stay logged in
+    between sessions. It was created with the default umask, which on a shared
+    machine leaves another user able to read the cookie jar.
+    """
+
+    def test_the_profile_directory_is_private(self) -> None:
+        import os
+        import shutil
+        import stat as stat_module
+
+        directory = browser_control._automation_profile("unit_test_browser")
+        try:
+            if os.name == "nt":
+                self.skipTest("POSIX permission bits do not apply on Windows")
+            mode = stat_module.S_IMODE(os.stat(directory).st_mode)
+            self.assertEqual(mode & 0o077, 0, oct(mode))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_an_existing_loose_directory_is_tightened(self) -> None:
+        import os
+        import shutil
+        import stat as stat_module
+        from pathlib import Path
+
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits do not apply on Windows")
+        target = Path.home() / ".jarvis_profiles" / "unit_test_loose"
+        target.mkdir(parents=True, exist_ok=True)
+        os.chmod(target, 0o755)
+        try:
+            browser_control._automation_profile("unit_test_loose")
+            mode = stat_module.S_IMODE(target.stat().st_mode)
+            self.assertEqual(mode & 0o077, 0, oct(mode))
+        finally:
+            shutil.rmtree(target, ignore_errors=True)
+
+    def test_page_text_is_delivered_as_untrusted_content(self) -> None:
+        """get_text returns whatever the site chose to put on the page."""
+        import inspect
+
+        source = inspect.getsource(browser_control._BrowserSession.get_text)
+        self.assertIn("wrap(", source)
+        self.assertIn("untrusted", source)
