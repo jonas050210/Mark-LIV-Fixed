@@ -114,3 +114,90 @@ class PluginDiscoverySafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImportSideEffectTests(unittest.TestCase):
+    """A plugin that is rejected must not already have run.
+
+    Discovery imports every file in the plugins directory and validates it
+    afterwards, so a plugin thrown out for a malformed PLUGIN dict had executed
+    its module body first. "Rejected" read like "did not run", and it was not
+    true.
+    """
+
+    def _check(self, source: str) -> None:
+        from core.plugin_loader import check_no_import_side_effects
+
+        check_no_import_side_effects(source, "probe.py")
+
+    def test_a_bare_call_at_import_time_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._check("import os\nos.system('echo pwned')\n")
+        self.assertIn("runs code at import time", str(caught.exception))
+
+    def test_assigning_into_another_object_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._check("import os\nos.environ['PWNED'] = '1'\n")
+        self.assertIn("another object", str(caught.exception))
+
+    def test_a_loop_at_import_time_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._check("for _ in range(10**9):\n    pass\n")
+
+    def test_a_with_block_at_import_time_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._check("open('/tmp/x', 'w').close()\n")
+
+    def test_an_ordinary_plugin_is_accepted(self) -> None:
+        self._check(
+            '"""Docstring."""\n'
+            "import math\n"
+            "import logging\n"
+            "LOG = logging.getLogger(__name__)\n"
+            "SCALE = math.pi\n"
+            "class Helper:\n    pass\n"
+            "def run(parameters, **kwargs):\n    return 'ok'\n"
+            "try:\n    import json\nexcept ImportError:\n    json = None\n"
+            "if __name__ == '__main__':\n    pass\n"
+            "PLUGIN = {'name': 'x', 'description': 'y',"
+            " 'parameters': {'type': 'OBJECT', 'properties': {}}, 'run': run}\n"
+        )
+
+    def test_the_shipped_template_still_passes(self) -> None:
+        from pathlib import Path
+
+        template = Path(__file__).resolve().parent.parent / "plugins" / "_template.py"
+        self._check(template.read_text(encoding="utf-8"))
+
+    def test_unparseable_source_is_refused_before_execution(self) -> None:
+        with self.assertRaises(ValueError):
+            self._check("def (:\n")
+
+    def test_a_rejected_plugin_leaves_no_trace(self) -> None:
+        """End to end: discovery must not run the body of a bad plugin."""
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from core.plugin_loader import discover_plugins
+
+        directory = Path(tempfile.mkdtemp()) / "plugins"
+        directory.mkdir()
+        bad = directory / "sneaky.py"
+        bad.write_text(
+            "import os\n"
+            "os.environ['MARK_PLUGIN_SIDE_EFFECT'] = 'yes'\n"
+            "PLUGIN = {'name': 'sneaky', 'description': 'x',"
+            " 'parameters': {'type': 'OBJECT', 'properties': {}}, 'run': lambda p: 'x'}\n",
+            encoding="utf-8",
+        )
+        bad.chmod(0o644)
+        os.environ.pop("MARK_PLUGIN_SIDE_EFFECT", None)
+        try:
+            registry = discover_plugins(directory, set(), logger=lambda _message: None)
+            self.assertFalse(registry.has("sneaky"))
+            self.assertIsNone(os.environ.get("MARK_PLUGIN_SIDE_EFFECT"))
+        finally:
+            os.environ.pop("MARK_PLUGIN_SIDE_EFFECT", None)
+            shutil.rmtree(directory.parent, ignore_errors=True)

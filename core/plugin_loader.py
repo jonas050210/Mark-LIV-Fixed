@@ -9,6 +9,7 @@ toggling a plugin does not require restarting the app or re-importing anything.
 from __future__ import annotations
 
 import copy
+import ast
 import importlib.util
 import inspect
 import math
@@ -344,6 +345,61 @@ def _is_reparse_point(details) -> bool:
     return bool(int(getattr(details, "st_file_attributes", 0)) & 0x400)
 
 
+_ALLOWED_TOP_LEVEL = (
+    ast.Import,
+    ast.ImportFrom,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.Try,          # guarded optional imports
+    ast.If,           # "if TYPE_CHECKING" and the __main__ guard
+    ast.Pass,
+)
+
+
+def check_no_import_side_effects(source: str, filename: str) -> None:
+    """Refuse a plugin that *does* something merely by being loaded.
+
+    Discovery imports every file in the plugins directory, and validation only
+    happens afterwards — so a plugin rejected for a malformed PLUGIN dict had
+    already run its module body. "Rejected" read like "did not run", and it was
+    not true.
+
+    A plugin module is supposed to define things: imports, constants, functions,
+    a PLUGIN dict. Anything that acts at the top level — a bare call, a loop, a
+    `with` block, an assignment into someone else's namespace — is refused
+    before the file is executed.
+
+    This is not a sandbox and does not pretend to be one: `X = shutil.rmtree(...)`
+    is an assignment and would pass. The real boundary is the ownership and
+    permission check on the file; this closes the gap between being rejected
+    and having already run.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError as exc:
+        raise ValueError(f"{filename} could not be parsed: {exc.msg}") from exc
+
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue                      # docstring
+        if not isinstance(node, _ALLOWED_TOP_LEVEL):
+            raise ValueError(
+                f"{filename} runs code at import time "
+                f"({type(node).__name__.lower()} at line {node.lineno}); a plugin may "
+                "only define imports, constants, functions and classes"
+            )
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(target, (ast.Name, ast.Tuple, ast.List)):
+                    raise ValueError(
+                        f"{filename} assigns into another object at import time "
+                        f"(line {node.lineno}); a plugin may only bind its own names"
+                    )
+
+
 def _trusted_plugin_source(path: Path, plugins_dir: Path) -> str:
     """Read one trusted regular plugin through a bounded, no-follow descriptor."""
     directory_details = plugins_dir.lstat()
@@ -416,6 +472,8 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
             continue
         try:
             source = _trusted_plugin_source(path, plugins_dir)
+            # Checked before the module is executed, not after.
+            check_no_import_side_effects(source, path.name)
             module_name = f"plugins.{path.stem}"
             spec = importlib.util.spec_from_file_location(module_name, path)
             if spec is None or spec.loader is None:
