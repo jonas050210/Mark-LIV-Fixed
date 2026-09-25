@@ -145,6 +145,20 @@ class CacheLifecycleTests(unittest.TestCase):
             app_index.load_index()
         build.assert_called_once()
 
+    def test_an_old_cache_version_is_rebuilt(self) -> None:
+        old_cache = {
+            "version": app_index.INDEX_VERSION - 1,
+            "system": app_index._OS,
+            "built_at": time.time(),
+            "signature": app_index._source_signature(),
+            "entries": [self.entries[0].as_dict()],
+        }
+        with patch.object(app_index, "_read_cache", return_value=old_cache), \
+             patch.object(app_index, "build_index", return_value=self.entries) as build:
+            loaded = app_index.load_index()
+        self.assertEqual(loaded, self.entries)
+        build.assert_called_once_with()
+
     def test_a_cache_from_another_operating_system_is_discarded(self) -> None:
         app_index._write_cache(self.entries)
         store = app_index._store()
@@ -193,8 +207,9 @@ class WindowsSpecialApplicationDiscoveryTests(unittest.TestCase):
 
         programs = self.root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
         programs.mkdir(parents=True)
-        shortcut = programs / "YouTube.lnk"
-        shortcut.write_bytes(b"shortcut")
+        shortcuts = [programs / f"{name}.lnk" for name in ("Arena", "Twitch", "YouTube")]
+        for shortcut in shortcuts:
+            shortcut.write_bytes(b"shortcut")
         browser = self.root / "chrome.exe"
         browser.write_bytes(b"binary")
         fake_link = SimpleNamespace(
@@ -205,9 +220,12 @@ class WindowsSpecialApplicationDiscoveryTests(unittest.TestCase):
         with patch.dict(sys.modules, {"pylnk3": fake_module}), \
              patch.dict(os.environ, {"ProgramData": str(self.root), "APPDATA": ""}):
             entries = app_index._windows_start_menu_entries()
-        youtube = next(entry for entry in entries if entry.name == "YouTube")
-        self.assertEqual(youtube.kind, "lnk")
-        self.assertEqual(Path(youtube.target), shortcut)
+        web_apps = {entry.name: entry for entry in entries}
+        self.assertEqual(set(web_apps), {"Arena", "Twitch", "YouTube"})
+        for name, shortcut in zip(("Arena", "Twitch", "YouTube"), shortcuts):
+            self.assertEqual(web_apps[name].kind, "lnk")
+            self.assertEqual(web_apps[name].source, "webapp")
+            self.assertEqual(Path(web_apps[name].target), shortcut)
 
     def test_argument_free_shortcut_still_resolves_to_its_executable(self) -> None:
         import sys

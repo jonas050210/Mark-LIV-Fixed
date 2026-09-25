@@ -25,6 +25,33 @@ class ApplicationCatalogueTests(unittest.TestCase):
         self.assertIn("1 launchable entries", result)
 
 
+class NativeWindowRoutingTests(unittest.TestCase):
+    def test_legacy_minimize_routes_to_window_manager_without_hotkeys(self) -> None:
+        with patch("actions.window_manager.window_manager", return_value="Minimized Editor.") as route, \
+             patch.object(computer_settings, "_PYAUTOGUI", False):
+            result = computer_settings.computer_settings(
+                {"action": "minimize", "target": "Editor"}
+            )
+        self.assertEqual(result, "Minimized Editor.")
+        route.assert_called_once_with(
+            {"action": "minimize", "target": "Editor"}, player=None
+        )
+
+    def test_active_close_routes_by_window_handle_without_pyautogui(self) -> None:
+        with patch("actions.window_manager.window_manager", return_value="Closed Twitch.") as route, \
+             patch.object(computer_settings, "_PYAUTOGUI", False):
+            result = computer_settings.computer_settings({"action": "close_window"})
+        self.assertEqual(result, "Closed Twitch.")
+        route.assert_called_once_with(
+            {"action": "close", "target": ""}, player=None
+        )
+
+    def test_unnamed_switch_refuses_alt_tab(self) -> None:
+        result = computer_settings.computer_settings({"action": "switch_window"})
+        self.assertIn("Alt+Tab was removed", result)
+        self.assertIn("window_manager", result)
+
+
 class ImmediateWindowClosePolicyTests(unittest.TestCase):
     def test_named_window_close_has_no_mark_liv_confirmation(self) -> None:
         self.assertNotIn("confirmation_actions", window_manager.TOOL)

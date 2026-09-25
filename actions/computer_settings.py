@@ -1,4 +1,5 @@
 #computer_settings.py
+import os
 import re
 import time
 import subprocess
@@ -246,82 +247,25 @@ def brightness_down():
         except Exception as e:
             print(f"[Settings] Brightness decrease failed on Windows ({type(e).__name__}).")
 
-def close_app():
-    if _OS == "Darwin": pyautogui.hotkey("command", "q")
-    else:               pyautogui.hotkey("alt", "f4")
-
-def close_window():
-    if _OS == "Darwin": pyautogui.hotkey("command", "w")
-    else:               pyautogui.hotkey("ctrl", "w")
-
-def full_screen():
-    if _OS == "Darwin": pyautogui.hotkey("ctrl", "command", "f")
-    else:               pyautogui.press("f11")
-
-def minimize_window():
-    if _OS == "Darwin": pyautogui.hotkey("command", "m")
-    else:               pyautogui.hotkey("win", "down")
-
-def maximize_window():
-    if _OS == "Darwin":
-        subprocess.run(["osascript", "-e",
-            'tell application "System Events" to keystroke "f" '
-            'using {control down, command down}'],
-            capture_output=True, timeout=5)
-    elif _OS == "Windows":
-        pyautogui.hotkey("win", "up")
-    else:
-        try:
-            subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-b", "add,maximized_vert,maximized_horz"],
-                capture_output=True, timeout=5)
-        except Exception:
-            pyautogui.hotkey("super", "up")
-
-def snap_left():
-    if _OS == "Windows":
-        pyautogui.hotkey("win", "left")
-    elif _OS == "Darwin":
-        # macOS has no built-in snap; try Rectangle app shortcut if installed
-        try:
-            subprocess.run(["open", "-a", "Rectangle"], capture_output=True, timeout=1)
-        except Exception:
-            pass
-        pyautogui.hotkey("ctrl", "option", "left")
-    else:  # Linux
-        try:
-            subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,0,0,960,1080"],
-                capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-def snap_right():
-    if _OS == "Windows":
-        pyautogui.hotkey("win", "right")
-    elif _OS == "Darwin":
-        try:
-            subprocess.run(["open", "-a", "Rectangle"], capture_output=True, timeout=1)
-        except Exception:
-            pass
-        pyautogui.hotkey("ctrl", "option", "right")
-    else:  # Linux
-        try:
-            subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,960,0,960,1080"],
-                capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-def switch_window():
-    if _OS == "Darwin": pyautogui.hotkey("command", "tab")
-    else:               pyautogui.hotkey("alt", "tab")
-
 def show_desktop():
-    if _OS == "Darwin":   pyautogui.hotkey("fn", "f11")
-    elif _OS == "Windows": pyautogui.hotkey("win", "d")
-    else:                  pyautogui.hotkey("super", "d")
+    if _OS == "Windows":
+        _must_run([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "(New-Object -ComObject Shell.Application).ToggleDesktop()",
+        ], **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to key code 103'],
+                       capture_output=True, timeout=5)
+    else:
+        _must_run(["wmctrl", "-k", "on"])
+
 
 def open_task_manager():
     if _OS == "Windows":
-        pyautogui.hotkey("ctrl", "shift", "esc")
+        subprocess.Popen(
+            [str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "Taskmgr.exe")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     elif _OS == "Darwin":
         subprocess.Popen(["open", "-a", "Activity Monitor"])
     else:
@@ -486,7 +430,7 @@ def lock_screen():
 
 def open_system_settings():
     if _OS == "Windows":
-        pyautogui.hotkey("win", "i")
+        os.startfile("ms-settings:")  # type: ignore[attr-defined]
     elif _OS == "Darwin":
         subprocess.Popen(["open", "-a", "System Preferences"])
     else:
@@ -497,7 +441,10 @@ def open_system_settings():
 
 def open_file_explorer():
     if _OS == "Windows":
-        pyautogui.hotkey("win", "e")
+        subprocess.Popen(
+            [str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "explorer.exe"), str(Path.home())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     elif _OS == "Darwin":
         subprocess.Popen(["open", str(Path.home())])
     else:
@@ -518,10 +465,6 @@ def sleep_display():
         subprocess.run(["pmset", "displaysleepnow"], capture_output=True, timeout=5)
     else:
         subprocess.run(["xset", "dpms", "force", "off"], capture_output=True, timeout=5)
-
-def open_run():
-    if _OS == "Windows":
-        pyautogui.hotkey("win", "r")
 
 def _must_run(argv: list[str], *, timeout: int = 5, **kwargs) -> subprocess.CompletedProcess:
     """Run a command and raise when it fails.
@@ -623,15 +566,6 @@ ACTION_MAP: dict[str, callable] = {
     "screen_off":          sleep_display,
     "pause_video":         pause_video,
     "play_pause":          pause_video,
-    "close_app":           close_app,
-    "close_window":        close_window,
-    "full_screen":         full_screen,
-    "fullscreen":          full_screen,
-    "minimize":            minimize_window,
-    "maximize":            maximize_window,
-    "snap_left":           snap_left,
-    "snap_right":          snap_right,
-    "switch_window":       switch_window,
     "show_desktop":        show_desktop,
     "task_manager":        open_task_manager,
     "focus_search":        focus_search,
@@ -666,7 +600,6 @@ ACTION_MAP: dict[str, callable] = {
     "lock_screen":         lock_screen,
     "open_settings":       open_system_settings,
     "file_explorer":       open_file_explorer,
-    "open_run":            open_run,
     "dark_mode":           dark_mode,
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
@@ -689,10 +622,6 @@ ACTION_MAP: dict[str, callable] = {
 # Asking before every action is what makes an assistant unusable, and every
 # question costs a round trip. Undo is both faster and safer than a prompt.
 _IRREVERSIBLE = {
-    "close_app":   ("Close the active application",
-                    "The application may contain unsaved work."),
-    "close_window": ("Close the active window",
-                     "The window may contain unsaved work."),
     "restart":     ("Restart this computer",
                     "Anything unsaved will be lost. The computer restarts in 10 seconds."),
     "shutdown":    ("Shut this computer down",
@@ -810,9 +739,6 @@ def computer_settings(
     player=None,
     session_memory=None,
 ) -> str:
-    if not _PYAUTOGUI:
-        return "pyautogui is not installed. Run: pip install pyautogui"
-
     params = parameters if isinstance(parameters, dict) else {}
     action_value = params.get("action", "")
     description_value = params.get("description", "")
@@ -834,24 +760,52 @@ def computer_settings(
     if not action:
         return _suggest(description or raw_action)
 
-    # Keep older model calls compatible: if they send an application name with
-    # a generic window action, delegate to the named-window implementation
-    # instead of applying a blind hotkey to the currently focused window.
-    window_actions = {
-        "minimize", "minimise", "maximize", "maximise", "restore", "focus",
-        "switch", "close_window", "move_to_monitor", "snap", "snap_left", "snap_right",
+    # Window operations are addressed by native window handle, even for the
+    # active window. The old implementation sent Alt+F4, Win+Arrow or F11 to
+    # whichever application happened to own focus by the time the key arrived.
+    # This delegates legacy system_control calls to the same deterministic tool
+    # used by voice and dashboard window cards.
+    window_action_map = {
+        "minimize": "minimize", "minimise": "minimize",
+        "maximize": "maximize", "maximise": "maximize",
+        "restore": "restore", "focus": "focus", "switch": "focus",
+        "close_app": "close", "close_window": "close",
+        "full_screen": "fullscreen", "fullscreen": "fullscreen",
+        "move_to_monitor": "move_to_monitor", "snap": "snap",
+        "snap_left": "snap", "snap_right": "snap",
     }
-    named_target = str(params.get("target") or "").strip()
-    if action in window_actions and named_target:
+    if action in window_action_map:
         from actions.window_manager import window_manager
-        delegated = {"action": action, "target": named_target}
+
+        delegated = {
+            "action": window_action_map[action],
+            "target": str(params.get("target") or "").strip(),
+        }
         if params.get("monitor") is not None:
             delegated["monitor"] = params.get("monitor")
         if action == "snap_left":
-            delegated["action"], delegated["side"] = "snap", "left"
+            delegated["side"] = "left"
         elif action == "snap_right":
-            delegated["action"], delegated["side"] = "snap", "right"
+            delegated["side"] = "right"
+        elif params.get("side") is not None:
+            delegated["side"] = params.get("side")
         return window_manager(delegated, player=player)
+
+    if action == "switch_window":
+        return (
+            "Switching by Alt+Tab was removed because it can select the wrong window. "
+            "Use window_manager with the application or window name."
+        )
+
+    if not _PYAUTOGUI and action in ACTION_MAP:
+        # Structured/native actions above do not depend on PyAutoGUI. Remaining
+        # keyboard and pointer actions still report the missing capability.
+        keyboard_free = {
+            "task_manager", "open_settings", "file_explorer", "show_desktop", "sleep_display",
+            "dark_mode", "toggle_wifi", "restart", "shutdown",
+        }
+        if action not in keyboard_free:
+            return "pyautogui is not installed. Run: pip install pyautogui"
 
     print(f"[Settings] Action: {action}  OS: {_OS}")
     if player:
@@ -1004,7 +958,7 @@ TOOL = {
                     "scroll_bottom | page_up | page_down | copy | paste | cut | "
                     "undo | redo | select_all | save | enter | escape | press_key | "
                     "type_text | screenshot | lock_screen | open_settings | "
-                    "file_explorer | open_run | dark_mode | toggle_wifi | "
+                    "file_explorer | dark_mode | toggle_wifi | "
                     "restart | shutdown"
                 )
             },

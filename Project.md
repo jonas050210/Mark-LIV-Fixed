@@ -423,8 +423,6 @@ lines and only learns how to open them.
 | Module | Panel |
 | --- | --- |
 | `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette proxy, shared widget styling |
-| `ui_panels/launcher.py` | search the application index, pin, rescan, launch |
-| `ui_panels/layouts.py` | save, restore and delete window layouts |
 | `ui_panels/setup.py` | first-run API key entry |
 | `ui_panels/customize.py` | accent colour wheel, avatar and identity |
 | `ui_panels/plugins.py` | plugin manager and plugin settings |
@@ -438,14 +436,6 @@ time rather than importing it, because `ui` imports this package; that also
 means a live theme change is picked up the next time a panel is built. A widget
 test constructs all of them, because a panel that fails to build is otherwise
 noticed only when a user clicks the button that opens it.
-
-The palette is read from `ui.C` at call time rather than imported, because
-`ui` imports these modules; the indirection also means a live theme change is
-picked up the next time a panel opens. Both panels call the same actions the
-voice path uses (`actions.open_app`, `actions.layout_manager`), so a click and a
-spoken command share one implementation, one store, and one undo entry — and
-both panels print the action's own sentence rather than deciding for themselves
-that the operation worked.
 
 ### Placement
 

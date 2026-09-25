@@ -44,12 +44,17 @@ The phone dashboard's **CONTROL** panel uses the same action registry as voice c
 
 MARK LIV launches applications from a real index of what is installed on the
 machine — Windows `App Paths` and Roblox protocol registry entries, Start-menu
-shortcuts (including parameterised Chrome/Edge web apps), versioned Roblox
-installations, `shell:AppsFolder` package ids, macOS application bundles, and
-Linux desktop entries. It never presses the Windows key and types a name into the Start menu,
+shortcuts (including generic Chrome/Edge web apps such as Arena, Twitch, and
+YouTube), versioned Roblox installations, `shell:AppsFolder` package ids, macOS
+application bundles, and Linux desktop entries. Web apps keep their original
+profile and app-id switches, so they open as standalone apps instead of ordinary
+browser tabs. It never presses the Windows key and types a name into the Start menu,
 so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming
-success. Say `rescan my apps` after installing something new.
+success. A stale executable or shortcut triggers one automatic index rebuild
+and one bounded retry; slow shortcuts and Store apps are verified with an
+adaptive before/after window check. Say `rescan my apps` after installing
+something new if you want to refresh proactively.
 
 The launcher also remembers what you actually use: the dashboard's **APP
 LAUNCHER** panel shows pinned and recently opened applications as icon buttons,

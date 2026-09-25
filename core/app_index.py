@@ -40,6 +40,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 INDEX_FILE = BASE_DIR / "config" / "app_index.json"
 USAGE_FILE = BASE_DIR / "config" / "app_usage.json"
 
+INDEX_VERSION = 2
 CACHE_TTL_SECONDS = 24 * 60 * 60
 MAX_RECENT = 12
 MAX_PINNED = 12
@@ -109,7 +110,7 @@ def is_uri(value: str) -> bool:
 # ── cache ────────────────────────────────────────────────────────────────────
 
 def _valid_cache(value: object) -> bool:
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or value.get("version") != INDEX_VERSION:
         return False
     entries = value.get("entries")
     if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
@@ -180,7 +181,7 @@ def _source_signature() -> float:
 
 def _write_cache(entries: list[AppEntry]) -> None:
     payload = {
-        "version": 1,
+        "version": INDEX_VERSION,
         "system": _OS,
         "built_at": time.time(),
         "signature": _source_signature(),
@@ -317,13 +318,20 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                         source="startmenu",
                     ))
                 else:
-                    # Parameterised shortcuts must remain shortcuts. This is
-                    # how Chromium PWAs retain their --app-id and profile.
+                    # Parameterised shortcuts must remain shortcuts. Chromium
+                    # PWAs are tagged generically from their switches, not from
+                    # a hard-coded site list, so Arena, Twitch, YouTube and any
+                    # future installed web app follow the same path.
+                    lowered_arguments = shortcut_arguments.casefold()
+                    source = "webapp" if any(
+                        switch in lowered_arguments
+                        for switch in ("--app-id=", "--app=")
+                    ) else "startmenu"
                     entries.append(AppEntry(
                         name=name,
                         kind=_KIND_LNK,
                         target=str(path),
-                        source="startmenu",
+                        source=source,
                     ))
         except OSError:
             continue
@@ -521,7 +529,10 @@ _SCANNERS = {"Windows": _scan_windows, "Darwin": _scan_macos, "Linux": _scan_lin
 
 def _deduplicate(entries: list[AppEntry]) -> list[AppEntry]:
     """Keep one entry per name, preferring the most directly launchable source."""
-    rank = {"registry": 0, "builtin": 0, "bundle": 1, "desktop": 1, "startmenu": 2, "appsfolder": 3}
+    rank = {
+        "registry": 0, "builtin": 0, "bundle": 1, "desktop": 1,
+        "webapp": 1, "startmenu": 2, "appsfolder": 3, "roblox": 1,
+    }
 
     def _rank(item: AppEntry) -> int:
         # A Start-menu entry that pylnk3 resolved to a real executable is as
@@ -564,8 +575,9 @@ def load_index(*, refresh: bool = False) -> list[AppEntry]:
             moved = False
         stale = stale or moved
         same_system = cache.get("system") == _OS
+        same_version = cache.get("version") == INDEX_VERSION
         raw = cache.get("entries") if isinstance(cache.get("entries"), list) else []
-        if raw and same_system and not stale:
+        if raw and same_system and same_version and not stale:
             return [
                 AppEntry(
                     name=str(item.get("name", "")),

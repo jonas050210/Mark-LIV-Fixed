@@ -180,7 +180,7 @@ def _note_opened_pages(arguments) -> None:
 
 
 def _launch_resolved(entry, arguments=None) -> tuple[bool, int | None, str]:
-    """Start one indexed application.  Never simulates keyboard input."""
+    """Start one indexed application. Never simulates keyboard input."""
     try:
         pid = launch_app(entry, arguments)
         return True, pid, ""
@@ -188,6 +188,40 @@ def _launch_resolved(entry, arguments=None) -> tuple[bool, int | None, str]:
         return False, None, str(exc)
     except Exception as exc:
         return False, None, f"{type(exc).__name__}"
+
+
+def _launch_with_repair(entry, arguments, *queries: str):
+    """Launch once, rebuilding a stale index before one bounded retry.
+
+    Installers frequently replace versioned executables in place. A cached path
+    can therefore become invalid even though the application is still installed.
+    Only failures that look stale trigger the rescan; permission and OS errors
+    are returned directly rather than retried blindly.
+    """
+    started, pid, failure = _launch_resolved(entry, arguments)
+    stale_markers = (
+        "no longer installed", "no longer exists", "indexed location",
+        "shortcut for", "filenotfounderror",
+    )
+    if started or not any(marker in str(failure).casefold() for marker in stale_markers):
+        return started, pid, failure, entry, False
+
+    try:
+        refreshed_entries = load_index(refresh=True)
+    except Exception as exc:
+        return False, None, f"{failure}; rescan failed ({type(exc).__name__})", entry, True
+
+    replacement = None
+    for query in queries:
+        matches = resolve_app(query, limit=1, entries=refreshed_entries)
+        if matches:
+            replacement = matches[0]
+            break
+    if replacement is None:
+        return False, None, f"{failure}; the rescan no longer found the application", entry, True
+
+    started, pid, retry_failure = _launch_resolved(replacement, arguments)
+    return started, pid, retry_failure, replacement, True
 
 
 def _normalised_window_text(value: str) -> str:
@@ -227,6 +261,34 @@ def _matching_windows(requested: str, normalized: str):
     return matches
 
 
+def _browser_title_match_may_be_a_web_app(existing, *queries: str) -> bool:
+    """Return True when a browser-titled window must not suppress a PWA launch.
+
+    A normal Chrome tab titled "Twitch" is indistinguishable from the Twitch
+    PWA by title alone. If the installed-app index says the requested name is a
+    parameterised web-app shortcut, launching that shortcut is the reliable and
+    idempotent operation: Chromium focuses an existing app window or creates it.
+    """
+    if _SYSTEM != "Windows" or not existing:
+        return False
+    browser_names = {"chrome", "msedge", "edge", "brave", "vivaldi", "opera"}
+    if not any(
+        any(name in _normalised_window_text(getattr(window, "process", ""))
+            for name in browser_names)
+        for window in existing
+    ):
+        return False
+    try:
+        entries = load_index()
+    except Exception:
+        return False
+    for query in queries:
+        matches = resolve_app(query, limit=1, entries=entries)
+        if matches and getattr(matches[0], "source", "") == "webapp":
+            return True
+    return False
+
+
 def _focus_window(window) -> bool:
     try:
         from core.window_manager import operate
@@ -243,6 +305,15 @@ def _window_key(window):
         int(getattr(window, "pid", 0) or 0),
         str(getattr(window, "title", "")),
     )
+
+
+def _visible_window_keys() -> set[tuple]:
+    try:
+        from core.window_manager import list_windows
+
+        return {_window_key(window) for window in list_windows()}
+    except Exception:
+        return set()
 
 
 def _wait_for_windows(requested: str, normalized: str, minimum: int,
@@ -321,18 +392,81 @@ def _wait_for_pid_window(pid: int | None, timeout: float = 12.0):
 
 
 def _await_launched_window(app_name: str, normalized: str, pid: int | None,
-                           existing_keys: set[tuple], timeout: float = 12.0):
-    """Identify the window a launch produced, by pid first and title second.
+                           existing_keys: set[tuple], timeout: float = 20.0,
+                           allow_focused_existing: bool = False):
+    """Identify a launched window without serial PID and title waits.
 
-    Replaces the old fixed ``time.sleep`` guesses: a fast machine continues as
-    soon as the window exists, a slow one still gets the full budget, and a
-    launch that produces nothing is reported instead of being called a success.
+    PID ownership, name matching and the before/after window snapshot are
+    checked together. This matters for shortcuts and Store apps, which often do
+    not return the final process id, and for Chromium PWAs whose window title
+    can be the current page rather than the installed app's name. A single new
+    visible window is accepted after a short settling period; multiple unrelated
+    windows are never guessed between.
     """
-    by_pid = _wait_for_pid_window(pid, timeout=timeout)
-    if by_pid:
-        return by_pid[0]
-    _, new_windows = _wait_for_windows(app_name, normalized, 1, existing_keys, timeout=timeout)
-    return new_windows[-1] if new_windows else None
+    started_at = time.monotonic()
+    deadline = started_at + max(1.0, timeout)
+    single_new_since: float | None = None
+    while time.monotonic() < deadline:
+        try:
+            from core.window_manager import list_windows, windows_for_pid
+
+            windows = list_windows()
+        except Exception:
+            windows = []
+
+        if pid:
+            try:
+                owned = windows_for_pid(pid)
+            except Exception:
+                owned = []
+            if owned:
+                return owned[0]
+
+        requested_text = _normalised_window_text(app_name)
+        normalized_text = _normalised_window_text(normalized)
+        terms = {
+            term for value in (requested_text, normalized_text)
+            for term in value.split()
+            if len(term) >= 3 and term not in {
+                "open", "launch", "start", "application", "app",
+            }
+        }
+        new_windows = [window for window in windows if _window_key(window) not in existing_keys]
+        matching_all = []
+        for window in windows:
+            title = _normalised_window_text(getattr(window, "title", ""))
+            process = _normalised_window_text(getattr(window, "process", ""))
+            if (_is_roblox(app_name) and ("roblox" in title or "roblox" in process)) or any(
+                term in title or term in process for term in terms
+            ):
+                matching_all.append(window)
+        matching_new = [
+            window for window in matching_all if _window_key(window) not in existing_keys
+        ]
+        if matching_new:
+            return matching_new[-1]
+
+        if allow_focused_existing and time.monotonic() - started_at >= 0.75:
+            try:
+                from core.window_manager import foreground_window
+
+                focused = foreground_window()
+            except Exception:
+                focused = None
+            if focused is not None:
+                for window in matching_all:
+                    if int(window.handle) == int(focused.handle):
+                        return window
+
+        if len(new_windows) == 1:
+            if single_new_since is None:
+                single_new_since = time.monotonic()
+            elif time.monotonic() - single_new_since >= 0.75:
+                return new_windows[0]
+        else:
+            single_new_since = None
+        time.sleep(0.2)
+    return None
 
 
 def _placement_request(parameters: dict) -> tuple[int | None, str]:
@@ -423,6 +557,12 @@ def open_app(
     explicit_second = _explicit_second_instance(parameters, app_name)
     is_roblox = _is_roblox(app_name) or _is_roblox(shortcut_target) or _is_roblox(normalized)
     existing = _matching_windows(app_name, normalized)
+    if _browser_title_match_may_be_a_web_app(
+        existing, normalized, shortcut_target, app_name
+    ):
+        # Let Chromium route the installed app id. A title-only browser match
+        # may be an ordinary tab and is not proof that the PWA is open.
+        existing = []
 
     if player:
         player.write_log("[open_app] Launch requested")
@@ -477,21 +617,45 @@ def open_app(
         except Exception:
             previous_foreground = None
 
-    print(f"[open_app] Launching an indexed application ({_SYSTEM}, {entry.source}).")
-    existing_keys = {_window_key(window) for window in existing}
+    print(
+        f"[open_app] Launching '{entry.name}' "
+        f"(platform={_SYSTEM}, kind={entry.kind}, source={entry.source})."
+    )
+    existing_keys = _visible_window_keys()
+    if not existing_keys:
+        existing_keys = {_window_key(window) for window in existing}
 
     try:
-        started, pid, failure = _launch_resolved(entry, arguments)
+        started, pid, failure, entry, repaired = _launch_with_repair(
+            entry, arguments, normalized, shortcut_target, app_name
+        )
+        if repaired:
+            print(
+                f"[open_app] Rebuilt stale index; retry target "
+                f"kind={entry.kind}, source={entry.source}."
+            )
         if not started:
-            return f"I could not start {entry.name}: {failure or 'the launch was refused'}."
+            repair_note = " after rebuilding the application index" if repaired else ""
+            return (
+                f"I could not start {entry.name}{repair_note}: "
+                f"{failure or 'the launch was refused'}."
+            )
 
         if is_roblox and explicit_second:
             return _second_roblox_instance(app_name, normalized, existing, existing_keys)
 
         record_launch(entry.name)
         _note_opened_pages(arguments)
-        window = _await_launched_window(app_name, normalized, pid, existing_keys)
+        wait_seconds = 30.0 if entry.kind in {"lnk", "aumid"} else 20.0
+        window = _await_launched_window(
+            app_name, normalized, pid, existing_keys, timeout=wait_seconds,
+            allow_focused_existing=(entry.source == "webapp"),
+        )
         if window is None:
+            print(
+                f"[open_app] No verified window for '{entry.name}' "
+                f"(pid={pid or 'delegated'}, waited={int(wait_seconds)}s)."
+            )
             return (
                 f"I started {entry.name}, but no window appeared within the wait window. "
                 "It may still be loading or it may have failed to start."
