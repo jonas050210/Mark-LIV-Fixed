@@ -102,6 +102,12 @@ def _read() -> dict:
         return {"version": 1, "layouts": {}}
 
 
+def read_layouts() -> dict:
+    """Saved layouts as a name to record mapping, for the UI panel."""
+    layouts = _read().get("layouts", {})
+    return dict(layouts) if isinstance(layouts, dict) else {}
+
+
 def _write(data: dict) -> None:
     _store().write(data)
 

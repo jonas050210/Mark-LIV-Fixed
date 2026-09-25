@@ -4011,6 +4011,22 @@ class MainWindow(QMainWindow):
         audio_btn.clicked.connect(self._open_audio_devices)
         lay.addWidget(audio_btn)
 
+        launch_btn = QPushButton("▸  LAUNCHER")
+        launch_btn.setFixedHeight(26)
+        launch_btn.setFont(QFont("Courier New", 7))
+        launch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        launch_btn.setStyleSheet(_BTN_STYLE_DIM)
+        launch_btn.clicked.connect(self._open_launcher)
+        lay.addWidget(launch_btn)
+
+        layout_btn = QPushButton("▤  LAYOUTS")
+        layout_btn.setFixedHeight(26)
+        layout_btn.setFont(QFont("Courier New", 7))
+        layout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout_btn.setStyleSheet(_BTN_STYLE_DIM)
+        layout_btn.clicked.connect(self._open_layouts)
+        lay.addWidget(layout_btn)
+
         mem_btn = QPushButton("🧠  MEMORY")
         mem_btn.setFixedHeight(26)
         mem_btn.setFont(QFont("Courier New", 7))
@@ -5133,6 +5149,33 @@ class MainWindow(QMainWindow):
         ov = MemoryOverlay(parent=self.centralWidget())
         self._centre_overlay(ov)
         self._memory_overlay = ov
+
+    # ── Launcher and window layouts ──────────────────────────────────────────
+    #
+    # Both panels live in ui_panels/ rather than in this file, and are imported
+    # only when first opened: neither is needed to start the HUD, and a failure
+    # while building one must not take the window down with it.
+
+    def _open_launcher(self):
+        try:
+            from ui_panels.launcher import LauncherOverlay
+        except Exception as e:
+            self._log.append_log(f"ERR: Launcher panel unavailable ({type(e).__name__}).")
+            return
+        ov = LauncherOverlay(parent=self.centralWidget())
+        ov.launched.connect(lambda name: self._log.append_log(f"SYS: Launched {name}."))
+        self._centre_overlay(ov)
+        self._launcher_overlay = ov         # keep a reference so it isn't GC'd
+
+    def _open_layouts(self):
+        try:
+            from ui_panels.layouts import LayoutOverlay
+        except Exception as e:
+            self._log.append_log(f"ERR: Layout panel unavailable ({type(e).__name__}).")
+            return
+        ov = LayoutOverlay(parent=self.centralWidget())
+        self._centre_overlay(ov)
+        self._layout_overlay = ov           # keep a reference so it isn't GC'd
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 

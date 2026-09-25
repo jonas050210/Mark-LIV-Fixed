@@ -275,6 +275,48 @@ as `explorer.exe` are skipped so a restore does not fight the desktop. Save,
 apply and delete are all undoable, and applying reports the windows that are not
 currently open rather than launching them.
 
+### Reminder registry
+
+`actions/reminder.py` hands each reminder to the operating system's own
+scheduler — Task Scheduler, launchd, `systemd-run`, or `at` — which is what lets
+it fire while MARK LIV is closed. The cost is that the assistant used to have no
+idea what it had scheduled: a reminder could only be removed by opening the
+scheduler by hand. `memory/reminders.json` now records the scheduler handle, the
+time, and the message for each job, which is exactly what `cancel` needs and
+nothing more.
+
+- `action: list` prints the pending reminders, numbered, and prunes the ones
+  whose time has passed by more than a minute.
+- `action: cancel` takes that number or the exact message text; with a single
+  reminder pending, neither is needed.
+- A cancellation the scheduler refuses is reported as a failure, because the
+  job is still registered and will still fire. Nothing is removed from the
+  registry in that case.
+- `at` is the one backend that can schedule a job it cannot describe: if it
+  prints no job number, the reminder is still set, and the answer says plainly
+  that it will not be cancellable.
+
+### Panels outside ui.py
+
+`ui.py` is 5500 lines. New HUD panels therefore live in `ui_panels/`, and
+`ui.py` only learns how to open them — two buttons in the drawer, and two
+methods that import the panel lazily so a broken panel cannot stop the HUD from
+starting.
+
+| Module | Panel |
+| --- | --- |
+| `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette access, shared widget styling |
+| `ui_panels/launcher.py` | `LauncherOverlay` — search the application index, pin, rescan, launch |
+| `ui_panels/layouts.py` | `LayoutOverlay` — save, restore and delete window layouts |
+
+The palette is read from `ui.C` at call time rather than imported, because
+`ui` imports these modules; the indirection also means a live theme change is
+picked up the next time a panel opens. Both panels call the same actions the
+voice path uses (`actions.open_app`, `actions.layout_manager`), so a click and a
+spoken command share one implementation, one store, and one undo entry — and
+both panels print the action's own sentence rather than deciding for themselves
+that the operation worked.
+
 ### Placement
 
 `core/window_manager.place_window()` moves a window to a monitor and applies a

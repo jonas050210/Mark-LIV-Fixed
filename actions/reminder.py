@@ -4,11 +4,13 @@ import shutil
 import subprocess
 import sys
 import secrets
+import re
 import shlex
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
+from core.json_store import JsonStore, JsonStoreCorruptError
 from core.path_policy import atomic_create_text, resolve_user_path
 
 _CNW: dict = (
@@ -147,7 +149,7 @@ except Exception:
     return script_path
 
 def _schedule_windows(target_dt: datetime, task_name: str,
-                      script_path: Path, message: str) -> str:
+                      script_path: Path, message: str) -> tuple[str, str]:
     python_exe = Path(sys.executable)
     pythonw = python_exe.parent / "pythonw.exe"
     if pythonw.exists():
@@ -199,13 +201,13 @@ def _schedule_windows(target_dt: datetime, task_name: str,
     if result.returncode != 0:
         script_path.unlink(missing_ok=True)
         print(f"[Reminder] ❌ schtasks failed with exit code {result.returncode}.")
-        return ""  
+        return "", ""
 
-    return task_name
+    return task_name, "schtasks"
 
 
 def _schedule_mac(target_dt: datetime, task_name: str,
-                  script_path: Path) -> str:
+                  script_path: Path) -> tuple[str, str]:
     agents_dir = resolve_user_path(
         Path.home() / "Library" / "LaunchAgents",
         allow_missing=True,
@@ -254,13 +256,13 @@ def _schedule_mac(target_dt: datetime, task_name: str,
         plist_path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
         print(f"[Reminder] ❌ launchctl failed with exit code {result.returncode}.")
-        return ""
+        return "", ""
 
-    return label
+    return label, "launchd"
 
 
 def _schedule_linux(target_dt: datetime, task_name: str,
-                    script_path: Path) -> str:
+                    script_path: Path) -> tuple[str, str]:
 
     if shutil.which("systemd-run"):
         on_calendar = target_dt.strftime("%Y-%m-%d %H:%M:00")
@@ -276,7 +278,7 @@ def _schedule_linux(target_dt: datetime, task_name: str,
             capture_output=True, text=True, timeout=20,
         )
         if result.returncode == 0:
-            return task_name
+            return task_name, "systemd"
         print(f"[Reminder] ⚠️ systemd-run failed with exit code {result.returncode}; trying 'at'.")
 
     if shutil.which("at"):
@@ -287,12 +289,169 @@ def _schedule_linux(target_dt: datetime, task_name: str,
             input=cmd_str, capture_output=True, text=True, timeout=20,
         )
         if result.returncode == 0:
-            return task_name
+            # 'at' prints "job 42 at Tue Sep 29 09:00:00 2026" on stderr; that
+            # number is the only handle atrm accepts, so a reminder scheduled
+            # through 'at' cannot be cancelled without it.
+            match = re.search(r"job\s+(\d+)", f"{result.stderr}\n{result.stdout}")
+            return (match.group(1) if match else ""), "at"
         print(f"[Reminder] ❌ at failed with exit code {result.returncode}.")
-        return ""
+        return "", ""
 
     print("[Reminder] ❌ Neither systemd-run nor at found on this Linux system.")
-    return ""
+    return "", ""
+
+
+
+# ── Registry of scheduled reminders ──────────────────────────────────────────
+#
+# Scheduling a reminder hands the job to the operating system, which is what
+# makes it survive a restart of MARK LIV. The price is that the assistant then
+# has no idea what it scheduled: without a record, a reminder can only be
+# removed by opening Task Scheduler, launchctl or systemctl by hand. This
+# registry is that record — it stores what is needed to cancel a job and
+# nothing else.
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+REMINDER_FILE = BASE_DIR / "memory" / "reminders.json"
+MAX_REMINDERS = 100
+_BACKENDS = {"schtasks", "launchd", "systemd", "at"}
+
+
+def _valid_registry(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    items = value.get("reminders", [])
+    if not isinstance(items, list) or len(items) > MAX_REMINDERS:
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        for field in ("id", "when", "message", "backend"):
+            if not isinstance(item.get(field), str) or len(item[field]) > 300:
+                return False
+        if item["backend"] not in _BACKENDS:
+            return False
+        if not isinstance(item.get("script", ""), str) or len(item.get("script", "")) > 1000:
+            return False
+        if not isinstance(item.get("handle", ""), str) or len(item.get("handle", "")) > 300:
+            return False
+    return True
+
+
+def _registry_store() -> JsonStore[dict]:
+    return JsonStore(REMINDER_FILE, dict, validator=_valid_registry)
+
+
+def _read_registry() -> list[dict]:
+    if not REMINDER_FILE.exists():
+        return []
+    try:
+        data = _registry_store().read()
+    except (JsonStoreCorruptError, OSError, ValueError):
+        return []
+    items = data.get("reminders")
+    return list(items)[:MAX_REMINDERS] if isinstance(items, list) else []
+
+
+def _write_registry(items: list[dict]) -> None:
+    try:
+        _registry_store().write({"reminders": items[:MAX_REMINDERS]})
+    except Exception as exc:
+        print(f"[Reminder] could not persist the reminder registry ({type(exc).__name__}).")
+
+
+def _record_reminder(entry: dict) -> None:
+    items = [item for item in _read_registry() if item.get("id") != entry.get("id")]
+    items.append(entry)
+    items.sort(key=lambda item: item.get("when", ""))
+    _write_registry(items)
+
+
+def _parse_when(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(str(value or "")[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
+def _prune_registry(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split the registry into still-pending and already-fired reminders.
+
+    A reminder is dropped a full minute after its time rather than exactly on
+    it, so a listing made while the notification is being delivered does not
+    claim the reminder never existed.
+    """
+    now = datetime.now()
+    pending, expired = [], []
+    for item in items:
+        when = _parse_when(item.get("when", ""))
+        if when is None or (now - when).total_seconds() > 60:
+            expired.append(item)
+        else:
+            pending.append(item)
+    return pending, expired
+
+
+def _delete_script(path_text: str) -> None:
+    if not path_text:
+        return
+    try:
+        candidate = Path(path_text)
+        if candidate.parent == _scripts_dir() and candidate.suffix == ".py":
+            candidate.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _run(argv: list[str], **kwargs) -> tuple[bool, str]:
+    """Run a scheduler command, reporting failure honestly."""
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, **kwargs
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        return False, type(exc).__name__
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, (detail[-1][:120] if detail else f"exit code {result.returncode}")
+    return True, ""
+
+
+def _cancel_job(item: dict) -> tuple[bool, str]:
+    """Remove one scheduled job from the operating system's scheduler."""
+    backend = item.get("backend", "")
+    handle = item.get("handle") or item.get("id", "")
+    if not handle:
+        return False, "the reminder has no scheduler handle"
+
+    if backend == "schtasks":
+        return _run(["schtasks", "/Delete", "/TN", handle, "/F"], **_CNW)
+
+    if backend == "launchd":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{handle}.plist"
+        ok, detail = _run(["launchctl", "unload", str(plist)])
+        if not ok:
+            return False, detail
+        try:
+            plist.unlink(missing_ok=True)
+        except OSError as exc:
+            return False, type(exc).__name__
+        return True, ""
+
+    if backend == "systemd":
+        # systemd-run creates a transient timer; stopping the timer is what
+        # cancels the pending run. The service unit may already be gone.
+        ok, detail = _run(["systemctl", "--user", "stop", f"{handle}.timer"])
+        if not ok:
+            return False, detail
+        _run(["systemctl", "--user", "stop", f"{handle}.service"])
+        return True, ""
+
+    if backend == "at":
+        return _run(["atrm", handle])
+
+    return False, f"unknown scheduler '{backend}'"
+
 
 def reminder(
     parameters: dict,
@@ -300,8 +459,92 @@ def reminder(
     player=None,
     session_memory=None,
 ) -> str:
-
     params = parameters if isinstance(parameters, dict) else {}
+    raw_action = params.get("action", "set")
+    action = raw_action.strip().casefold()[:16] if isinstance(raw_action, str) else "set"
+
+    if action in {"list", "show", "pending"}:
+        return _list_reminders()
+    if action in {"cancel", "delete", "remove"}:
+        return _cancel_reminder(params)
+    return _set_reminder(params, player)
+
+
+def _list_reminders() -> str:
+    pending, expired = _prune_registry(_read_registry())
+    if expired:
+        for item in expired:
+            _delete_script(item.get("script", ""))
+        _write_registry(pending)
+    if not pending:
+        return "You have no reminders scheduled."
+    lines = [f"{len(pending)} reminder{'s' if len(pending) != 1 else ''} scheduled:"]
+    for index, item in enumerate(pending, start=1):
+        when = _parse_when(item.get("when", ""))
+        stamp = when.strftime("%B %d at %H:%M") if when else item.get("when", "unknown time")
+        lines.append(f"{index}. {stamp} — {item.get('message', 'Reminder')}")
+    return "\n".join(lines)
+
+
+def _select_reminder(pending: list[dict], params: dict) -> dict | None:
+    """Pick the reminder a cancel request refers to, by number or by text."""
+    raw_index = params.get("index")
+    if isinstance(raw_index, bool):
+        raw_index = None
+    if isinstance(raw_index, (int, float, str)):
+        try:
+            number = int(str(raw_index).strip())
+        except (TypeError, ValueError):
+            number = 0
+        if 1 <= number <= len(pending):
+            return pending[number - 1]
+    wanted = str(params.get("message") or "").strip().casefold()
+    if wanted:
+        for item in pending:
+            if item.get("message", "").casefold() == wanted:
+                return item
+        matches = [item for item in pending if wanted in item.get("message", "").casefold()]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _cancel_reminder(params: dict) -> str:
+    pending, expired = _prune_registry(_read_registry())
+    if expired:
+        for item in expired:
+            _delete_script(item.get("script", ""))
+        _write_registry(pending)
+    if not pending:
+        return "You have no reminders scheduled, so there is nothing to cancel."
+
+    if len(pending) == 1 and not params.get("index") and not params.get("message"):
+        target = pending[0]
+    else:
+        target = _select_reminder(pending, params)
+    if target is None:
+        return (
+            "I could not tell which reminder you mean. "
+            + _list_reminders()
+            + "\nSay the number or the exact text."
+        )
+
+    removed, detail = _cancel_job(target)
+    if not removed:
+        # The job is still registered with the operating system, so the
+        # reminder will still fire. Saying otherwise would be a lie.
+        return (
+            f"I could not cancel the reminder '{target.get('message', '')}' "
+            f"({detail}). It is still scheduled."
+        )
+    _delete_script(target.get("script", ""))
+    _write_registry([item for item in pending if item.get("id") != target.get("id")])
+    when = _parse_when(target.get("when", ""))
+    stamp = when.strftime("%B %d at %H:%M") if when else target.get("when", "")
+    return f"Cancelled the reminder for {stamp} — {target.get('message', 'Reminder')}."
+
+
+def _set_reminder(params: dict, player=None) -> str:
     raw_date = params.get("date", "")
     raw_time = params.get("time", "")
     raw_message = params.get("message", "Reminder")
@@ -320,6 +563,10 @@ def reminder(
     if target_dt <= datetime.now():
         return "That time has already passed — I can't set a reminder in the past."
 
+    pending, _expired = _prune_registry(_read_registry())
+    if len(pending) >= MAX_REMINDERS:
+        return f"You already have {MAX_REMINDERS} reminders scheduled; cancel one first."
+
     os_name    = _get_os()
     safe_msg   = _sanitise(message)
     task_name = (
@@ -335,33 +582,66 @@ def reminder(
 
     try:
         if os_name == "windows":
-            job_id = _schedule_windows(target_dt, task_name, script_path, safe_msg)
+            handle, backend = _schedule_windows(target_dt, task_name, script_path, safe_msg)
         elif os_name == "mac":
-            job_id = _schedule_mac(target_dt, task_name, script_path)
+            handle, backend = _schedule_mac(target_dt, task_name, script_path)
         else:
-            job_id = _schedule_linux(target_dt, task_name, script_path)
+            handle, backend = _schedule_linux(target_dt, task_name, script_path)
     except Exception as e:
         script_path.unlink(missing_ok=True)
         print(f"[Reminder] ❌ Scheduling failed ({type(e).__name__}).")
         return "Something went wrong while scheduling the reminder."
 
-    if not job_id:
+    if not backend:
         return "I couldn't register the reminder with the system scheduler."
+
+    _record_reminder({
+        "id": task_name,
+        "when": target_dt.strftime("%Y-%m-%d %H:%M"),
+        "message": safe_msg,
+        "backend": backend,
+        "handle": handle,
+        "script": str(script_path),
+    })
 
     if player:
         player.write_log(f"[Reminder] ✅ {date_str} {time_str}")
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
+    if backend == "at" and not handle:
+        # Scheduled, but 'at' did not report a job number, so cancelling it
+        # later will not be possible from here.
+        return (
+            f"Reminder set for {friendly_time}. Note that this system's 'at' "
+            "did not return a job id, so I will not be able to cancel it."
+        )
     return f"Reminder set for {friendly_time}."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "reminder",
-    "description": "Sets a timed reminder using Task Scheduler.",
+    "description": (
+        "Set, list, or cancel timed reminders. The reminder is registered with "
+        "the operating system's scheduler, so it fires even when MARK LIV is "
+        "not running. Use action 'set' with date, time and message; 'list' to "
+        "see what is pending; 'cancel' with the number from that list or the "
+        "exact message text."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
+            "action": {
+                "type": "STRING",
+                "enum": ["set", "list", "cancel"],
+                "description": "set | list | cancel (default: set)"
+            },
+            "index": {
+                "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Which reminder to cancel, as numbered by the list action"
+            },
             "date": {
                 "type": "STRING",
                 "minLength": 10,
@@ -381,11 +661,7 @@ TOOL = {
                 "description": "Reminder message text"
             }
         },
-        "required": [
-            "date",
-            "time",
-            "message"
-        ]
+        "required": ["action"]
     },
     "handler": reminder,
 }
