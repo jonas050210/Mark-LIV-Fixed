@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import importlib.util
 import platform
-import subprocess
 import sys
 from typing import Callable
+
+from core.process_runner import run_bounded
 
 # ── Package lists ─────────────────────────────────────────────────────────
 # Each entry: (import_name, pip_package_name)
@@ -67,17 +68,18 @@ def _available(module: str) -> bool:
 def _pip(package: str, log: Callable | None = None) -> bool:
     if log:
         log(f"SYS: pip install {package} …")
-    result = subprocess.run(
+    result = run_bounded(
         [
             sys.executable, "-m", "pip", "install", package,
             "--quiet", "--disable-pip-version-check",
         ],
-        capture_output=True,
+        timeout=900,
+        max_output=100_000,
     )
-    ok = result.returncode == 0
+    ok = result.returncode == 0 and not result.timed_out
     if not ok and log:
-        stderr = result.stderr.decode(errors="replace").strip()
-        log(f"ERR: {package} install failed — {stderr[:140]}")
+        reason = "timed out" if result.timed_out else f"exit code {result.returncode}"
+        log(f"ERR: {package} install failed ({reason}).")
     return ok
 
 
@@ -126,12 +128,16 @@ def install_for_config(config: dict, log: Callable | None = None) -> None:
         _pip("playwright", log)
         if log:
             log("SYS: Downloading Playwright browser (Chromium, ~150 MB — one-time)…")
-        subprocess.run(
+        browser_install = run_bounded(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
+            timeout=900,
+            max_output=100_000,
         )
         if log:
-            log("SYS: Playwright browser ready.")
+            if browser_install.returncode == 0 and not browser_install.timed_out:
+                log("SYS: Playwright browser ready.")
+            else:
+                log("ERR: Playwright browser installation did not complete.")
 
     if log:
         log("SYS: All dependencies ready ✓")

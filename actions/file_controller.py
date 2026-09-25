@@ -1,6 +1,10 @@
+import heapq
 import os
 import shutil
 import platform
+import secrets
+import stat
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -10,8 +14,20 @@ try:
 except ImportError:
     _SEND2TRASH = False
 
-from core.undo import push_undo
+from core.undo import push_undo, refuse
 from core import explorer
+from core.path_policy import (
+    FileFingerprint,
+    PathPolicyError,
+    atomic_create_text,
+    atomic_replace_bytes_if_unchanged,
+    atomic_replace_text_if_unchanged,
+    fingerprint,
+    move_no_replace,
+    resolve_user_path,
+    unchanged,
+    validate_child_name,
+)
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -19,49 +35,72 @@ _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 # Above this size it does not — a 200 MB log would sit in RAM for the rest of
 # the session to protect an edit nobody is going to take back.
 _UNDO_CONTENT_LIMIT = 1_000_000
+_COPY_TREE_MAX_ENTRIES = 10_000
+_COPY_TREE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def _undo_move(src: Path, dst: Path):
-    """Reverse of a move: put it back where it came from."""
+def _is_reparse(details) -> bool:
+    return bool(int(getattr(details, "st_file_attributes", 0)) & 0x400)
+
+
+def _entry_is_link(entry: os.DirEntry) -> bool:
+    try:
+        return entry.is_symlink() or _is_reparse(entry.stat(follow_symlinks=False))
+    except OSError:
+        return True
+
+
+def _path_is_link(path: Path) -> bool:
+    try:
+        return path.is_symlink() or _is_reparse(path.lstat())
+    except OSError:
+        return True
+
+
+def _undo_move(src: Path, dst: Path, expected):
+    """Reverse a move only while the moved object is still unchanged."""
     def _fn():
         if not dst.exists():
-            return f"'{dst.name}' is no longer there — nothing moved back."
+            refuse(f"'{dst.name}' is no longer there, so it cannot be moved back")
+        if not unchanged(dst, expected):
+            refuse(f"'{dst.name}' changed after the move and was left alone")
+        if src.exists():
+            refuse(f"'{src}' now exists and will not be overwritten")
         src.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(dst), str(src))
+        move_no_replace(dst, src)
         return f"'{src.name}' is back in {src.parent.name}/."
     return _fn
 
 
-def _undo_create(target: Path):
-    """Reverse of a create: remove what we made — and only if we still made it.
-
-    Deliberately refuses to touch a directory that has since been filled: the
-    undo for 'create a folder' is not 'delete whatever ended up in it'."""
+def _undo_create(target: Path, expected):
+    """Remove a created object only if it still has the captured identity."""
     def _fn():
         if not target.exists():
             return f"'{target.name}' is already gone."
-        if target.is_dir():
-            if any(target.iterdir()):
-                return (f"'{target.name}' is not empty any more — "
-                        f"leaving it alone rather than deleting your files.")
-            target.rmdir()
-        else:
-            target.unlink()
+        if not unchanged(target, expected):
+            refuse(f"'{target.name}' changed after creation and was left alone")
+        if target.is_dir() and any(target.iterdir()):
+            refuse(f"'{target.name}' is no longer empty and was left alone")
+        target.rmdir() if target.is_dir() else target.unlink()
         return f"Removed '{target.name}'."
     return _fn
 
 
-def _undo_write(target: Path, previous: str | None):
-    """Reverse of a write: restore the old contents, or remove a file that did
-    not exist before the write created it."""
+def _undo_write(target: Path, existed: bool, previous: bytes | None, expected):
+    """Restore bytes only if the assistant's written version is unchanged."""
     def _fn():
+        if not target.exists():
+            if not existed:
+                return f"'{target.name}' is already gone."
+            refuse(f"'{target.name}' is missing, so its previous contents cannot be restored")
+        if not unchanged(target, expected):
+            refuse(f"'{target.name}' changed after the write and was left alone")
+        if not existed:
+            target.unlink()
+            return f"Removed '{target.name}' — it did not exist before."
         if previous is None:
-            if target.exists():
-                target.unlink()
-                return f"Removed '{target.name}' — it did not exist before."
-            return f"'{target.name}' is already gone."
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(previous, encoding="utf-8")
+            refuse(f"the previous contents of '{target.name}' were not captured")
+        atomic_replace_bytes_if_unchanged(target, previous, expected)
         return f"Restored the previous contents of '{target.name}'."
     return _fn
 
@@ -86,7 +125,7 @@ def _restore_from_trash(original: Path) -> str:
                         item.InvokeVerb("UNDELETE")
                         return f"'{original.name}' restored from the Recycle Bin."
         except Exception as e:
-            print(f"[file] Recycle Bin restore failed: {e}")
+            print(f"[file] Recycle Bin restore failed ({type(e).__name__}).")
     return (f"'{original.name}' is in the Recycle Bin — I could not pull it back "
             f"automatically, but it is there and can be restored by hand.")
 
@@ -95,16 +134,67 @@ _SAFE_ROOTS: list[Path] = [
     Path.home(),
 ]
 
-def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
+def _is_safe_path(
+    target: Path, *, mutation: bool = False, recursive: bool = False
+) -> bool:
     try:
-        resolved = target.resolve()
-        return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
+        resolve_user_path(
+            target,
+            allowed_roots=_SAFE_ROOTS,
+            allow_missing=True,
+            reject_symlinks=mutation or recursive,
+            protect_ancestors=mutation or recursive,
         )
-    except Exception:
+        return True
+    except (OSError, ValueError, PathPolicyError):
         return False
+
+def _recursive_mutation_safe(root: Path) -> bool:
+    """Refuse recursive changes that would include protected data or links."""
+    if not root.is_dir():
+        return True
+    stack = [root]
+    scanned = 0
+    try:
+        while stack:
+            current = stack.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > _COPY_TREE_MAX_ENTRIES:
+                        return False
+                    child = Path(entry.path)
+                    if _entry_is_link(entry) or not _is_safe_path(child):
+                        return False
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(child)
+        return True
+    except OSError:
+        return False
+
+
+def _read_regular_bytes(path: Path, limit: int) -> tuple[bytes, FileFingerprint]:
+    """Read a small undo snapshot through a no-follow regular-file descriptor."""
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        details = os.fstat(handle.fileno())
+        if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
+            raise ValueError("snapshot target is not a regular file")
+        if details.st_size > limit:
+            raise ValueError("snapshot target exceeds the undo limit")
+        content = handle.read(limit + 1)
+        if len(content) > limit:
+            raise ValueError("snapshot target grew beyond the undo limit")
+        captured = FileFingerprint(
+            "file",
+            int(details.st_size),
+            int(details.st_mtime_ns),
+            int(getattr(details, "st_ino", 0)),
+        )
+    return content, captured
+
 
 def _get_desktop() -> Path:
     if _OS == "Linux":
@@ -159,7 +249,10 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
-    raw   = raw.strip().strip('"').strip("'")
+    raw = str(raw or "")
+    if len(raw) > 4096:
+        raise ValueError("path is too long")
+    raw = raw.strip().strip('"').strip("'")
     lower = raw.lower()
     if lower in shortcuts:
         return shortcuts[lower]
@@ -175,7 +268,12 @@ def _resolve_path(raw: str) -> Path:
         rest = rest.strip("/")
         return shortcuts[head.lower()] / rest if rest else shortcuts[head.lower()]
 
-    return Path(raw).expanduser()
+    # Preserve the lexical path so later mutation checks can detect symlink or
+    # junction components. Relative commands are still anchored to the user.
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.home() / candidate
+    return Path(os.path.abspath(candidate))
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -207,74 +305,99 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
             return f"Not a directory: {target}"
 
         items = []
-        for item in sorted(target.iterdir()):
-            if not show_hidden and item.name.startswith("."):
-                continue
-            if item.is_dir():
-                items.append(f"📁 {item.name}/")
-            else:
-                size = _format_size(item.stat().st_size)
-                items.append(f"📄 {item.name} ({size})")
+        total = 0
+        scan_capped = False
+        with os.scandir(target) as entries:
+            for scanned, entry in enumerate(entries, 1):
+                if scanned > 10_000:
+                    scan_capped = True
+                    break
+                item = Path(entry.path)
+                if not show_hidden and item.name.startswith("."):
+                    continue
+                if _entry_is_link(entry) or not _is_safe_path(item):
+                    continue
+                total += 1
+                if len(items) >= 200:
+                    continue
+                if item.is_dir():
+                    items.append(f"📁 {item.name}/")
+                else:
+                    size = _format_size(item.stat().st_size)
+                    items.append(f"📄 {item.name} ({size})")
 
         if not items:
             return f"Directory is empty: {target.name}/"
 
-        return f"Contents of {target.name}/ ({len(items)} items):\n" + "\n".join(items)
+        items.sort(key=str.casefold)
+        suffix = f"\n[Showing {len(items)} of {total} scanned items]" if total > len(items) else ""
+        if scan_capped:
+            suffix += "\n[Stopped after scanning 10,000 directory entries]"
+        count_label = f"at least {total}" if scan_capped else str(total)
+        return f"Contents of {target.name}/ ({count_label} items):\n" + "\n".join(items) + suffix
 
     except PermissionError:
         return f"Permission denied: {path}"
     except Exception as e:
-        return f"Error listing files: {e}"
+        return f"Error listing files: {type(e).__name__}"
 
 
 def create_file(path: str, name: str = "", content: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
+        text = str(content)
+        if len(text.encode("utf-8")) > _UNDO_CONTENT_LIMIT:
+            return "File content is larger than the 1 MB safety limit."
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, mutation=True):
             return f"Access denied: {target}"
+        if target.exists():
+            return f"A file or folder named '{target.name}' already exists; nothing was overwritten."
         target.parent.mkdir(parents=True, exist_ok=True)
-        existed = target.exists()
-        previous = None
-        if existed:
-            try:
-                previous = target.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                previous = None
-        target.write_text(content, encoding="utf-8")
-        push_undo(f"created {target.name}",
-                  _undo_write(target, previous) if existed else _undo_create(target))
+        atomic_create_text(target, text)
+        after = fingerprint(target)
+        push_undo(f"created {target.name}", _undo_create(target, after))
         return f"File created: {target.name}"
     except Exception as e:
-        return f"Could not create file: {e}"
+        return f"Could not create file: {type(e).__name__}"
 
 
 def create_folder(path: str, name: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, mutation=True):
             return f"Access denied: {target}"
         already = target.exists()
+        if already and not target.is_dir():
+            return f"A file named '{target.name}' already exists here."
         target.mkdir(parents=True, exist_ok=True)
         # Only offer to undo a folder we actually made. "mkdir -p" on something
         # that was already there is not a change, and undoing it would delete a
         # directory the user has had for years.
         if not already:
-            push_undo(f"created folder {target.name}", _undo_create(target))
+            push_undo(
+                f"created folder {target.name}",
+                _undo_create(target, fingerprint(target)),
+            )
         return f"Folder created: {target.name}"
     except Exception as e:
-        return f"Could not create folder: {e}"
+        return f"Could not create folder: {type(e).__name__}"
 
 
 def delete_file(path: str, name: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, mutation=True):
             return f"Access denied: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
+        if target.is_dir() and not _recursive_mutation_safe(target):
+            return (
+                "Directory deletion refused because it contains protected data, "
+                "symbolic links, unreadable entries, or too many items."
+            )
 
         # Safe-directory check — protect critical user folders
         protected = {
@@ -294,161 +417,361 @@ def delete_file(path: str, name: str = "") -> str:
     except PermissionError:
         return f"Permission denied: {path}"
     except Exception as e:
-        return f"Could not delete: {e}"
+        return f"Could not delete: {type(e).__name__}"
 
 
 def move_file(path: str, name: str = "", destination: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        src    = (base / name) if name else base
-        dst    = _resolve_path(destination) if destination else None
+        base = _resolve_path(path)
+        src = base / validate_child_name(name) if name else base
+        dst = _resolve_path(destination) if destination else None
 
         if not src.exists():
             return f"Source not found: {src.name}"
         if dst is None:
             return "No destination specified."
-        if not _is_safe_path(src):
+        if not _is_safe_path(src, mutation=True):
             return f"Access denied (source): {src}"
-        if not _is_safe_path(dst):
+        if src.is_dir() and not _recursive_mutation_safe(src):
+            return (
+                "Directory move refused because it contains protected data, "
+                "symbolic links, unreadable entries, or too many items."
+            )
+        if not _is_safe_path(dst, mutation=True):
             return f"Access denied (destination): {dst}"
 
         if dst.is_dir():
             dst = dst / src.name
+        if not _is_safe_path(dst, mutation=True):
+            return f"Access denied (destination): {dst}"
+        if dst.exists():
+            return f"Destination already exists: {dst.name}. Nothing was overwritten."
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         origin = src.resolve()
-        shutil.move(str(src), str(dst))
-        push_undo(f"moved {origin.name} to {dst.parent.name}/",
-                  _undo_move(origin, dst.resolve()))
-        return f"Moved: {src.name} → {dst.parent.name}/"
+        final = dst.resolve(strict=False)
+        move_no_replace(src, final)
+        after = fingerprint(final)
+        push_undo(
+            f"moved {origin.name} to {final.parent.name}/",
+            _undo_move(origin, final, after),
+        )
+        return f"Moved: {origin.name} → {final.parent.name}/"
 
     except Exception as e:
-        return f"Could not move: {e}"
+        return f"Could not move: {type(e).__name__}"
 
 
-def copy_file(path: str, name: str = "", destination: str = "") -> str:
+def copy_file(path: str, name: str = "", destination: str = "", cancel_event=None) -> str:
     try:
         base = _resolve_path(path)
-        src  = (base / name) if name else base
-        dst  = _resolve_path(destination) if destination else None
+        src = base / validate_child_name(name) if name else base
+        dst = _resolve_path(destination) if destination else None
 
         if not src.exists():
             return f"Source not found: {src.name}"
         if dst is None:
             return "No destination specified."
-        if not _is_safe_path(src):
+        if not _is_safe_path(src, recursive=True):
             return f"Access denied (source): {src}"
-        if not _is_safe_path(dst):
+        if not _is_safe_path(dst, mutation=True):
             return f"Access denied (destination): {dst}"
 
         if dst.is_dir():
             dst = dst / src.name
-
+        if not _is_safe_path(dst, mutation=True):
+            return f"Access denied (destination): {dst}"
+        if dst.exists():
+            return f"Destination already exists: {dst.name}. Nothing was overwritten."
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if src.is_dir():
-            shutil.copytree(str(src), str(dst))
-        else:
-            shutil.copy2(str(src), str(dst))
+            scanned = 0
+            estimated_bytes = 0
+            for current, dirs, files in os.walk(src, followlinks=False):
+                if cancel_event is not None and cancel_event.is_set():
+                    return "Directory copy was cancelled before publication."
+                for child in [*(Path(current) / name for name in dirs),
+                              *(Path(current) / name for name in files)]:
+                    scanned += 1
+                    if scanned > _COPY_TREE_MAX_ENTRIES:
+                        return (
+                            "Directory copy refused: more than "
+                            f"{_COPY_TREE_MAX_ENTRIES:,} entries."
+                        )
+                    child_stat = child.lstat()
+                    if stat.S_ISLNK(child_stat.st_mode) or _is_reparse(child_stat):
+                        return f"Directory copy refused: link or reparse point found at {child.name}."
+                    if not _is_safe_path(child):
+                        return "Directory copy refused: protected data was found in the source."
+                    if stat.S_ISREG(child_stat.st_mode):
+                        estimated_bytes += child_stat.st_size
+                        if estimated_bytes > _COPY_TREE_MAX_BYTES:
+                            return "Directory copy refused: total file size exceeds 2 GiB."
+                    elif not stat.S_ISDIR(child_stat.st_mode):
+                        return f"Directory copy refused: unsupported file type at {child.name}."
 
-        # The undo for a copy is deleting the copy — never the original.
-        _copy = dst.resolve()
+            # Build out of sight and publish with a no-replace rename. This
+            # prevents failed/racing copies from exposing a partial tree.
+            staging = dst.parent / f".{dst.name}.copying-{secrets.token_hex(6)}"
+            copied_bytes = 0
+
+            def _bounded_copy(source_name, destination_name):
+                nonlocal copied_bytes
+                source_path = Path(source_name)
+                destination_path = Path(destination_name)
+                flags = (
+                    os.O_RDONLY
+                    | int(getattr(os, "O_BINARY", 0))
+                    | int(getattr(os, "O_NONBLOCK", 0))
+                )
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                if not _is_safe_path(source_path, mutation=True):
+                    raise OSError("source changed to a link or protected path")
+                descriptor = os.open(source_path, flags)
+                try:
+                    opened_details = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened_details.st_mode) or _is_reparse(opened_details):
+                        raise OSError("source changed to an unsupported file type")
+                    source_file = os.fdopen(descriptor, "rb")
+                    descriptor = -1
+                    with source_file, destination_path.open("xb") as output:
+                        while True:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise InterruptedError("directory copy was cancelled")
+                            chunk = source_file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            copied_bytes += len(chunk)
+                            if copied_bytes > _COPY_TREE_MAX_BYTES:
+                                raise OSError("directory grew beyond the 2 GiB copy limit")
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    shutil.copystat(source_path, destination_path, follow_symlinks=False)
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                return str(destination_path)
+
+            try:
+                shutil.copytree(
+                    str(src), str(staging), symlinks=True,
+                    copy_function=_bounded_copy,
+                )
+                for current, dirs, files in os.walk(staging, followlinks=False):
+                    if any((Path(current) / name).is_symlink() for name in [*dirs, *files]):
+                        raise OSError("source changed during copy and introduced a symbolic link")
+                move_no_replace(staging, dst)
+            except Exception:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            return (
+                f"Copied: {src.name} → {dst.parent.name}/. Directory copies are "
+                "not auto-deleted by undo because their contents may change."
+            )
+
+        created_destination = False
+        try:
+            source_flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+            if hasattr(os, "O_NOFOLLOW"):
+                source_flags |= os.O_NOFOLLOW
+            source_descriptor = os.open(src, source_flags)
+            source_details = os.fstat(source_descriptor)
+            if not stat.S_ISREG(source_details.st_mode) or _is_reparse(source_details):
+                os.close(source_descriptor)
+                raise OSError("source is not a regular file")
+            if source_details.st_size > _COPY_TREE_MAX_BYTES:
+                os.close(source_descriptor)
+                raise OSError("file copy refused: source exceeds 2 GiB")
+            with os.fdopen(source_descriptor, "rb") as source:
+                output = dst.open("xb")
+                created_destination = True
+                copied_bytes = 0
+                with output:
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise InterruptedError("file copy was cancelled")
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        copied_bytes += len(chunk)
+                        if copied_bytes > _COPY_TREE_MAX_BYTES:
+                            raise OSError("file grew beyond the 2 GiB copy limit")
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            try:
+                shutil.copystat(src, dst, follow_symlinks=False)
+            except OSError:
+                pass
+        except Exception:
+            if created_destination:
+                dst.unlink(missing_ok=True)
+            raise
+        copied = dst.resolve()
+        expected = fingerprint(copied)
+
         def _undo_copy():
-            if not _copy.exists():
-                return f"The copy '{_copy.name}' is already gone."
-            if _copy.is_dir():
-                shutil.rmtree(_copy)
-            else:
-                _copy.unlink()
-            return f"Removed the copy in {_copy.parent.name}/."
-        push_undo(f"copied {src.name} to {dst.parent.name}/", _undo_copy)
+            if not copied.exists():
+                return f"The copy '{copied.name}' is already gone."
+            if not unchanged(copied, expected):
+                refuse(f"the copy '{copied.name}' changed and was left alone")
+            copied.unlink()
+            return f"Removed the copy in {copied.parent.name}/."
 
+        push_undo(f"copied {src.name} to {dst.parent.name}/", _undo_copy)
         return f"Copied: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
-        return f"Could not copy: {e}"
+        return f"Could not copy: {type(e).__name__}"
 
 
 def rename_file(path: str, name: str = "", new_name: str = "") -> str:
     try:
-        base     = _resolve_path(path)
-        target   = (base / name) if name else base
-        if not _is_safe_path(target):
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, mutation=True):
             return f"Access denied: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
-        if not new_name:
-            return "No new name provided."
+        if target.is_dir() and not _recursive_mutation_safe(target):
+            return (
+                "Directory rename refused because it contains protected data, "
+                "symbolic links, unreadable entries, or too many items."
+            )
 
-        new_path = target.parent / new_name
+        clean_name = validate_child_name(new_name)
+        new_path = target.parent / clean_name
+        if not _is_safe_path(new_path, mutation=True):
+            return f"Access denied: {new_path}"
         if new_path.exists():
-            return f"A file named '{new_name}' already exists here."
+            return f"A file named '{clean_name}' already exists here."
 
         old_path = target.resolve()
-        target.rename(new_path)
-        push_undo(f"renamed {old_path.name} to {new_name}",
-                  _undo_move(old_path, new_path.resolve()))
-        return f"Renamed: {target.name} → {new_name}"
+        move_no_replace(target, new_path)
+        final = new_path.resolve()
+        push_undo(
+            f"renamed {old_path.name} to {clean_name}",
+            _undo_move(old_path, final, fingerprint(final)),
+        )
+        return f"Renamed: {old_path.name} → {clean_name}"
 
     except Exception as e:
-        return f"Could not rename: {e}"
+        return f"Could not rename: {type(e).__name__}"
 
 
 def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, recursive=True):
             return f"Access denied: {target}"
         if not target.exists():
             return f"File not found: {target.name}"
         if not target.is_file():
             return f"Not a file: {target.name}"
 
-        content = target.read_text(encoding="utf-8", errors="ignore")
-        if len(content) > max_chars:
-            content = content[:max_chars] + f"\n\n[Truncated — {len(content)} total chars]"
+        limit = max(1, min(int(max_chars), 20_000))
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NONBLOCK", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(target, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace") as handle:
+            opened_details = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_details.st_mode) or _is_reparse(opened_details):
+                raise ValueError("read target is not a regular file")
+            content = handle.read(limit + 1)
+        if len(content) > limit:
+            content = content[:limit] + "\n\n[Truncated — file is larger than the preview limit]"
         return content
 
     except Exception as e:
-        return f"Could not read file: {e}"
+        return f"Could not read file: {type(e).__name__}"
 
 
 def write_file(path: str, name: str = "", content: str = "",
-               append: bool = False) -> str:
+               append: bool = False, overwrite: bool = False) -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
+        if not _is_safe_path(target, mutation=True):
             return f"Access denied: {target}"
+        if target.exists() and not target.is_file():
+            return f"Not a file: {target.name}"
+        existed = target.exists()
+        if existed and not append and not overwrite:
+            return (
+                f"'{target.name}' already exists. Use append or explicitly request "
+                "an overwrite; nothing was changed."
+            )
+        text = str(content)
+        if len(text.encode("utf-8")) > _UNDO_CONTENT_LIMIT:
+            return "Write content is larger than the 1 MB safety limit."
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        # Snapshot before writing. None means "did not exist", which is a
-        # different undo (delete it) from "existed and had this in it".
-        previous: str | None = None
-        undoable = True
-        if target.exists():
+        if append and existed:
+            flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(target, flags)
+            with os.fdopen(descriptor, "ab") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
+                    raise ValueError("append target is not a regular file")
+                before_size = int(info.st_size)
+                handle.write(text.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            expected = fingerprint(target)
+
+            def undo_append():
+                if not target.exists() or not unchanged(target, expected):
+                    refuse(f"'{target.name}' changed after the append and was left alone")
+                flags = os.O_RDWR | int(getattr(os, "O_BINARY", 0))
+                flags |= int(getattr(os, "O_NOFOLLOW", 0))
+                descriptor = os.open(target, flags)
+                with os.fdopen(descriptor, "r+b") as handle:
+                    details = os.fstat(handle.fileno())
+                    current = (
+                        "file" if stat.S_ISREG(details.st_mode) and not _is_reparse(details) else "other",
+                        int(details.st_size),
+                        int(details.st_mtime_ns),
+                        int(getattr(details, "st_ino", 0)),
+                    )
+                    wanted = (
+                        expected.kind,
+                        expected.size,
+                        expected.modified_ns,
+                        expected.inode,
+                    )
+                    if current != wanted:
+                        refuse(f"'{target.name}' changed during undo and was left alone")
+                    handle.truncate(before_size)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                return f"Removed the text appended to '{target.name}'."
+
+            push_undo(f"appended to {target.name}", undo_append)
+            return f"Appended to: {target.name}"
+
+        if existed:
             try:
-                if target.stat().st_size > _UNDO_CONTENT_LIMIT:
-                    undoable = False       # too large to hold in memory
-                else:
-                    previous = target.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                undoable = False           # binary, locked, unreadable
-
-        mode = "a" if append else "w"
-        with open(target, mode, encoding="utf-8") as f:
-            f.write(content)
-
-        action = "Appended to" if append else "Written to"
-        if undoable:
-            push_undo(f"wrote to {target.name}", _undo_write(target, previous))
-            return f"{action}: {target.name}"
-        return (f"{action}: {target.name}. "
-                f"(Too large to keep a copy of the old contents, so this one "
-                f"cannot be undone.)")
+                previous, before = _read_regular_bytes(target, _UNDO_CONTENT_LIMIT)
+            except (OSError, ValueError):
+                return f"'{target.name}' changed or could not be snapshotted safely."
+            atomic_replace_text_if_unchanged(target, text, before)
+        else:
+            previous, before = None, None
+            atomic_create_text(target, text)
+        expected = fingerprint(target)
+        push_undo(
+            f"wrote to {target.name}",
+            _undo_write(target, existed, previous, expected),
+        )
+        return f"Written to: {target.name}"
     except Exception as e:
-        return f"Could not write file: {e}"
+        return f"Could not write file: {type(e).__name__}"
 
 
 def find_files(name: str = "", extension: str = "",
@@ -457,11 +780,11 @@ def find_files(name: str = "", extension: str = "",
         matches = explorer.search(name, root=path, extension=extension, limit=max_results)
         return explorer.format_matches(matches, name or extension or "files")
     except Exception as exc:
-        return f"Search error: {exc}"
+        return f"Search error: {type(exc).__name__}"
 
 
 def get_largest_files(path: str = "downloads", count: int = 10) -> str:
-    count = min(count, 50)  # maksimum 50
+    count = max(1, min(int(count), 50))
     try:
         search_path = _resolve_path(path)
         if not _is_safe_path(search_path):
@@ -469,16 +792,27 @@ def get_largest_files(path: str = "downloads", count: int = 10) -> str:
         if not search_path.exists():
             return f"Path not found: {path}"
 
-        files = []
+        deadline = time.monotonic() + 10.0
+        heap: list[tuple[int, str, Path]] = []
+        scanned = 0
+        timed_out = False
         for item in search_path.rglob("*"):
-            if item.is_file():
-                try:
-                    files.append((item.stat().st_size, item))
-                except Exception:
-                    continue
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            if _path_is_link(item) or not item.is_file() or not _is_safe_path(item):
+                continue
+            try:
+                entry = (item.stat().st_size, str(item).casefold(), item)
+                scanned += 1
+                if len(heap) < count:
+                    heapq.heappush(heap, entry)
+                elif entry[:2] > heap[0][:2]:
+                    heapq.heapreplace(heap, entry)
+            except OSError:
+                continue
 
-        files.sort(reverse=True)
-        top = files[:count]
+        top = [(size, item) for size, _key, item in sorted(heap, reverse=True)]
 
         if not top:
             return "No files found."
@@ -486,17 +820,21 @@ def get_largest_files(path: str = "downloads", count: int = 10) -> str:
         lines = [f"Top {len(top)} largest files in {search_path.name}/:"]
         for size, f in top:
             lines.append(f"  {_format_size(size):>10}  {f.name}  ({f.parent})")
+        if timed_out:
+            lines.append(f"[Stopped after 10 seconds; scanned {scanned} files.]")
 
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error: {type(e).__name__}"
 
 
 def get_disk_usage(path: str = "home") -> str:
     try:
         target = _resolve_path(path)
-        usage  = shutil.disk_usage(target)
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        usage = shutil.disk_usage(target)
         pct    = usage.used / usage.total * 100
         return (
             f"Disk usage ({target}):\n"
@@ -505,96 +843,112 @@ def get_disk_usage(path: str = "home") -> str:
             f"  Free  : {_format_size(usage.free)}"
         )
     except Exception as e:
-        return f"Could not get disk usage: {e}"
+        return f"Could not get disk usage: {type(e).__name__}"
 
 
 def organize_desktop() -> str:
     type_map = {
-        "Images":    {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".heic"},
-        "Documents": {".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx",
-                      ".ppt", ".pptx", ".csv", ".odt", ".ods", ".odp"},
-        "Videos":    {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"},
-        "Music":     {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"},
-        "Archives":  {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
-        "Code":      {".py", ".js", ".ts", ".html", ".css", ".json", ".xml",
-                      ".cpp", ".java", ".cs", ".go", ".rs", ".sh"},
+        "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".heic"},
+        "Documents": {".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".odt", ".ods", ".odp"},
+        "Videos": {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"},
+        "Music": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"},
+        "Archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
+        "Code": {".py", ".js", ".ts", ".html", ".css", ".json", ".xml", ".cpp", ".java", ".cs", ".go", ".rs", ".sh"},
     }
 
-    desktop = _get_desktop()
-    moved, skipped = [], []
-    journal: list[tuple[Path, Path]] = []   # (where it was, where it went)
+    desktop = _get_desktop().resolve(strict=False)
+    if not _is_safe_path(desktop, mutation=True) or not desktop.is_dir():
+        return f"Could not organize desktop: unavailable or outside the safe file roots ({desktop})."
+
+    moved: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    journal: list[tuple[Path, Path, object]] = []
 
     try:
-        for item in desktop.iterdir():
-            # Leave folders, hidden files and organize-folders untouched
-            if item.is_dir() or item.name.startswith("."):
-                continue
-            if item.name in {k for k in type_map}:
-                continue
+        candidates = []
+        for index, candidate in enumerate(desktop.iterdir(), 1):
+            if index > 500:
+                return (
+                    "Desktop has more than 500 entries; organize was refused "
+                    "to keep the operation reviewable."
+                )
+            candidates.append(candidate)
+    except OSError as exc:
+        return f"Could not organize desktop: {type(exc).__name__}"
 
-            ext        = item.suffix.lower()
-            target_dir = desktop / "Others"
-            for folder, exts in type_map.items():
-                if ext in exts:
-                    target_dir = desktop / folder
-                    break
-
-            target_dir.mkdir(exist_ok=True)
+    for item in candidates:
+        try:
+            if _path_is_link(item) or item.is_dir() or item.name.startswith("."):
+                continue
+            target_folder = next(
+                (folder for folder, extensions in type_map.items() if item.suffix.lower() in extensions),
+                "Others",
+            )
+            target_dir = desktop / target_folder
             new_path = target_dir / item.name
-
+            if not _is_safe_path(new_path, mutation=True):
+                errors.append(f"{item.name}: unsafe destination")
+                continue
             if new_path.exists():
                 skipped.append(item.name)
                 continue
-
+            target_dir.mkdir(exist_ok=True)
             origin = item.resolve()
-            shutil.move(str(item), str(new_path))
-            journal.append((origin, new_path.resolve()))
+            move_no_replace(item, new_path)
+            final = new_path.resolve()
+            journal.append((origin, final, fingerprint(final)))
             moved.append(f"{item.name} → {target_dir.name}/")
+        except Exception as exc:
+            errors.append(f"{item.name}: {type(exc).__name__}")
 
-        # One command, dozens of moves — so one undo that reverses all of them.
-        # Without this, "organize my desktop" is the single least reversible
-        # thing the assistant can do to a person's files, and it was completely
-        # ungated.
-        if journal:
-            def _undo_organize(entries=tuple(journal)):
-                restored = 0
-                for origin, moved_to in entries:
-                    try:
-                        if moved_to.exists():
-                            origin.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(moved_to), str(origin))
-                            restored += 1
-                    except Exception as e:
-                        print(f"[file] undo organize: {moved_to.name}: {e}")
-                # Clear away the folders we created, but only while they are
-                # empty — anything the user put in since stays.
-                for folder in {m.parent for _o, m in entries}:
-                    try:
-                        if folder.exists() and folder.is_dir() and not any(folder.iterdir()):
-                            folder.rmdir()
-                    except Exception:
-                        pass
-                return f"{restored} file(s) put back on the desktop."
-            push_undo(f"organized the desktop ({len(journal)} files)", _undo_organize)
+    if journal:
+        def undo_organize(entries=tuple(journal)):
+            restored = 0
+            refused = 0
+            for origin, moved_to, expected in reversed(entries):
+                try:
+                    if not moved_to.exists():
+                        continue
+                    if origin.exists() or not unchanged(moved_to, expected):
+                        refused += 1
+                        continue
+                    move_no_replace(moved_to, origin)
+                    restored += 1
+                except Exception as exc:
+                    refused += 1
+                    print(f"[file] undo organize conflict ({type(exc).__name__}).")
+            for folder in {moved.parent for _origin, moved, _expected in entries}:
+                try:
+                    if folder.is_dir() and not any(folder.iterdir()):
+                        folder.rmdir()
+                except OSError:
+                    pass
+            if refused:
+                refuse(
+                    f"{restored} file(s) were restored, but {refused} changed or "
+                    "conflicting file(s) were left alone"
+                )
+            return f"{restored} file(s) put back on the desktop."
 
-        result = f"Desktop organized: {len(moved)} files moved."
-        if moved:
-            preview = moved[:8]
-            result += "\n" + "\n".join(preview)
-            if len(moved) > 8:
-                result += f"\n... and {len(moved) - 8} more."
-        if skipped:
-            result += f"\n{len(skipped)} file(s) skipped (name conflict)."
-        return result
+        push_undo(f"organized the desktop ({len(journal)} files)", undo_organize)
 
-    except Exception as e:
-        return f"Could not organize desktop: {e}"
+    result = f"Desktop organized: {len(moved)} files moved."
+    if moved:
+        result += "\n" + "\n".join(moved[:8])
+        if len(moved) > 8:
+            result += f"\n... and {len(moved) - 8} more."
+    if skipped:
+        result += f"\n{len(skipped)} file(s) skipped (name conflict)."
+    if errors:
+        result += f"\n{len(errors)} file(s) failed and were left in place: " + "; ".join(errors[:3])
+    return result
 
 
 def get_file_info(path: str, name: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
+        base = _resolve_path(path)
+        target = base / validate_child_name(name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
@@ -613,7 +967,7 @@ def get_file_info(path: str, name: str = "") -> str:
         return "\n".join(f"  {k}: {v}" for k, v in info.items())
 
     except Exception as e:
-        return f"Could not get file info: {e}"
+        return f"Could not get file info: {type(e).__name__}"
 
 def open_explorer(
     path: str = "home",
@@ -621,9 +975,18 @@ def open_explorer(
     select: bool = False,
     match_index: int | None = None,
 ) -> str:
-    target = explorer.resolve_location(path)
+    try:
+        target = _resolve_path(path)
+    except (OSError, ValueError, PathPolicyError) as exc:
+        return f"Access denied: {type(exc).__name__}"
+    if not _is_safe_path(target):
+        return f"Access denied: {target}"
     if name:
-        candidate = target / name
+        try:
+            clean_name = validate_child_name(name)
+        except ValueError as exc:
+            return f"Invalid file name: {type(exc).__name__}"
+        candidate = target / clean_name
         if candidate.exists():
             target = candidate
         else:
@@ -641,7 +1004,22 @@ def open_explorer(
     except FileNotFoundError:
         return f"Explorer is not available on this operating system."
     except Exception as exc:
-        return f"Could not open Explorer: {exc}"
+        return f"Could not open Explorer: {type(exc).__name__}"
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off", ""}:
+        return False
+    raise ValueError("boolean value must be true or false")
 
 
 def file_controller(
@@ -649,11 +1027,12 @@ def file_controller(
     response=None,
     player=None,
     session_memory=None,
+    cancel_event=None,
 ) -> str:
-    params = parameters or {}
-    action = params.get("action", "").lower().strip()
-    path   = params.get("path") or ("home" if action == "find" else "desktop")
-    name   = params.get("name", "")
+    params = parameters if isinstance(parameters, dict) else {}
+    action = str(params.get("action") or "").lower().strip()
+    path = str(params.get("path") or ("home" if action == "find" else "desktop"))
+    name = str(params.get("name") or "")
     match_index = params.get("match_index")
     if match_index is not None:
         try:
@@ -662,7 +1041,7 @@ def file_controller(
             return "The Explorer candidate number must be an integer."
 
     if player:
-        player.write_log(f"[file] {action} {name or path}")
+        player.write_log(f"[file] {action} requested")
 
     try:
         if action in {"open", "open_folder", "explorer"}:
@@ -687,7 +1066,12 @@ def file_controller(
             return move_file(path, name=name, destination=params.get("destination", ""))
 
         elif action == "copy":
-            return copy_file(path, name=name, destination=params.get("destination", ""))
+            return copy_file(
+                path,
+                name=name,
+                destination=params.get("destination", ""),
+                cancel_event=cancel_event,
+            )
 
         elif action == "rename":
             return rename_file(path, name=name, new_name=params.get("new_name", ""))
@@ -697,9 +1081,11 @@ def file_controller(
 
         elif action == "write":
             return write_file(
-                path, name=name,
+                path,
+                name=name,
                 content=params.get("content", ""),
-                append=params.get("append", False)
+                append=_as_bool(params.get("append", False)),
+                overwrite=_as_bool(params.get("overwrite", False)),
             )
 
         elif action == "find":
@@ -733,7 +1119,7 @@ def file_controller(
             return f"Unknown action: '{action}'"
 
     except Exception as e:
-        return f"File controller error ({action}): {e}"
+        return f"File controller error ({action}): {type(e).__name__}"
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
@@ -745,42 +1131,64 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
+                "enum": ["open", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "organize_desktop", "info"],
+                "maxLength": 32,
                 "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
             },
             "path": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "File/folder path or shortcut: desktop, downloads, documents, home"
             },
             "destination": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "Destination path for move/copy"
             },
             "new_name": {
                 "type": "STRING",
+                "maxLength": 255,
                 "description": "New name for rename"
             },
             "content": {
                 "type": "STRING",
+                "maxLength": 900000,
                 "description": "Content for create_file/write"
+            },
+            "append": {
+                "type": "BOOLEAN",
+                "description": "Append to an existing file instead of replacing it."
+            },
+            "overwrite": {
+                "type": "BOOLEAN",
+                "description": "Explicitly replace an existing file. Existing writes require confirmation."
             },
             "name": {
                 "type": "STRING",
+                "maxLength": 255,
                 "description": "Exact file name, file query, or file name to reveal in Explorer"
             },
             "extension": {
                 "type": "STRING",
+                "maxLength": 32,
                 "description": "File extension to search (e.g. .pdf)"
             },
             "count": {
                 "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 50,
                 "description": "Number of results for largest"
             },
             "max_results": {
                 "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 50,
                 "description": "Maximum number of search candidates (1-50)"
             },
             "match_index": {
                 "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 50,
                 "description": "1-based candidate number to open or select after a search returned multiple matches"
             }
         },
@@ -789,6 +1197,6 @@ TOOL = {
         ]
     },
     "handler": file_controller,
-    "confirmation_actions": ["delete"],
+    "confirmation_actions": ["delete", "write", "organize_desktop"],
     "undoable": True,
 }

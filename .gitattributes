@@ -1,0 +1,2 @@
+# Integrity-pinned vendor assets must keep byte-for-byte contents on every OS.
+dashboard/static/crypto-js.min.js -text

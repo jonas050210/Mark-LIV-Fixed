@@ -8,15 +8,25 @@ toggling a plugin does not require restarting the app or re-importing anything.
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import inspect
+import math
+import os
 import re
+import stat
 import sys
-import traceback
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.action_loader import (
+    ParameterValidationError,
+    validate_parameters,
+    validate_parameter_schema,
+)
+from core.action_result import ActionResult
 from memory.config_manager import get_plugin_enabled, get_plugin_config
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
@@ -27,6 +37,7 @@ _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
 # core/action_loader.py for what each value means.
 _BEHAVIORS = ("BLOCKING", "NON_BLOCKING")
 _SCHEDULING = ("WHEN_IDLE", "SILENT", "INTERRUPT")
+_PLUGIN_RUN_SLOTS = threading.BoundedSemaphore(8)
 
 
 def _opt_upper(value, allowed: tuple[str, ...]) -> Optional[str]:
@@ -69,7 +80,7 @@ class PluginRegistry:
                 decl = {
                     "name": rec.name,
                     "description": rec.description,
-                    "parameters": rec.parameters,
+                    "parameters": copy.deepcopy(rec.parameters),
                 }
                 if rec.behavior:
                     decl["behavior"] = rec.behavior
@@ -89,21 +100,72 @@ class PluginRegistry:
         return rec.timeout_seconds if rec else 60.0
 
     # -- called by main.py from _execute_tool's else branch --
-    def run(self, name: str, parameters: dict, player=None, session_memory=None,
-            cancel_event=None, action_id=None) -> str:
+    def execute(self, name: str, parameters: dict, player=None, session_memory=None,
+                cancel_event=None, action_id=None) -> ActionResult:
         rec = self._plugins.get(name)
         if rec is None or not rec.valid:
-            return f"Plugin '{name}' is not available."
+            return ActionResult.failure(
+                name, f"Plugin '{name}' is not available.", status="unavailable"
+            )
         if not get_plugin_enabled(name):
-            return f"The '{name}' plugin is currently disabled."
+            return ActionResult.failure(
+                name, f"The '{name}' plugin is currently disabled.", status="disabled"
+            )
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            return ActionResult.failure(
+                name,
+                f"Invalid parameters for plugin '{name}': expected an object.",
+                status="invalid_parameters",
+            )
         try:
-            return _call_run(rec.run, parameters, player, session_memory,
-                             cancel_event=cancel_event, action_id=action_id) or "Done."
-        except Exception as e:
-            self._logger(f"Plugin '{name}' crashed during run(): {e}")
+            parameters = copy.deepcopy(parameters)
+            for key in ("confirmed", "confirmation", "confirmation_bypass"):
+                parameters.pop(key, None)
+            validate_parameters(parameters, rec.parameters)
+        except (ParameterValidationError, TypeError, ValueError) as exc:
+            return ActionResult.failure(
+                name,
+                f"Invalid parameters for plugin '{name}': {exc}",
+                error=str(exc),
+                status="invalid_parameters",
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            return ActionResult.failure(
+                name, f"Plugin '{name}' was cancelled.", status="cancelled"
+            )
+        run_slots = _PLUGIN_RUN_SLOTS
+        if not run_slots.acquire(blocking=False):
+            return ActionResult.failure(
+                name,
+                "Plugin worker capacity is busy; wait for existing plugins to finish.",
+                status="busy",
+            )
+        try:
+            value = _call_run(
+                rec.run, parameters, player, session_memory,
+                cancel_event=cancel_event, action_id=action_id,
+            )
+            return ActionResult.from_handler(name, value)
+        except Exception as exc:
+            self._logger(f"Plugin '{name}' crashed during run ({type(exc).__name__}).")
             self._notify(f"Plugin '{name}' failed — see the console for details.")
-            traceback.print_exc()
-            return f"Sir, the '{name}' plugin failed: {e}"
+            return ActionResult.failure(
+                name,
+                f"Plugin '{name}' failed ({type(exc).__name__}).",
+                error=type(exc).__name__,
+            )
+        finally:
+            run_slots.release()
+
+    def run(self, name: str, parameters: dict, player=None, session_memory=None,
+            cancel_event=None, action_id=None) -> str:
+        """Compatibility text wrapper for older callers."""
+        return self.execute(
+            name, parameters, player, session_memory,
+            cancel_event=cancel_event, action_id=action_id,
+        ).as_text()
 
     # -- called by ui.py's settings tab to render per-plugin config forms --
     def settings_schemas(self) -> list[dict]:
@@ -177,14 +239,23 @@ def _validate(module, filename: str) -> PluginRecord:
                                    "(letters/digits/underscore, must start with letter/underscore).")
 
     description = plugin_meta.get("description")
-    if not isinstance(description, str) or not description.strip():
+    if (
+        not isinstance(description, str) or not description.strip()
+        or len(description) > 4_000
+        or any(ord(char) < 32 and char not in "\n\t" for char in description)
+    ):
         return PluginRecord(name=name, file=filename,
-                             error="PLUGIN['description'] missing or empty.")
+                             error="PLUGIN['description'] must be non-empty bounded text.")
 
     parameters = plugin_meta.get("parameters", _DEFAULT_PARAMS)
     if not isinstance(parameters, dict) or parameters.get("type") != "OBJECT":
         return PluginRecord(name=name, file=filename,
                              error="PLUGIN['parameters'] must be a dict with \"type\": \"OBJECT\".")
+    try:
+        validate_parameter_schema(parameters)
+    except (TypeError, ValueError) as exc:
+        return PluginRecord(name=name, file=filename,
+                             error=f"Invalid PLUGIN parameter schema: {exc}")
 
     run_fn = getattr(module, "run", None)
     if not callable(run_fn):
@@ -197,14 +268,25 @@ def _validate(module, filename: str) -> PluginRecord:
     if not (isinstance(settings, dict) and isinstance(settings.get("fields"), list)):
         settings = None
 
+    behavior = _opt_upper(plugin_meta.get("behavior"), _BEHAVIORS)
+    scheduling = _opt_upper(plugin_meta.get("scheduling"), _SCHEDULING)
+    if "behavior" in plugin_meta and behavior is None:
+        return PluginRecord(name=name, file=filename, error="PLUGIN['behavior'] is invalid.")
+    if "scheduling" in plugin_meta and scheduling is None:
+        return PluginRecord(name=name, file=filename, error="PLUGIN['scheduling'] is invalid.")
     try:
-        timeout_seconds = max(1.0, min(float(plugin_meta.get("timeout_seconds", 60.0)), 900.0))
+        timeout_raw = plugin_meta.get("timeout_seconds", 60.0)
+        if isinstance(timeout_raw, bool):
+            raise ValueError
+        timeout_seconds = float(timeout_raw)
+        if not math.isfinite(timeout_seconds) or not 1.0 <= timeout_seconds <= 900.0:
+            raise ValueError
     except (TypeError, ValueError):
-        timeout_seconds = 60.0
-    return PluginRecord(name=name, description=description.strip(), parameters=parameters,
+        return PluginRecord(name=name, file=filename,
+                            error="PLUGIN['timeout_seconds'] must be between 1 and 900.")
+    return PluginRecord(name=name, description=description.strip(), parameters=copy.deepcopy(parameters),
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
-                         behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
-                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
+                         behavior=behavior, scheduling=scheduling,
                          timeout_seconds=timeout_seconds)
 
 
@@ -221,17 +303,97 @@ def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:
     thirty-second fix. Nothing here is specific to any plugin: the helper's name
     comes from the exception itself.
     """
+    if isinstance(exc, PermissionError):
+        message = str(exc)
+        safe_policy_prefixes = (
+            "plugins directory is writable by other users",
+            "plugin file is writable by other users",
+            "plugins directory is not owned by the current user or system administrator",
+            "plugin file is not owned by the current user or system administrator",
+            "plugins directory must be a regular directory",
+            "plugin files must be regular files",
+            "plugin file exceeds the 2 MB source limit",
+            "plugin source changed during validation",
+            "plugin source permissions changed during validation",
+        )
+        if message.startswith(safe_policy_prefixes):
+            return message
+        return "Plugin source could not be opened safely (PermissionError)."
     if isinstance(exc, ModuleNotFoundError):
         missing = (getattr(exc, "name", "") or "").split(".")
-        if len(missing) == 2 and missing[0] == "plugins" and missing[1].startswith("_"):
+        if (
+            len(missing) == 2
+            and missing[0] == "plugins"
+            and re.fullmatch(r"_[A-Za-z0-9_]{0,63}", missing[1] or "")
+        ):
             helper = missing[1] + ".py"
             return (f"Needs the shared file '{helper}', which is not in "
                     f"{plugins_dir.name}/. It comes with this plugin — download "
                     f"'{helper}' into the same folder as {path.name} and restart.")
-        if missing and missing[0] not in ("plugins",):
+        if (
+            missing
+            and missing[0] != "plugins"
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", missing[0] or "")
+        ):
             return (f"Needs a package that is not installed: "
                     f"pip install {missing[0]}")
-    return f"Failed to load: {exc}"
+    return f"Failed to load ({type(exc).__name__}). See the console for details."
+
+
+def _is_reparse_point(details) -> bool:
+    return bool(int(getattr(details, "st_file_attributes", 0)) & 0x400)
+
+
+def _trusted_plugin_source(path: Path, plugins_dir: Path) -> str:
+    """Read one trusted regular plugin through a bounded, no-follow descriptor."""
+    directory_details = plugins_dir.lstat()
+    if (
+        plugins_dir.is_symlink()
+        or _is_reparse_point(directory_details)
+        or not stat.S_ISDIR(directory_details.st_mode)
+    ):
+        raise PermissionError("plugins directory must be a regular directory")
+    if os.name != "nt":
+        if directory_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError("plugins directory is writable by other users")
+        if hasattr(os, "getuid") and directory_details.st_uid not in {0, os.getuid()}:
+            raise PermissionError("plugins directory is not owned by the current user or system administrator")
+
+    details = path.lstat()
+    if path.is_symlink() or _is_reparse_point(details) or not stat.S_ISREG(details.st_mode):
+        raise PermissionError("plugin files must be regular files, not links")
+    if details.st_size > 2_000_000:
+        raise PermissionError("plugin file exceeds the 2 MB source limit")
+    if os.name != "nt":
+        if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError(
+                "plugin file is writable by other users; use permissions 0644 or stricter"
+            )
+        if hasattr(os, "getuid") and details.st_uid not in {0, os.getuid()}:
+            raise PermissionError("plugin file is not owned by the current user or system administrator")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_point(opened)
+            or opened.st_size > 2_000_000
+        ):
+            raise PermissionError("plugin source changed during validation")
+        if os.name != "nt" and (
+            opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (hasattr(os, "getuid") and opened.st_uid not in {0, os.getuid()})
+        ):
+            raise PermissionError("plugin source permissions changed during validation")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read(2_000_001)
+    finally:
+        os.close(descriptor)
+    if len(content) > 2_000_000:
+        raise PermissionError("plugin file exceeds the 2 MB source limit")
+    return content.decode("utf-8-sig")
 
 
 def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
@@ -253,6 +415,7 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
         if path.name.startswith("_"):
             continue
         try:
+            source = _trusted_plugin_source(path, plugins_dir)
             module_name = f"plugins.{path.stem}"
             spec = importlib.util.spec_from_file_location(module_name, path)
             if spec is None or spec.loader is None:
@@ -260,7 +423,8 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             try:
-                spec.loader.exec_module(module)
+                code = compile(source, str(path), "exec", dont_inherit=True)
+                exec(code, module.__dict__)
             except Exception:
                 sys.modules.pop(module_name, None)
                 raise
@@ -278,7 +442,6 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
         except Exception as e:
             rec = PluginRecord(name=path.stem, file=path.name,
                                 error=_load_error(path, plugins_dir, e))
-            traceback.print_exc()
 
         all_records.append(rec)
         if rec.valid:

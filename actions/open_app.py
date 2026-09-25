@@ -94,7 +94,7 @@ def _launch_windows(app_name: str) -> bool:
             time.sleep(1.5)
             return True
         except Exception as e:
-            print(f"[open_app] subprocess failed: {e}")
+            print(f"[open_app] subprocess launch failed ({type(e).__name__}).")
 
     if ":" in app_name:
         # URI launch without a shell: never interpolate model text into cmd.exe.
@@ -117,7 +117,7 @@ def _launch_windows(app_name: str) -> bool:
         time.sleep(2.5)
         return True
     except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
+        print(f"[open_app] Start Menu search failed ({type(e).__name__}).")
 
     return False
 
@@ -169,7 +169,7 @@ def _launch_macos(app_name: str) -> bool:
         time.sleep(1.5)
         return True
     except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
+        print(f"[open_app] Spotlight launch failed ({type(e).__name__}).")
 
     return False
 
@@ -211,11 +211,12 @@ def _launch_linux(app_name: str) -> bool:
             pass
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["xdg-open", app_name],
             capture_output=True, timeout=5
         )
-        return True
+        if result.returncode == 0:
+            return True
     except Exception:
         pass
 
@@ -257,7 +258,7 @@ def _matching_windows(requested: str, normalized: str):
         from core.window_manager import list_windows
         windows = list_windows()
     except Exception as exc:
-        print(f"[open_app] window detection unavailable: {exc}")
+        print(f"[open_app] window detection unavailable ({type(exc).__name__}).")
         return []
 
     requested_text = _normalised_window_text(requested)
@@ -286,7 +287,7 @@ def _focus_window(window) -> bool:
         operate(window, "focus")
         return True
     except Exception as exc:
-        print(f"[open_app] could not focus existing window: {exc}")
+        print(f"[open_app] could not focus existing window ({type(exc).__name__}).")
         return False
 
 
@@ -343,8 +344,10 @@ def _opposite_monitor(window):
 
 
 def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
-    if bool(parameters.get("new_instance") or parameters.get("second_instance") or
-            parameters.get("another_instance")):
+    if any(
+        parameters.get(key) is True
+        for key in ("new_instance", "second_instance", "another_instance")
+    ):
         return True
     text = _normalised_window_text(app_name)
     phrases = (
@@ -368,8 +371,8 @@ def open_app(
     player=None,
     session_memory=None,
 ) -> str:
-    parameters = parameters or {}
-    app_name = str(parameters.get("app_name", "")).strip()
+    parameters = parameters if isinstance(parameters, dict) else {}
+    app_name = str(parameters.get("app_name", ""))[:160].strip()
 
     if not app_name:
         return "No application name provided."
@@ -387,7 +390,7 @@ def open_app(
     existing = _matching_windows(app_name, normalized)
 
     if player:
-        player.write_log(f"[open_app] {app_name}")
+        player.write_log("[open_app] Launch requested")
 
     # A normal open is idempotent.  In particular, do not create a duplicate
     # Roblox client just because the launcher was called a second time.
@@ -397,8 +400,8 @@ def open_app(
         return f"{app_name} is already open, but I could not focus its window."
 
     if shortcut_target.casefold() != app_name.casefold():
-        print(f"[open_app] Shortcut: '{app_name}' → '{shortcut_target}'")
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+        print("[open_app] Resolved a saved shortcut.")
+    print(f"[open_app] Launching application target ({_SYSTEM}).")
 
     existing_keys = {_window_key(window) for window in existing}
     try:
@@ -426,7 +429,7 @@ def open_app(
                     return "A second Roblox window opened, but no opposite monitor was available."
                 move_to_monitor(new_window, target_monitor)
             except Exception as exc:
-                return f"A second Roblox window opened, but I could not move it: {exc}"
+                return f"A second Roblox window opened, but I could not move it: {type(exc).__name__}"
             verified, _ = _wait_for_windows(
                 app_name, normalized, desired_count, set()
             )
@@ -445,8 +448,8 @@ def open_app(
         # above; existing applications are handled before launch.
         return f"Opened {app_name}."
     except Exception as exc:
-        print(f"[open_app] Error: {exc}")
-        return f"Failed to open {app_name}: {exc}"
+        print(f"[open_app] Launch failed ({type(exc).__name__}).")
+        return f"Failed to open {app_name}."
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
@@ -458,6 +461,7 @@ TOOL = {
         "properties": {
             "app_name": {
                 "type": "STRING",
+                "maxLength": 160,
                 "description": "Name of the application (e.g. 'WhatsApp', 'Chrome', 'Roblox')"
             },
             "new_instance": {

@@ -69,14 +69,8 @@ import json
 import sys
 import time
 import threading
-from pathlib import Path
 
-if getattr(sys, "frozen", False):
-    _BASE = Path(sys.executable).parent
-else:
-    _BASE = Path(__file__).resolve().parent.parent
-
-_KEY_FILE = _BASE / "config" / "api_keys.json"
+from memory.config_manager import get_gemini_key
 
 # Ladders, tried left to right. Change a model HERE and the whole app follows.
 FAST = "fast"      # short classification, extraction, one-line decisions
@@ -199,8 +193,7 @@ def api_key(refresh: bool = False) -> str:
         if _cached_key is not None and not refresh:
             return _cached_key
         try:
-            data = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
-            _cached_key = str(data.get("gemini_api_key") or "")
+            _cached_key = get_gemini_key() or ""
         except Exception:
             _cached_key = ""
         return _cached_key
@@ -407,7 +400,7 @@ def call(contents, tier: str = FAST, config=None,
                 print(f"[Gemini] {model}: out of quota — skipping it for "
                       f"{_COOLDOWN_SECONDS // 60} minutes")
             else:
-                print(f"[Gemini] {model}: {type(e).__name__}: {msg[:140]}")
+                print(f"[Gemini] {model}: request failed ({type(e).__name__})")
     return None
 
 
@@ -435,5 +428,5 @@ def as_json(contents, tier: str = FAST, config=None,
     try:
         return json.loads(raw)
     except Exception as e:
-        print(f"[Gemini] reply was not JSON: {e}")
+        print(f"[Gemini] reply was not JSON ({type(e).__name__}).")
         return default

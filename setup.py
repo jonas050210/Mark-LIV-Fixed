@@ -21,6 +21,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Setup is commonly launched from legacy Windows consoles. Keep status symbols
+# from turning a valid installation into a UnicodeEncodeError.
+for _stream_name in ("stdout", "stderr"):
+    try:
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 CHECK_ONLY = "--check" in sys.argv[1:]
 HERE = Path(__file__).resolve().parent
@@ -31,7 +41,7 @@ MAX_PY = (3, 13)        # highest version this is actually tested on
 
 def _run(label: str, args: list[str]) -> None:
     print(f"\n▶ {label}")
-    subprocess.run(args, check=True)
+    subprocess.run(args, check=True, timeout=1800)
 
 
 def _check_python() -> None:

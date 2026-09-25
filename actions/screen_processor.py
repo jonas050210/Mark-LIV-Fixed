@@ -9,9 +9,9 @@ main Gemini Live session; there is no separate vision session here.
 from __future__ import annotations
 
 import io
-import json
-import sys
-from pathlib import Path
+import platform
+
+from memory.config_manager import load_api_keys, patch_config
 
 try:
     import numpy as np
@@ -40,34 +40,26 @@ except ImportError:
     _PIL = False
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-_BASE        = _base_dir()
-_CONFIG_PATH = _BASE / "config" / "api_keys.json"
-
-
 def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_api_keys()
 
 
 def _save_config_key(key: str, value) -> None:
     try:
-        cfg = _load_config()
-        cfg[key] = value
-        _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        patch_config(**{key: value})
     except Exception as e:
-        print(f"[Vision] ⚠️  Could not save config key '{key}': {e}")
+        print(f"[Vision] ⚠️ Could not save a vision setting ({type(e).__name__}).")
 
 
 def _get_os() -> str:
-    return _load_config().get("os_system", "windows").lower()
+    configured = _load_config().get("os_system")
+    if isinstance(configured, str):
+        normalized = configured.strip().lower()
+        if normalized in {"windows", "mac", "linux"}:
+            return normalized
+    return {"Windows": "windows", "Darwin": "mac", "Linux": "linux"}.get(
+        platform.system(), "linux"
+    )
 
 
 _IMG_MAX_W = 1280
@@ -86,7 +78,7 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         img.save(buf, format="JPEG", quality=_JPEG_Q, optimize=False)
         return buf.getvalue(), "image/jpeg"
     except Exception as e:
-        print(f"[Vision] ⚠️  Image compress failed: {e}")
+        print(f"[Vision] ⚠️ Image compression failed ({type(e).__name__}).")
         return img_bytes, f"image/{source_format.lower()}"
 
 
@@ -117,20 +109,20 @@ def _cv2_backend() -> int:
 
 
 def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
-
-    if not _CV2:
+    if not _CV2 or not _NUMPY:
         return False
     cap = cv2.VideoCapture(index, backend)
-    if not cap.isOpened():
+    try:
+        if not cap.isOpened():
+            return False
+        for _ in range(max(0, min(int(warmup), 20))):
+            cap.read()
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return False
+        return bool(np.mean(frame) > 8)
+    finally:
         cap.release()
-        return False
-    for _ in range(warmup):
-        cap.read()
-    ret, frame = cap.read()
-    cap.release()
-    if not ret or frame is None:
-        return False
-    return bool(np.mean(frame) > 8)
 
 
 def _detect_camera_index() -> int:
@@ -152,7 +144,10 @@ def _detect_camera_index() -> int:
 def _get_camera_index() -> int:
     cfg = _load_config()
     if "camera_index" in cfg:
-        return int(cfg["camera_index"])
+        try:
+            return max(0, min(int(cfg["camera_index"]), 32))
+        except (TypeError, ValueError):
+            pass
     return _detect_camera_index()
 
 
@@ -162,21 +157,20 @@ def _capture_camera() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
-    index   = _get_camera_index()
+    index = _get_camera_index()
     backend = _cv2_backend()
-    cap     = cv2.VideoCapture(index, backend)
+    cap = cv2.VideoCapture(index, backend)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Camera index {index} could not be opened.")
 
-    if not cap.isOpened():
-        raise RuntimeError(f"Camera index {index} could not be opened.")
-
-    for _ in range(10):
-        cap.read()
-
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret or frame is None:
-        raise RuntimeError("Camera returned no frame.")
+        for _ in range(10):
+            cap.read()
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera returned no frame.")
+    finally:
+        cap.release()
 
     if _PIL:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

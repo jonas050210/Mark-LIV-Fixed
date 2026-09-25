@@ -1,0 +1,56 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install verification dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          "fastapi<1" "uvicorn<1" "cryptography<47"
+          "python-multipart<1" "httpx<0.28"
+
+      - name: Validate setup inputs
+        run: python setup.py --check
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Run unit tests
+        run: python .github/scripts/run_tests.py
+
+      - name: Run overall verification
+        run: python .github/scripts/run_overall.py

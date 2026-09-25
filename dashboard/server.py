@@ -1,9 +1,8 @@
 """
 dashboard/server.py — JARVIS Local HTTP Dashboard
 
-Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
-Security at the application layer: AES-256-CBC with session-key-derived key.
-CryptoJS is auto-downloaded once and served locally — no CDN needed after that.
+Local HTTPS dashboard with expiring bearer sessions and authenticated command
+payloads. The pinned CryptoJS bundle is served locally and integrity checked.
 
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 """
@@ -11,9 +10,14 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import hmac
+import json
+import os
 import re
+import stat
 import secrets
 import socket
+import ssl
 import string
 import time
 from pathlib import Path
@@ -22,11 +26,18 @@ from core.action_runtime import runtime as action_runtime
 from core import undo as undo_stack
 from core import confirm as confirm_gate
 from core import explorer as explorer_core
+from core.path_policy import (
+    PathPolicyError,
+    atomic_write_bytes,
+    move_no_replace,
+    resolve_user_path,
+    validate_child_name,
+)
 
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, Response
     import uvicorn
     _DEPS_OK = True
 except ImportError:
@@ -43,9 +54,16 @@ except Exception:
 BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
-MAX_UPLOAD_MB = 500
+MAX_UPLOAD_MB = 100
 LOGIN_ATTEMPT_WINDOW = 300.0
 MAX_LOGIN_ATTEMPTS = 10
+AUTH_TOKEN_TTL = 12 * 60 * 60
+DEVICE_TOKEN_TTL = 30 * 24 * 60 * 60
+MAX_REQUEST_BYTES = 2_000_000
+
+
+class _RequestBodyTooLarge(ValueError):
+    pass
 
 
 def _make_uploads_dir() -> Path:
@@ -53,25 +71,26 @@ def _make_uploads_dir() -> Path:
     for candidate in [
         Path.home() / "Downloads" / "JARVIS Uploads",
         Path.home() / "Documents" / "JARVIS Uploads",
-        BASE_DIR / "uploads",
+        Path.home() / ".mark" / "uploads",
     ]:
         try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            return candidate
+            safe = resolve_user_path(
+                candidate, allow_missing=True, reject_symlinks=True
+            )
+            safe.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                safe.chmod(0o700)
+            except OSError:
+                pass
+            return resolve_user_path(
+                safe, allow_missing=False, reject_symlinks=True
+            )
         except Exception:
             pass
-    return BASE_DIR / "uploads"
+    raise RuntimeError("Could not create a safe uploads folder in the user profile")
 
 
 UPLOADS_DIR = _make_uploads_dir()
-
-def _get_gemini_key() -> str | None:
-    try:
-        import json as _json
-        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
-            return _json.load(f).get("gemini_api_key")
-    except Exception:
-        return None
 
 _KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
               if c not in ('O', 'I', 'L', '0', '1')]
@@ -81,267 +100,51 @@ _AES_SALT = b'JARVIS-DASHBOARD-v1'
 
 
 def _derive_key(session_key: str) -> bytes:
-    """SHA-256(sessionKey‖salt) → 32-byte AES-256 key (microseconds, no PBKDF2 needed)."""
+    """Derive the AES key from a high-entropy per-session secret."""
     return hashlib.sha256(session_key.encode('utf-8') + _AES_SALT).digest()
 
 
-def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
-    """Decrypt base64(IV[16] ‖ ciphertext) with AES-256-CBC + PKCS7."""
+def _derive_mac_key(session_key: str) -> bytes:
+    return hashlib.sha256(session_key.encode('utf-8') + _AES_SALT + b'-MAC').digest()
+
+
+def _decrypt_cbc(aes_key: bytes, mac_key: bytes, enc_b64: str) -> str:
+    """Authenticate and decrypt base64(IV ‖ ciphertext ‖ HMAC-SHA256)."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as sym_pad
     if not isinstance(enc_b64, str) or len(enc_b64) > 2_000_000:
         raise ValueError("encrypted payload is too large")
-    raw      = base64.b64decode(enc_b64, validate=True)
-    if len(raw) < 32 or len(raw[16:]) % 16:
+    raw = base64.b64decode(enc_b64, validate=True)
+    if len(raw) < 64 or len(raw[16:-32]) % 16:
         raise ValueError("invalid encrypted payload")
-    iv, ct   = raw[:16], raw[16:]
-    dec      = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    signed, supplied_mac = raw[:-32], raw[-32:]
+    expected_mac = hmac.new(mac_key, signed, hashlib.sha256).digest()
+    if not hmac.compare_digest(supplied_mac, expected_mac):
+        raise ValueError("encrypted payload authentication failed")
+    iv, ct = signed[:16], signed[16:]
+    dec = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
     padded   = dec.update(ct) + dec.finalize()
     unpadder = sym_pad.PKCS7(128).unpadder()
     return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
 
 
 # ── CryptoJS (auto-download once, served locally) ─────────────────────────────
-_CRYPTOJS_CDN  = ("https://cdnjs.cloudflare.com/ajax/libs/"
-                  "crypto-js/4.2.0/crypto-js.min.js")
 _CRYPTOJS_FILE = STATIC_DIR / "crypto-js.min.js"
+_CRYPTOJS_SHA256 = "769a555de553babc35a3338f344dd7aa16260c93cea2c7db290707c90484e7cc"
 
 
-def _ensure_network_access(port: int) -> None:
-    """Cross-platform, best-effort: open port in the OS firewall for LAN access.
-
-    Runs in a background thread — never blocks uvicorn startup.
-
-    Windows : writes a .bat file, runs it elevated via Windows ShellExecuteW
-              (native UAC dialog, guaranteed to appear). One-time setup.
-    macOS   : osascript admin dialog if the Application Firewall is on.
-    Linux   : pkexec GUI → sudo -n → prints manual command as fallback.
-    """
+def _crypto_js_valid() -> bool:
     try:
-        port = int(port)
-    except (TypeError, ValueError):
-        print(f"[Dashboard] Invalid firewall port: {port!r}")
-        return
-    if not 1 <= port <= 65_535:
-        print(f"[Dashboard] Firewall port out of range: {port}")
-        return
-
-    import sys, subprocess, os, tempfile, threading
-
-    # ── Windows ──────────────────────────────────────────────────────────────
-    if sys.platform == "win32":
-        import ctypes, time
-
-        port_rule = f"JARVIS Dashboard Port {port}"
-        prog_rule  = "JARVIS Dashboard Python"
-        # Double quotes are escaped for the generated batch file. The path is
-        # still passed to subprocess without a Python shell.
-        py_exe     = str(sys.executable).replace('"', '""')
-
-        def _netsh_rule_exists(name: str) -> bool:
-            try:
-                r = subprocess.run(
-                    ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                return r.returncode == 0 and "No rules match" not in r.stdout
-            except Exception:
-                return False
-
-        def _network_is_public() -> bool:
-            try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     "(Get-NetConnectionProfile | "
-                     "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                     "Measure-Object).Count"],
-                    capture_output=True, text=True, timeout=6,
-                )
-                return r.stdout.strip() not in ("", "0")
-            except Exception:
-                return False
-
-        need_port    = not _netsh_rule_exists(port_rule)
-        need_prog    = not _netsh_rule_exists(prog_rule)
-        need_private = _network_is_public()
-
-        if not need_port and not need_prog and not need_private:
-            return  # already fully configured
-
-        # Build a .bat file — netsh + powershell, runs fast when elevated
-        bat_lines = ["@echo off"]
-        if need_private:
-            bat_lines.append(
-                'powershell -NoProfile -NonInteractive -Command "'
-                'Get-NetConnectionProfile | '
-                "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                'Set-NetConnectionProfile -NetworkCategory Private"'
-            )
-        if need_port:
-            bat_lines.append(
-                f'netsh advfirewall firewall add rule '
-                f'name="{port_rule}" protocol=TCP dir=in '
-                f'localport={port} action=allow'
-            )
-        if need_prog:
-            bat_lines.append(
-                f'netsh advfirewall firewall add rule '
-                f'name="{prog_rule}" dir=in action=allow '
-                f'program="{py_exe}" enable=yes'
-            )
-
-        bat_body = "\r\n".join(bat_lines) + "\r\n"
-        fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="jarvis_fw_")
-        try:
-            os.write(fd, bat_body.encode("mbcs"))   # Windows cmd.exe expects ANSI
-            os.close(fd)
-        except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            return
-
-        # ── Try running directly (succeeds when already admin) ────────────────
-        try:
-            comspec = os.environ.get("COMSPEC", "cmd.exe")
-            r = subprocess.run(
-                [comspec, "/d", "/c", bat_path],
-                capture_output=True, timeout=8, shell=False,
-            )
-            if r.returncode == 0:
-                print(f"[Dashboard] Firewall configured for port {port}.")
-                try:
-                    os.unlink(bat_path)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-
-        # ── ShellExecuteW: native UAC elevation (most reliable on Windows) ────
-        # ShellExecuteW with verb "runas" always shows the UAC dialog regardless
-        # of UAC level settings. Non-blocking — uvicorn is already running.
-        print("[Dashboard] One-time network setup required.")
-        print("[Dashboard] >>> A Windows security dialog will appear — click 'Yes' <<<")
-        try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None,       # hwnd  (no parent window)
-                "runas",    # verb  (request elevation)
-                bat_path,   # file  (our .bat)
-                None,       # params
-                None,       # working dir
-                0,          # SW_HIDE (run without a visible cmd window)
-            )
-            if int(ret) > 32:
-                # ShellExecuteW returns immediately; bat finishes in ~1 second.
-                # Sleep briefly so the rules are in place before the first retry.
-                time.sleep(2)
-                print(f"[Dashboard] Network setup complete — port {port} is open.")
-                print("[Dashboard] Refresh your phone browser to connect.")
-            else:
-                print("[Dashboard] Setup was not allowed.")
-                print("[Dashboard] Phone connections may fail until JARVIS is run as Administrator.")
-        except Exception as e:
-            print(f"[Dashboard] Firewall setup error: {e}")
-        finally:
-            # Cleanup after the bat has had time to run
-            def _cleanup(path: str) -> None:
-                time.sleep(5)
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
-            threading.Thread(target=_cleanup, args=(bat_path,), daemon=True).start()
-        return
-
-    # ── macOS ─────────────────────────────────────────────────────────────────
-    if sys.platform == "darwin":
-        fw_ctl = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-        try:
-            r = subprocess.run(
-                [fw_ctl, "--getglobalstate"], capture_output=True, text=True, timeout=5,
-            )
-            if "disabled" in r.stdout.lower():
-                return  # firewall off — nothing to do
-
-            py = sys.executable
-            listed = subprocess.run(
-                [fw_ctl, "--listapps"], capture_output=True, text=True, timeout=5,
-            )
-            if py in listed.stdout:
-                return  # already allowed
-
-            print("[Dashboard] One-time network setup — enter your password in the macOS dialog.")
-            subprocess.run(
-                ["osascript", "-e",
-                 f'do shell script "{fw_ctl} --add {py} && {fw_ctl} --unblockapp {py}"'
-                 f' with administrator privileges'],
-                timeout=60,
-            )
-        except Exception:
-            pass  # macOS firewall is off by default — silent failure is fine
-        return
-
-    # ── Linux ─────────────────────────────────────────────────────────────────
-    def _privileged(cmd: list[str]) -> bool:
-        for prefix in (["pkexec"], ["sudo", "-n"]):
-            try:
-                r = subprocess.run(prefix + cmd, capture_output=True, timeout=30)
-                if r.returncode == 0:
-                    return True
-            except Exception:
-                pass
+        digest = hashlib.sha256(_CRYPTOJS_FILE.read_bytes()).hexdigest()
+        return hmac.compare_digest(digest, _CRYPTOJS_SHA256)
+    except OSError:
         return False
-
-    try:  # ufw
-        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=5)
-        if "active" in r.stdout.lower():
-            if _privileged(["ufw", "allow", f"{port}/tcp"]):
-                print(f"[Dashboard] ufw: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo ufw allow {port}/tcp")
-            return
-    except FileNotFoundError:
-        pass
-
-    try:  # firewalld
-        r = subprocess.run(
-            ["firewall-cmd", "--state"], capture_output=True, text=True, timeout=5,
-        )
-        if "running" in r.stdout.lower():
-            ok = (_privileged(["firewall-cmd", "--add-port", f"{port}/tcp", "--permanent"])
-                  and _privileged(["firewall-cmd", "--reload"]))
-            if ok:
-                print(f"[Dashboard] firewalld: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo firewall-cmd --add-port={port}/tcp --permanent && sudo firewall-cmd --reload")
-            return
-    except FileNotFoundError:
-        pass
-
-    try:  # iptables (not persistent but works until reboot)
-        r = subprocess.run(["iptables", "-L", "INPUT", "-n"], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            if _privileged(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]):
-                print(f"[Dashboard] iptables: port {port} opened.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo iptables -A INPUT -p tcp --dport {port} -j ACCEPT")
-    except FileNotFoundError:
-        pass  # no iptables means firewall is probably off — nothing to do
 
 
 def _ensure_crypto_js() -> None:
-    if _CRYPTOJS_FILE.exists():
-        return
-    try:
-        import urllib.request
-        print("[Dashboard] Downloading CryptoJS (one-time setup)…")
-        urllib.request.urlretrieve(_CRYPTOJS_CDN, str(_CRYPTOJS_FILE))
-        print("[Dashboard] CryptoJS cached — will serve locally from now on.")
-    except Exception as e:
-        print(f"[Dashboard] CryptoJS download failed: {e}")
-        print(f"[Dashboard] Encryption will fall back to CDN load on client.")
+    if not _crypto_js_valid():
+        print("[Dashboard] Bundled CryptoJS is missing or failed its integrity check.")
+        print("[Dashboard] Restore dashboard/static/crypto-js.min.js before remote use.")
 
 
 _ensure_crypto_js()
@@ -384,6 +187,32 @@ def _local_ip() -> str:
     return "127.0.0.1"
 
 
+def _regular_no_reparse(path: Path) -> bool:
+    try:
+        details = path.lstat()
+        return (
+            stat.S_ISREG(details.st_mode)
+            and not path.is_symlink()
+            and not (int(getattr(details, "st_file_attributes", 0)) & 0x400)
+        )
+    except OSError:
+        return False
+
+
+def _cert_pair_valid() -> bool:
+    certs = BASE_DIR / "config" / "certs"
+    key_path = certs / "jarvis.key"
+    cert_path = certs / "jarvis.crt"
+    if not _regular_no_reparse(key_path) or not _regular_no_reparse(cert_path):
+        return False
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        return True
+    except (OSError, ssl.SSLError):
+        return False
+
+
 def _ensure_certs() -> bool:
     """
     Make sure config/certs holds a TLS key pair, generating a self-signed one the
@@ -394,14 +223,42 @@ def _ensure_certs() -> bool:
     present a certificate that matches it. Generating locally gives each install
     its own key, costs about a second, and happens exactly once.
 
-    Returns True when a usable pair exists afterwards; False leaves the caller on
-    plain HTTP, which still works — the QR code simply encodes http:// instead.
+    Returns True when a usable pair exists afterwards. A False result is safe
+    only for loopback HTTP; the caller must not expose an unencrypted dashboard
+    to the LAN.
     """
     certs = BASE_DIR / "config" / "certs"
     key_p = certs / "jarvis.key"
     crt_p = certs / "jarvis.crt"
-    if key_p.exists() and crt_p.exists():
+    if certs.exists():
+        try:
+            cert_details = certs.lstat()
+            if (
+                certs.is_symlink()
+                or int(getattr(cert_details, "st_file_attributes", 0)) & 0x400
+                or not stat.S_ISDIR(cert_details.st_mode)
+            ):
+                print("[Dashboard] Certificate directory is not a trusted directory — loopback HTTP only.")
+                return False
+        except OSError:
+            return False
+    if _cert_pair_valid():
+        try:
+            os.chmod(key_p, 0o600)
+        except OSError:
+            pass
         return True
+    if key_p.exists() or crt_p.exists():
+        stamp = int(time.time())
+        for candidate in (key_p, crt_p):
+            if candidate.exists():
+                try:
+                    invalid = candidate.with_name(f"{candidate.name}.invalid-{stamp}")
+                    os.replace(candidate, invalid)
+                    if _regular_no_reparse(invalid):
+                        os.chmod(invalid, 0o600)
+                except OSError:
+                    pass
 
     try:
         import datetime
@@ -411,7 +268,7 @@ def _ensure_certs() -> bool:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
     except ImportError:
-        print("[Dashboard] cryptography not installed — serving over plain HTTP.")
+        print("[Dashboard] cryptography not installed — loopback HTTP only.")
         print("[Dashboard] For HTTPS run:  pip install cryptography")
         return False
 
@@ -451,12 +308,12 @@ def _ensure_certs() -> bool:
             .sign(key, hashes.SHA256())
         )
 
-        key_p.write_bytes(key.private_bytes(
+        atomic_write_bytes(key_p, key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=serialization.NoEncryption(),
         ))
-        crt_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        atomic_write_bytes(crt_p, cert.public_bytes(serialization.Encoding.PEM))
 
         try:
             import os as _os
@@ -467,7 +324,7 @@ def _ensure_certs() -> bool:
         print(f"[Dashboard] Generated a self-signed certificate for this machine: {certs}")
         return True
     except Exception as e:
-        print(f"[Dashboard] Certificate generation failed ({e}) — serving over plain HTTP.")
+        print(f"[Dashboard] Certificate generation failed ({type(e).__name__}) — loopback HTTP only.")
         return False
 
 
@@ -500,12 +357,14 @@ class DashboardServer:
 
     def __init__(self):
         self._ip                          = _local_ip()
-        self._tokens: set[str]            = set()
+        self._tokens: dict[str, float]    = {}   # auth_token → expiry timestamp
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
-        self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
+        self._aes_cache: dict[str, bytes] = {}   # session_key → AES bytes
+        self._mac_cache: dict[str, bytes] = {}   # session_key → HMAC bytes
         self._clients: set[WebSocket]     = set()
+        self._phone_clients: set[WebSocket] = set()
         self._history: list[dict]         = []
-        self._command_queue               = asyncio.Queue()
+        self._command_queue               = asyncio.Queue(maxsize=100)
         self._wake_callback               = None
         self._connect_callback            = None
         self._capabilities_callback       = None
@@ -513,7 +372,9 @@ class DashboardServer:
         self._pending_keys: dict[str, float] = {}
         self._login_attempts: dict[str, list[float]] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
-        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=64)
+        self._background_tasks: set[asyncio.Task] = set()
+        self._broadcast_lock              = asyncio.Lock()
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -523,8 +384,14 @@ class DashboardServer:
 
     def new_key(self, expiry_secs: int = 600) -> str:
         now = time.time()
+        expiry_secs = max(30, min(int(expiry_secs), 3_600))
         self._pending_keys = {k: v for k, v in self._pending_keys.items() if v > now}
+        while len(self._pending_keys) >= 100:
+            oldest = min(self._pending_keys, key=self._pending_keys.get)
+            self._pending_keys.pop(oldest, None)
         key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
+        while key in self._pending_keys:
+            key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
         self._pending_keys[key] = now + expiry_secs
         return key
 
@@ -536,57 +403,105 @@ class DashboardServer:
 
     def _allow_login_attempt(self, identity: str) -> bool:
         now = time.time()
-        recent = [
-            stamp for stamp in self._login_attempts.get(identity, [])
-            if now - stamp < LOGIN_ATTEMPT_WINDOW
-        ]
+        cutoff = now - LOGIN_ATTEMPT_WINDOW
+        self._login_attempts = {
+            key: [stamp for stamp in values if stamp >= cutoff]
+            for key, values in self._login_attempts.items()
+            if values and values[-1] >= cutoff
+        }
+        # Once the peer-cardinality budget is exhausted, unknown addresses share
+        # one strict overflow bucket rather than growing this map without bound.
+        if identity not in self._login_attempts and len(self._login_attempts) >= 255:
+            identity = "__overflow__"
+        recent = self._login_attempts.get(identity, [])
         if len(recent) >= MAX_LOGIN_ATTEMPTS:
-            self._login_attempts[identity] = recent
             return False
         recent.append(now)
         self._login_attempts[identity] = recent
-        # Keep this bounded even when many clients probe the login endpoint.
-        if len(self._login_attempts) > 256:
-            cutoff = now - LOGIN_ATTEMPT_WINDOW
-            self._login_attempts = {
-                key: values for key, values in self._login_attempts.items()
-                if values and values[-1] >= cutoff
-            }
         return True
 
     def _reset_login_attempts(self, identity: str) -> None:
-        self._login_attempts.pop(identity, None)
+        if identity in self._login_attempts:
+            self._login_attempts.pop(identity, None)
+        else:
+            self._login_attempts.pop("__overflow__", None)
 
     @staticmethod
     def _ssl_enabled() -> bool:
-        certs = BASE_DIR / "config" / "certs"
-        return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
+        return _cert_pair_valid()
 
     def get_url(self) -> str:
-        proto = "https" if self._ssl_enabled() else "http"
-        return f"{proto}://{self._ip}:{PORT}"
+        if self._ssl_enabled():
+            return f"https://{self._ip}:{PORT}"
+        return f"http://127.0.0.1:{PORT}"
 
     def get_manual_url(self) -> str:
-        """URL for manual browser entry. When HTTPS active, points to alias port (also HTTPS)."""
+        """URL for manual browser entry; insecure fallback is local-only."""
         if self._ssl_enabled():
             return f"{self._ip}:{PORT + 1}"
-        return f"{self._ip}:{PORT}"
+        return f"127.0.0.1:{PORT}"
 
     def _aes_key(self, session_key: str) -> bytes:
         if session_key not in self._aes_cache:
+            if len(self._aes_cache) >= 1_000:
+                self._aes_cache.clear()
             self._aes_cache[session_key] = _derive_key(session_key)
         return self._aes_cache[session_key]
 
+    def _mac_key(self, session_key: str) -> bytes:
+        if session_key not in self._mac_cache:
+            if len(self._mac_cache) >= 1_000:
+                self._mac_cache.clear()
+            self._mac_cache[session_key] = _derive_mac_key(session_key)
+        return self._mac_cache[session_key]
+
+    def _issue_token(self, session_key: str) -> str:
+        now = time.time()
+        token = secrets.token_urlsafe(32)
+        self._tokens[token] = now + AUTH_TOKEN_TTL
+        self._token_keys[token] = session_key
+        if len(self._tokens) > 1_000:
+            expired = [value for value, expiry in self._tokens.items() if expiry <= now]
+            for value in expired:
+                self._tokens.pop(value, None)
+                self._token_keys.pop(value, None)
+            while len(self._tokens) > 1_000:
+                oldest = min(self._tokens, key=self._tokens.get)
+                self._tokens.pop(oldest, None)
+                self._token_keys.pop(oldest, None)
+        return token
+
+    def _valid_token(self, token: str) -> bool:
+        if not isinstance(token, str) or not token or len(token) > 256:
+            return False
+        expiry = self._tokens.get(token)
+        if expiry is None or expiry <= time.time():
+            self._tokens.pop(token, None)
+            self._token_keys.pop(token, None)
+            return False
+        return True
+
     def _decrypt(self, token: str, enc_b64: str) -> str | None:
-        sk = self._token_keys.get(token)
-        if not sk:
+        if not self._valid_token(token):
+            return None
+        session_key = self._token_keys.get(token)
+        if not session_key:
             return None
         try:
-            return _decrypt_cbc(self._aes_key(sk), enc_b64)
+            return _decrypt_cbc(
+                self._aes_key(session_key), self._mac_key(session_key), enc_b64
+            )
         except Exception:
             return None
 
     # ── callbacks ────────────────────────────────────────────────────────
+
+    def _enqueue_command(self, text: str) -> bool:
+        try:
+            self._command_queue.put_nowait(text)
+            return True
+        except asyncio.QueueFull:
+            return False
 
     def set_wake_callback(self, fn) -> None:
         self._wake_callback = fn
@@ -604,35 +519,130 @@ class DashboardServer:
 
     # ── broadcast ────────────────────────────────────────────────────────
 
+    def _spawn(self, coroutine) -> None:
+        """Run a small server task with a hard cardinality limit and cleanup."""
+        if len(self._background_tasks) >= 100:
+            coroutine.close()
+            return
+        try:
+            task = asyncio.create_task(coroutine)
+        except RuntimeError:
+            coroutine.close()
+            return
+        self._background_tasks.add(task)
+
+        def _finished(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if not completed.cancelled():
+                try:
+                    completed.exception()
+                except Exception:
+                    pass
+
+        task.add_done_callback(_finished)
+
     async def broadcast(self, msg: dict) -> None:
-        self._history.append(msg)
-        if len(self._history) > 300:
-            self._history = self._history[-300:]
-        dead: set[WebSocket] = set()
-        for ws in list(self._clients):
-            try:
-                await ws.send_json(msg)
-            except Exception:
-                dead.add(ws)
-        self._clients -= dead
+        if not isinstance(msg, dict):
+            return
+        try:
+            encoded = json.dumps(msg, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return
+        if len(encoded) > 50_000:
+            msg = {
+                "type": str(msg.get("type") or "sys")[:40],
+                "text": str(msg.get("text") or msg.get("message") or "")[:20_000],
+                "truncated": True,
+            }
+        else:
+            # JSON round-tripping both copies nested values and guarantees the
+            # history/WebSocket payload remains serializable after this call.
+            msg = json.loads(encoded)
+        async with self._broadcast_lock:
+            self._history.append(msg)
+            if len(self._history) > 300:
+                self._history = self._history[-300:]
+            clients = list(self._clients)
+
+            async def _send(ws):
+                try:
+                    await asyncio.wait_for(ws.send_json(msg), timeout=2.0)
+                    return None
+                except Exception:
+                    return ws
+
+            dead = {
+                result
+                for result in await asyncio.gather(*(_send(ws) for ws in clients))
+                if result is not None
+            }
+            self._clients -= dead
 
     # ── FastAPI app ───────────────────────────────────────────────────────
 
     def _build_app(self) -> "FastAPI":
         app = FastAPI(docs_url=None, redoc_url=None)
 
+        @app.middleware("http")
+        async def security_headers(req: Request, call_next):
+            if req.url.path.startswith("/api/") and req.url.path not in {"/api/device-login"}:
+                token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+                if not token or not self._valid_token(token):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            length = req.headers.get("content-length")
+            if req.method in {"POST", "PUT", "PATCH"} and length is None:
+                return JSONResponse({"error": "Content-Length is required"}, status_code=411)
+            if length:
+                try:
+                    limit = (MAX_UPLOAD_MB * 1024 * 1024 + 1_000_000
+                             if req.url.path == "/api/upload" else MAX_REQUEST_BYTES)
+                    parsed_length = int(length)
+                    if parsed_length < 0:
+                        return JSONResponse({"error": "Invalid Content-Length"}, status_code=400)
+                    if parsed_length > limit:
+                        return JSONResponse({"error": "Request too large"}, status_code=413)
+                except ValueError:
+                    return JSONResponse({"error": "Invalid Content-Length"}, status_code=400)
+            response = await call_next(req)
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Permissions-Policy"] = "camera=(), geolocation=()"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                "connect-src 'self' ws: wss:; media-src 'self' blob:; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            )
+            return response
+
         def _auth(req: Request) -> bool:
             tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            return bool(tok) and tok in self._tokens
+            return bool(tok) and self._valid_token(tok)
 
-        # serve CryptoJS from local cache, fallback to CDN redirect
+        async def _read_json_body(req: Request):
+            """Parse JSON without trusting a possibly false Content-Length."""
+            payload = bytearray()
+            async for chunk in req.stream():
+                if len(payload) + len(chunk) > MAX_REQUEST_BYTES:
+                    raise _RequestBodyTooLarge("request body exceeds the JSON limit")
+                payload.extend(chunk)
+            if not payload:
+                raise ValueError("empty request body")
+            return json.loads(payload.decode("utf-8"))
+
+        # Serve only the pinned bundled copy; never execute an unverified download.
         @app.get("/static/crypto.js")
         async def serve_crypto():
-            if _CRYPTOJS_FILE.exists():
+            if _crypto_js_valid():
                 return FileResponse(str(_CRYPTOJS_FILE),
                                     media_type="application/javascript")
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(_CRYPTOJS_CDN)
+            return Response(
+                "console.error('Dashboard crypto integrity check failed');",
+                media_type="application/javascript",
+                status_code=503,
+            )
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
@@ -658,25 +668,30 @@ class DashboardServer:
                     headers={"Retry-After": str(int(LOGIN_ATTEMPT_WINDOW))},
                 )
             try:
-                body = await req.json()
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
             except Exception:
                 return JSONResponse({"ok": False, "error": "Invalid login request"}, status_code=400)
-            entered = str(body.get("pin", "")).strip().upper()[:32]
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid login request"}, status_code=400)
+            raw_pin = body.get("pin")
+            entered = raw_pin.strip().upper()[:32] if isinstance(raw_pin, str) else ""
             now     = time.time()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 self._reset_login_attempts(identity)
                 del self._pending_keys[entered]          # one-time use
-                tok = secrets.token_urlsafe(32)
-                self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
+                session_key = secrets.token_urlsafe(32)
+                tok = self._issue_token(session_key)
+                self._aes_key(session_key)
+                self._mac_key(session_key)
                 if self._connect_callback:
                     self._connect_callback()
-                asyncio.create_task(self.broadcast(
+                self._spawn(self.broadcast(
                     {"type": "sys", "text": "Remote connection established."}
                 ))
                 # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                return JSONResponse({"ok": True, "token": tok, "key": session_key})
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
@@ -705,16 +720,31 @@ class DashboardServer:
 
             self._reset_login_attempts(identity)
             del self._pending_keys[key]
-            tok     = secrets.token_urlsafe(32)
+            session_key = secrets.token_urlsafe(32)
+            tok = self._issue_token(session_key)
             dev_tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = key
-            self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
+            self._aes_key(session_key)
+            self._mac_key(session_key)
+            self._device_sessions[dev_tok] = {
+                "session_key": session_key,
+                "expires_at": time.time() + DEVICE_TOKEN_TTL,
+            }
+            if len(self._device_sessions) > 100:
+                now = time.time()
+                self._device_sessions = {
+                    token: session for token, session in self._device_sessions.items()
+                    if session.get("expires_at", 0) > now
+                }
+                while len(self._device_sessions) > 100:
+                    oldest = min(
+                        self._device_sessions,
+                        key=lambda token: self._device_sessions[token].get("expires_at", 0),
+                    )
+                    self._device_sessions.pop(oldest, None)
 
             if self._connect_callback:
                 self._connect_callback()
-            asyncio.create_task(self.broadcast(
+            self._spawn(self.broadcast(
                 {"type": "sys", "text": "Remote connection established via QR code."}
             ))
 
@@ -728,7 +758,7 @@ class DashboardServer:
 <body>
 <script>
   sessionStorage.setItem('jarvis_token','{tok}');
-  sessionStorage.setItem('jarvis_key','{key}');
+  sessionStorage.setItem('jarvis_key','{session_key}');
   localStorage.setItem('jarvis_device_token','{dev_tok}');
   setTimeout(function(){{location.replace('/')}},400);
 </script>
@@ -738,21 +768,34 @@ class DashboardServer:
         @app.post("/api/device-login")
         async def device_login_ep(req: Request):
             """Return a fresh auth token for a previously paired device token."""
+            identity = self._login_identity(req)
+            if not self._allow_login_attempt(identity):
+                return JSONResponse({"ok": False}, status_code=429)
             try:
-                body = await req.json()
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False}, status_code=413)
             except Exception:
                 return JSONResponse({"ok": False}, status_code=400)
-            dev_tok = (body.get("device_token") or "").strip()
-            if not dev_tok or dev_tok not in self._device_sessions:
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False}, status_code=400)
+            raw_device_token = body.get("device_token")
+            dev_tok = raw_device_token.strip() if isinstance(raw_device_token, str) else ""
+            if not dev_tok or len(dev_tok) > 256:
                 return JSONResponse({"ok": False}, status_code=401)
-            session_key = self._device_sessions[dev_tok]["session_key"]
-            tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = session_key
+            session = self._device_sessions.get(dev_tok)
+            if not session or session.get("expires_at", 0) <= time.time():
+                self._device_sessions.pop(dev_tok, None)
+                return JSONResponse({"ok": False}, status_code=401)
+            self._reset_login_attempts(identity)
+            session_key = session["session_key"]
+            session["expires_at"] = time.time() + DEVICE_TOKEN_TTL
+            tok = self._issue_token(session_key)
             self._aes_key(session_key)
+            self._mac_key(session_key)
             if self._connect_callback:
                 self._connect_callback()
-            asyncio.create_task(self.broadcast(
+            self._spawn(self.broadcast(
                 {"type": "sys", "text": "Known device reconnected automatically."}
             ))
             return JSONResponse({"ok": True, "token": tok, "key": session_key})
@@ -770,17 +813,30 @@ class DashboardServer:
         async def command(req: Request):
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            body  = await req.json()
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
             token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            enc   = body.get("enc", "")
+            enc = body.get("enc", "")
+            if enc and not isinstance(enc, str):
+                return JSONResponse({"error": "Invalid encrypted payload"}, status_code=400)
             if enc:
                 text = self._decrypt(token, enc)
                 if text is None:
                     return JSONResponse({"error": "Decryption failed"}, status_code=400)
             else:
-                text = (body.get("text") or "").strip()
+                raw_text = body.get("text")
+                text = raw_text.strip() if isinstance(raw_text, str) else ""
+            if text and len(text) > 20_000:
+                return JSONResponse({"error": "Command is too long"}, status_code=413)
             if text:
-                await self._command_queue.put(text)
+                if not self._enqueue_command(text):
+                    return JSONResponse({"error": "Command queue is busy"}, status_code=429)
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
@@ -802,7 +858,10 @@ class DashboardServer:
                 value = self._capabilities_callback() if self._capabilities_callback else []
                 return JSONResponse({"ok": True, "actions": value})
             except Exception as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+                return JSONResponse(
+                    {"ok": False, "error": f"Capability snapshot failed ({type(exc).__name__})."},
+                    status_code=500,
+                )
 
         @app.get("/api/desktop")
         async def desktop_snapshot(req: Request):
@@ -813,7 +872,10 @@ class DashboardServer:
                 value = self._desktop_callback() if self._desktop_callback else {}
                 return JSONResponse({"ok": True, **value})
             except Exception as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+                return JSONResponse(
+                    {"ok": False, "error": f"Desktop snapshot failed ({type(exc).__name__})."},
+                    status_code=500,
+                )
 
         @app.get("/api/explorer/search")
         async def explorer_search(
@@ -845,10 +907,12 @@ class DashboardServer:
                     "extension": extension,
                     "matches": [_explorer_row(path) for path in matches],
                 })
-            except (TypeError, ValueError) as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except PathPolicyError:
+                return JSONResponse({"ok": False, "error": "Search location is not allowed."}, status_code=403)
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "Search parameters are invalid."}, status_code=400)
             except Exception as exc:
-                return JSONResponse({"ok": False, "error": f"Explorer search failed: {exc}"}, status_code=500)
+                return JSONResponse({"ok": False, "error": f"Explorer search failed: {type(exc).__name__}"}, status_code=500)
 
         @app.post("/api/explorer/open")
         async def explorer_open(req: Request):
@@ -856,23 +920,34 @@ class DashboardServer:
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             try:
-                body = await req.json()
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
             except Exception:
                 return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
-            raw_path = str(body.get("path") or "").strip()
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            raw_value = body.get("path")
+            raw_path = raw_value.strip() if isinstance(raw_value, str) else ""
             if not raw_path or len(raw_path) > 400:
                 return JSONResponse({"ok": False, "error": "A valid path is required."}, status_code=400)
-            target = Path(raw_path).expanduser()
-            if not target.exists():
-                return JSONResponse({"ok": False, "error": f"Path not found: {target}"}, status_code=404)
             try:
-                select = bool(body.get("select", False))
+                target = resolve_user_path(raw_path, allow_missing=False)
+            except FileNotFoundError:
+                return JSONResponse({"ok": False, "error": "Path not found."}, status_code=404)
+            except (PathPolicyError, OSError, ValueError) as exc:
+                return JSONResponse({"ok": False, "error": f"Path denied: {type(exc).__name__}"}, status_code=403)
+            try:
+                raw_select = body.get("select", False)
+                if not isinstance(raw_select, bool):
+                    return JSONResponse({"ok": False, "error": "Select must be true or false."}, status_code=400)
+                select = raw_select
                 message = await asyncio.to_thread(
                     explorer_core.open_in_explorer, target, select=select
                 )
                 return JSONResponse({"ok": True, "path": str(target), "select": select, "message": message})
             except Exception as exc:
-                return JSONResponse({"ok": False, "error": f"Could not open Explorer: {exc}"}, status_code=500)
+                return JSONResponse({"ok": False, "error": f"Could not open Explorer: {type(exc).__name__}"}, status_code=500)
 
         @app.get("/api/actions")
         async def action_runs(req: Request):
@@ -889,7 +964,7 @@ class DashboardServer:
             if cancelled:
                 # If this run is waiting on the shared confirmation banner,
                 # cancelling its dashboard card must also dismiss that banner.
-                confirm_gate.resolve(False)
+                confirm_gate.resolve(False, key=action_id)
             return JSONResponse({"ok": cancelled, "action_id": action_id},
                                 status_code=200 if cancelled else 404)
 
@@ -912,16 +987,29 @@ class DashboardServer:
             """Queue a command from the admin panel through the normal dispatcher."""
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            body = await req.json()
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
             token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             enc = body.get("enc", "")
+            if enc and not isinstance(enc, str):
+                return JSONResponse({"ok": False, "error": "Invalid encrypted payload"}, status_code=400)
             if enc:
                 text = self._decrypt(token, enc) or ""
             else:
-                text = str(body.get("text") or "").strip()
+                raw_text = body.get("text")
+                text = raw_text.strip() if isinstance(raw_text, str) else ""
+            if len(text) > 20_000:
+                return JSONResponse({"ok": False, "error": "Command is too long"}, status_code=413)
             if not text:
                 return JSONResponse({"ok": False, "error": "Command is empty or could not be decrypted"}, status_code=400)
-            await self._command_queue.put(text)
+            if not self._enqueue_command(text):
+                return JSONResponse({"ok": False, "error": "Command queue is busy"}, status_code=429)
             if self._wake_callback:
                 self._wake_callback()
             return JSONResponse({"ok": True})
@@ -929,18 +1017,32 @@ class DashboardServer:
         # ── Phone mic real-time audio → Gemini Live ──────────────────────────
 
         @app.websocket("/ws/phone-audio")
-        async def phone_audio_ws(websocket: WebSocket, token: str = ""):
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def phone_audio_ws(websocket: WebSocket):
+            protocols = [
+                value.strip() for value in
+                websocket.headers.get("sec-websocket-protocol", "").split(",")
+            ]
+            tok = protocols[1] if len(protocols) == 2 and protocols[0] == "mark-auth" else ""
+            if not tok or not self._valid_token(tok):
                 await websocket.close(code=4001)
                 return
-            await websocket.accept()
-            asyncio.create_task(self.broadcast(
+            if len(self._phone_clients) >= 4:
+                await websocket.close(code=1013)
+                return
+            await websocket.accept(subprotocol="mark-auth")
+            self._phone_clients.add(websocket)
+            self._spawn(self.broadcast(
                 {"type": "sys", "text": "Phone microphone live."}
             ))
             try:
                 while True:
                     data = await websocket.receive_bytes()
+                    if not self._valid_token(tok):
+                        await websocket.close(code=4001)
+                        break
+                    if len(data) > 256_000:
+                        await websocket.close(code=1009)
+                        break
                     try:
                         self._phone_audio_queue.put_nowait(
                             {"data": data, "mime_type": "audio/pcm"}
@@ -950,21 +1052,30 @@ class DashboardServer:
             except WebSocketDisconnect:
                 pass
             finally:
-                asyncio.create_task(self.broadcast(
+                self._phone_clients.discard(websocket)
+                self._spawn(self.broadcast(
                     {"type": "sys", "text": "Phone microphone stopped."}
                 ))
 
         # ── File sharing ──────────────────────────────────────────────────────
 
         def _safe_filename(raw: str) -> str:
-            name = Path(str(raw)).name                    # strip path components
+            raw_text = str(raw)
+            if len(raw_text) > 1_024:
+                raise ValueError("filename is too long")
+            name = Path(raw_text).name                    # strip path components
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
             return name or "upload"
 
         def _safe_upload_path(raw: str) -> tuple[str, Path]:
-            safe = _safe_filename(raw)
-            root = self._uploads_dir.resolve()
-            path = (root / safe).resolve()
+            safe = validate_child_name(_safe_filename(raw))
+            root = resolve_user_path(self._uploads_dir, allow_missing=False, reject_symlinks=True)
+            path = resolve_user_path(
+                root / safe,
+                allowed_roots=(root,),
+                allow_missing=True,
+                reject_symlinks=True,
+            )
             if path.parent != root:
                 raise ValueError("invalid upload path")
             return safe, path
@@ -980,36 +1091,49 @@ class DashboardServer:
                 except ValueError:
                     return JSONResponse({"error": "Invalid filename"}, status_code=400)
                 stem, suffix = Path(safe).stem, Path(safe).suffix
-                counter = 1
-                while dest.exists() or dest.is_symlink():
-                    safe, dest = _safe_upload_path(f"{stem}_{counter}{suffix}")
-                    counter += 1
-
+                staging = self._uploads_dir / f".upload-{secrets.token_hex(12)}.tmp"
                 size = 0
                 max_bytes = MAX_UPLOAD_MB * 1024 * 1024
                 try:
-                    with open(dest, "wb") as fout:
+                    with staging.open("xb") as fout:
                         while True:
                             chunk = await file.read(65536)
                             if not chunk:
                                 break
                             size += len(chunk)
                             if size > max_bytes:
-                                fout.close()
-                                dest.unlink(missing_ok=True)
-                                return JSONResponse(
-                                    {"error": f"File too large (max {MAX_UPLOAD_MB} MB)"},
-                                    status_code=413,
-                                )
+                                raise OverflowError("upload exceeds the configured limit")
                             fout.write(chunk)
-                except Exception as exc:
-                    try:
-                        dest.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    return JSONResponse({"error": str(exc)}, status_code=500)
+                        fout.flush()
+                        os.fsync(fout.fileno())
 
-                asyncio.create_task(self.broadcast({
+                    # Publish only after the complete file is durable. A racing
+                    # upload or local file is never overwritten, and no consumer
+                    # can observe a partially received destination.
+                    counter = 1
+                    while True:
+                        try:
+                            move_no_replace(staging, dest)
+                            break
+                        except FileExistsError:
+                            if counter > 10_000:
+                                raise FileExistsError("could not allocate an upload filename")
+                            safe, dest = _safe_upload_path(f"{stem}_{counter}{suffix}")
+                            counter += 1
+                except OverflowError:
+                    staging.unlink(missing_ok=True)
+                    return JSONResponse(
+                        {"error": f"File too large (max {MAX_UPLOAD_MB} MB)"},
+                        status_code=413,
+                    )
+                except Exception as exc:
+                    staging.unlink(missing_ok=True)
+                    return JSONResponse(
+                        {"error": f"Upload failed ({type(exc).__name__})."},
+                        status_code=500,
+                    )
+
+                self._spawn(self.broadcast({
                     "type": "file_received",
                     "name": dest.name,
                     "size": size,
@@ -1019,6 +1143,8 @@ class DashboardServer:
         else:
             @app.post("/api/upload")
             async def upload_unavailable(req: Request):
+                if not _auth(req):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return JSONResponse(
                     {"error": "File uploads require: pip install python-multipart"},
                     status_code=503,
@@ -1030,38 +1156,86 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             files = []
             try:
-                for f in sorted(
-                    (p for p in self._uploads_dir.iterdir() if p.is_file()),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    files.append({"name": f.name, "size": f.stat().st_size})
+                candidates = []
+                for scanned, path in enumerate(self._uploads_dir.iterdir(), 1):
+                    if scanned > 2_000:
+                        break
+                    if path.name.startswith(".upload-") or not _regular_no_reparse(path):
+                        continue
+                    try:
+                        file_details = path.stat()
+                    except OSError:
+                        continue
+                    candidates.append(
+                        (float(file_details.st_mtime), path.name, int(file_details.st_size))
+                    )
+                for _modified, name, size in sorted(candidates, reverse=True)[:500]:
+                    files.append({"name": name, "size": size})
             except Exception:
                 pass
             return JSONResponse({"files": files})
 
         @app.get("/uploads/{filename}")
-        async def download_file(filename: str, token: str = ""):
-            # Auth via query param — browser <a download> can't send custom headers
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def download_file(filename: str, req: Request):
+            if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             try:
                 safe, path = _safe_upload_path(filename)
             except ValueError:
                 return JSONResponse({"error": "Not found"}, status_code=404)
             root = self._uploads_dir.resolve()
-            if path.parent != root or path.is_symlink() or not path.exists() or not path.is_file():
+            if path.parent != root or not _regular_no_reparse(path):
                 return JSONResponse({"error": "Not found"}, status_code=404)
-            return FileResponse(str(path), filename=safe)
+            descriptor = None
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
+                info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or int(getattr(info, "st_file_attributes", 0)) & 0x400
+                ):
+                    raise OSError("not a regular file")
+                handle = os.fdopen(descriptor, "rb")
+                descriptor = None
+            except OSError:
+                if descriptor is not None:
+                    os.close(descriptor)
+                return JSONResponse({"error": "Not found"}, status_code=404)
+
+            def chunks():
+                try:
+                    while True:
+                        chunk = handle.read(64 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    handle.close()
+
+            return StreamingResponse(
+                chunks(),
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{safe}"',
+                    "Content-Length": str(info.st_size),
+                },
+            )
 
         @app.websocket("/ws")
-        async def ws_ep(websocket: WebSocket, token: str = ""):
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def ws_ep(websocket: WebSocket):
+            protocols = [
+                value.strip() for value in
+                websocket.headers.get("sec-websocket-protocol", "").split(",")
+            ]
+            tok = protocols[1] if len(protocols) == 2 and protocols[0] == "mark-auth" else ""
+            if not tok or not self._valid_token(tok):
                 await websocket.close(code=4001)
                 return
-            await websocket.accept()
+            if len(self._clients) >= 20:
+                await websocket.close(code=1013)
+                return
+            await websocket.accept(subprotocol="mark-auth")
             self._clients.add(websocket)
             for entry in self._history[-50:]:
                 try:
@@ -1071,11 +1245,21 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_json()
+                    if not self._valid_token(tok):
+                        await websocket.close(code=4001)
+                        break
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("type") == "command":
                         enc = data.get("enc", "")
-                        t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
-                        if t:
-                            await self._command_queue.put(t)
+                        if enc and not isinstance(enc, str):
+                            continue
+                        if enc:
+                            text = self._decrypt(tok, enc)
+                        else:
+                            raw_text = data.get("text")
+                            text = raw_text.strip() if isinstance(raw_text, str) else ""
+                        if text and len(text) <= 20_000 and self._enqueue_command(text):
                             if self._wake_callback:
                                 self._wake_callback()
             except WebSocketDisconnect:
@@ -1093,10 +1277,10 @@ class DashboardServer:
         User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
+            ws_max_size=300_000, limit_concurrency=100, timeout_keep_alive=10,
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
         await uvicorn.Server(cfg).serve()
@@ -1107,26 +1291,46 @@ class DashboardServer:
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
             return
 
-        # Firewall setup runs in a thread — uvicorn starts immediately,
-        # no waiting for UAC dialogs or subprocess timeouts.
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
-
         # Generate the TLS pair on first run so no private key ships in the repo.
         _ensure_certs()
 
-        use_ssl  = self._ssl_enabled()
+        use_ssl = self._ssl_enabled()
+        # LAN exposure is allowed only with TLS. If cryptography/certificate
+        # setup is unavailable, keep the dashboard reachable from this machine
+        # without exposing bearer tokens over the local network.
+        if use_ssl:
+            print("[Dashboard] If another device cannot connect, allow the dashboard ports in your firewall settings.")
+        else:
+            print("[Dashboard] TLS unavailable — dashboard restricted to this computer.")
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
 
-        if use_ssl:
-            asyncio.create_task(self._serve_alias())
+        alias_task = (
+            asyncio.create_task(self._serve_alias(), name="dashboard-alias")
+            if use_ssl else None
+        )
 
         cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT, log_level="warning",
+            self.app, host="0.0.0.0" if use_ssl else "127.0.0.1", port=PORT,
+            log_level="warning", ws_max_size=300_000, limit_concurrency=100,
+            timeout_keep_alive=10,
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
         )
 
-        proto = "https" if use_ssl else "http"
-        print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
+        print(f"[Dashboard] {self.get_url()}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        try:
+            await uvicorn.Server(cfg).serve()
+        finally:
+            if alias_task is not None:
+                alias_task.cancel()
+                try:
+                    await alias_task
+                except asyncio.CancelledError:
+                    pass
+            pending = list(self._background_tasks)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._background_tasks.clear()

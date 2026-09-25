@@ -28,6 +28,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+for _stream_name in ("stdout", "stderr"):
+    try:
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 REPO = Path(__file__).resolve().parent
 TESTS = REPO / "tests"
 
@@ -113,7 +121,7 @@ def _discover_actions() -> str:
     messages: list[str] = []
     registry = discover_actions(REPO / "actions", logger=messages.append)
     names = registry.names()
-    required = {"open_app", "file_controller", "window_manager"}
+    required = {"open_app", "file_controller", "session_manager", "window_manager"}
     missing = required - names
     if missing:
         raise RuntimeError("required actions missing: " + ", ".join(sorted(missing)))
@@ -233,7 +241,12 @@ def _setup_and_requirements() -> str:
 
 def _secret_hygiene() -> str:
     ignore = (REPO / ".gitignore").read_text(encoding="utf-8")
-    expected = ("config/api_keys.json", "config/spotify_token.json", "memory/long_term.json")
+    expected = (
+        "config/api_keys.json",
+        "config/spotify_token.json",
+        "memory/long_term.json",
+        "memory/sessions.json",
+    )
     missing = [entry for entry in expected if entry not in ignore]
     if missing:
         raise RuntimeError(".gitignore does not protect: " + ", ".join(missing))
@@ -251,7 +264,7 @@ def _secret_hygiene() -> str:
         relative = str(path.relative_to(REPO))
         ignored = subprocess.run(
             ["git", "check-ignore", "-q", relative],
-            cwd=REPO, capture_output=True, check=False,
+            cwd=REPO, capture_output=True, check=False, timeout=10,
         ).returncode == 0
         if ignored:
             protected += 1
@@ -268,6 +281,8 @@ def _run_unit_tests() -> str:
         raise RuntimeError("tests directory is missing")
     env = os.environ.copy()
     env.pop("RUN_WINDOWS_INTEGRATION", None)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", "test_*.py", "-v"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=300, check=False,
@@ -284,6 +299,8 @@ def _run_windows_tests() -> str:
         raise SkipCheck("Windows integration checks require Windows")
     env = os.environ.copy()
     env["RUN_WINDOWS_INTEGRATION"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "tests.test_windows_integration", "-v"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=180, check=False,
@@ -297,7 +314,7 @@ def _environment() -> dict:
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=REPO, capture_output=True, text=True, check=False,
+            cwd=REPO, capture_output=True, text=True, check=False, timeout=10,
         ).stdout.strip()
     except OSError:
         commit = ""

@@ -6,10 +6,10 @@ from core import undo as undo_stack
 
 
 def shortcut_manager(parameters: dict | None = None, player=None) -> str:
-    p = parameters or {}
-    action = str(p.get("action") or "list").casefold().strip().replace(" ", "_")
-    alias = str(p.get("alias") or p.get("name") or "").strip()
-    target = str(p.get("target") or p.get("app") or p.get("value") or "").strip()
+    p = parameters if isinstance(parameters, dict) else {}
+    action = str(p.get("action") or "list")[:24].casefold().strip().replace(" ", "_")
+    alias = str(p.get("alias") or p.get("name") or "")[:40].strip()
+    target = str(p.get("target") or p.get("app") or p.get("value") or "")[:240].strip()
 
     try:
         if action in {"set", "save", "remember", "add"}:
@@ -52,9 +52,9 @@ def shortcut_manager(parameters: dict | None = None, player=None) -> str:
                 f"- {name} → {value}" for name, value in values.items()
             )
     except ValueError as exc:
-        return f"I could not save that shortcut: {exc}."
+        return f"I could not save that shortcut: {type(exc).__name__}."
     except OSError as exc:
-        return f"I could not update the shortcut file: {exc}."
+        return f"I could not update the shortcut file: {type(exc).__name__}."
     return "Use set, remove, resolve, or list for shortcuts."
 
 
@@ -69,9 +69,9 @@ TOOL = {
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "set | remove | resolve | list"},
-            "alias": {"type": "STRING", "description": "Short name such as gd, roblox, or school."},
-            "target": {"type": "STRING", "description": "Application name, path, folder, or URL to open."},
+            "action": {"type": "STRING", "enum": ["set", "remove", "resolve", "list"], "maxLength": 16, "description": "set | remove | resolve | list"},
+            "alias": {"type": "STRING", "maxLength": 40, "description": "Short name such as gd, roblox, or school."},
+            "target": {"type": "STRING", "maxLength": 240, "description": "Application name, path, folder, or URL to open."},
         },
         "required": ["action"],
     },

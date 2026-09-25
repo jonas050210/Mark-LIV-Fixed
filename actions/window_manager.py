@@ -44,9 +44,9 @@ def _remember_window(window, label: str, state) -> None:
 
 
 def window_manager(parameters: dict | None = None, player=None) -> str:
-    p = parameters or {}
-    action = str(p.get("action") or "list_windows").strip().casefold().replace(" ", "_")
-    target = str(p.get("target") or p.get("app") or "").strip()
+    p = parameters if isinstance(parameters, dict) else {}
+    action = str(p.get("action") or "list_windows")[:32].strip().casefold().replace(" ", "_")
+    target = str(p.get("target") or p.get("app") or "")[:200].strip()
 
     if action in {"list", "list_windows", "windows", "open_apps"}:
         return describe_windows()
@@ -129,6 +129,8 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
+                "enum": ["list_windows", "list_monitors", "focus", "minimize", "maximize", "restore", "close", "move_to_monitor", "snap", "move"],
+                "maxLength": 32,
                 "description": (
                     "list_windows | list_monitors | focus | minimize | maximize | "
                     "restore | close | move_to_monitor | snap | move"
@@ -136,25 +138,30 @@ TOOL = {
             },
             "target": {
                 "type": "STRING",
+                "maxLength": 500,
                 "description": "Application name or part of the window title, such as Chrome or Discord.",
             },
             "monitor": {
                 "type": "INTEGER",
+                "minimum": 1,
+                "maximum": 32,
                 "description": "1-based monitor number.",
             },
             "side": {
                 "type": "STRING",
+                "enum": ["left", "right", "top", "bottom", "full"],
+                "maxLength": 10,
                 "description": "For snap: left | right | top | bottom | full.",
             },
-            "x": {"type": "INTEGER", "description": "Left desktop coordinate for move."},
-            "y": {"type": "INTEGER", "description": "Top desktop coordinate for move."},
-            "width": {"type": "INTEGER", "description": "Width in pixels for move."},
-            "height": {"type": "INTEGER", "description": "Height in pixels for move."},
+            "x": {"type": "INTEGER", "minimum": -100000, "maximum": 100000, "description": "Left desktop coordinate for move."},
+            "y": {"type": "INTEGER", "minimum": -100000, "maximum": 100000, "description": "Top desktop coordinate for move."},
+            "width": {"type": "INTEGER", "minimum": 200, "maximum": 100000, "description": "Width in pixels for move."},
+            "height": {"type": "INTEGER", "minimum": 150, "maximum": 100000, "description": "Height in pixels for move."},
         },
         "required": ["action"],
     },
     "handler": window_manager,
-    "risk": "close requires confirmation; other window operations are reversible",
+    "risk": "medium",
     "confirmation_actions": ["close"],
     "undoable": True,
 }

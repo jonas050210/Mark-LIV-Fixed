@@ -21,23 +21,17 @@ import re
 import subprocess
 import sys
 import time
-from pathlib import Path
+import ipaddress
+import urllib.parse
 from typing import Callable, Generator
 
 import requests
 
+from memory.config_manager import load_api_keys
+
 # Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
 # Avoids splitting on decimals (3.5) because those have no space after the dot.
 _SENT_END = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*\n')
-
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR    = get_base_dir()
-CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
@@ -48,15 +42,13 @@ _DEFAULTS = {
 
 def get_llm_provider() -> str:
     """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
-    raw = _load_config().get("llm_provider", "ollama").strip().lower()
+    value = _load_config().get("llm_provider", "ollama")
+    raw = value.strip().lower() if isinstance(value, str) else "ollama"
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
 
 
 def _load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_api_keys()
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
@@ -75,13 +67,13 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
         try:
             ok = requests.get(health, timeout=5).status_code == 200
             if ok:
-                print(f"[LLM] OpenAI-compatible server reachable at {url}")
+                print("[LLM] Configured OpenAI-compatible server is reachable.")
             else:
-                print(f"[LLM] Server at {url} returned non-200.  Is it running?")
+                print("[LLM] Configured server returned a non-success response. Is it running?")
             return ok
         except Exception as e:
             print(
-                f"[LLM] Cannot reach OpenAI-compatible server at {url}.\n"
+                "[LLM] Cannot reach the configured OpenAI-compatible server.\n"
                 "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
             )
             return False
@@ -99,16 +91,24 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
         return True
 
     print("[LLM] Ollama not running — launching 'ollama serve'…")
+    process = None
     try:
-        kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        kwargs: dict = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+        }
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        subprocess.Popen(["ollama", "serve"], **kwargs)
+        else:
+            kwargs["start_new_session"] = True
+        process = subprocess.Popen(["ollama", "serve"], **kwargs)
     except FileNotFoundError:
         print("[LLM] 'ollama' command not found. Install Ollama from https://ollama.com")
         return False
     except Exception as e:
-        print(f"[LLM] Could not launch Ollama: {e}")
+        print(f"[LLM] Could not launch Ollama ({type(e).__name__}).")
         return False
 
     deadline = time.time() + timeout
@@ -119,6 +119,15 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
             return True
 
     print("[LLM] Ollama did not respond within the timeout.")
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+            except OSError:
+                pass
     return False
 
 
@@ -139,7 +148,7 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
-    print(f"[LLM] Warming up '{model}' ({provider})…")
+    print(f"[LLM] Warming up the configured {provider} model…")
 
     messages: list[dict] = []
     if system_prompt:
@@ -158,10 +167,10 @@ def warmup_model(system_prompt: str | None = None) -> bool:
         try:
             resp = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=180)
             resp.raise_for_status()
-            print(f"[LLM] '{model}' ready (OpenAI-compatible server).")
+            print("[LLM] Configured model is ready (OpenAI-compatible server).")
             return True
         except Exception as e:
-            print(f"[LLM] Warmup failed (non-fatal): {e}")
+            print(f"[LLM] Warmup failed non-fatally ({type(e).__name__}).")
             return False
 
     # ── Ollama ──────────────────────────────────────────────────────────────
@@ -177,10 +186,10 @@ def warmup_model(system_prompt: str | None = None) -> bool:
     try:
         resp = requests.post(f"{url}/api/chat", json=payload, timeout=180)
         resp.raise_for_status()
-        print(f"[LLM] '{model}' loaded and KV cache primed.")
+        print("[LLM] Configured model loaded and KV cache primed.")
         return True
     except Exception as e:
-        print(f"[LLM] Warmup failed (non-fatal): {e}")
+        print(f"[LLM] Warmup failed non-fatally ({type(e).__name__}).")
         return False
 
 
@@ -218,12 +227,33 @@ def check_model_available(log: Callable | None = None) -> bool:
         return True   # Ollama might still be starting up; non-blocking
 
 
+def _safe_local_url(value: object) -> str:
+    raw = value.strip().rstrip("/") if isinstance(value, str) else ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError
+        host = parsed.hostname.casefold()
+        if host != "localhost":
+            address = ipaddress.ip_address(host)
+            if not (address.is_loopback or address.is_private):
+                raise ValueError
+        if parsed.port is not None and not 1 <= parsed.port <= 65_535:
+            raise ValueError
+        return raw
+    except (ValueError, TypeError):
+        return _DEFAULTS["llm_url"]
+
+
 def get_llm_settings() -> tuple[str, str]:
-    """Returns (base_url, model_name)."""
-    cfg   = _load_config()
-    url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
-    model = cfg.get("llm_model", _DEFAULTS["llm_model"])
-    return url, model
+    """Return a private/loopback backend URL and a bounded model name."""
+    cfg = _load_config()
+    url = _safe_local_url(cfg.get("llm_url", _DEFAULTS["llm_url"]))
+    raw_model = cfg.get("llm_model", _DEFAULTS["llm_model"])
+    model = raw_model.strip()[:200] if isinstance(raw_model, str) else ""
+    return url, model or _DEFAULTS["llm_model"]
 
 
 def call_llm(
@@ -277,7 +307,9 @@ def call_llm(
                 "tool_calls": tc_list,
             }
         except Exception as e:
-            raise RuntimeError(f"OpenAI-compatible LLM call failed: {e}")
+            raise RuntimeError(
+                f"OpenAI-compatible LLM call failed ({type(e).__name__})"
+            ) from e
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     endpoint = f"{url}/api/chat"
@@ -301,7 +333,7 @@ def call_llm(
             "tool_calls": msg.get("tool_calls") or [],
         }
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
+        print("[LLM] Connection error; trying to restart Ollama.")
         if ensure_ollama_running():
             try:
                 resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -315,17 +347,17 @@ def call_llm(
             except Exception:
                 pass
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
+            "Cannot connect to the configured Ollama server. "
             "Make sure Ollama is installed and run: ollama serve"
         )
     except requests.exceptions.Timeout:
         raise RuntimeError("Ollama request timed out after 120 s.")
     except requests.exceptions.HTTPError as e:
-        print(f"[LLM] HTTPError: {e.response.status_code} — {e.response.text[:200]}")
+        print(f"[LLM] HTTP error from Ollama: status {e.response.status_code}.")
         raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
     except Exception as e:
-        print(f"[LLM] Unexpected error: {type(e).__name__}: {e}")
-        raise RuntimeError(f"LLM call failed: {e}")
+        print(f"[LLM] Unexpected call failure ({type(e).__name__}).")
+        raise RuntimeError("LLM call failed.") from e
 
 
 def call_llm_text(
@@ -362,11 +394,11 @@ def call_llm_text(
             except Exception:
                 pass
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
+            "Cannot connect to the configured Ollama server. "
             "Make sure Ollama is installed and run: ollama serve"
         )
     except Exception as e:
-        raise RuntimeError(f"LLM text call failed: {e}")
+        raise RuntimeError("LLM text call failed.") from e
 
 
 def _stream_openai(
@@ -482,7 +514,9 @@ def _stream_openai(
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
     except Exception as e:
-        raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
+        raise RuntimeError(
+            f"OpenAI-compatible stream failed ({type(e).__name__})"
+        ) from e
 
 
 def call_llm_stream(
@@ -569,12 +603,12 @@ def call_llm_stream(
     try:
         yield from _do_stream()
     except requests.exceptions.ConnectionError as e:
-        print(f"[LLM] Stream ConnectionError — trying to restart Ollama… ({e})")
+        print("[LLM] Stream connection error; trying to restart Ollama.")
         if ensure_ollama_running():
             yield from _do_stream()
             return
         raise RuntimeError(
-            f"Cannot connect to Ollama at {url}. "
+            "Cannot connect to the configured Ollama server. "
             "Make sure Ollama is installed and run: ollama serve"
         )
     except requests.exceptions.Timeout:
@@ -582,5 +616,5 @@ def call_llm_stream(
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
     except Exception as e:
-        print(f"[LLM] Stream error: {type(e).__name__}: {e}")
-        raise RuntimeError(f"LLM stream failed: {e}")
+        print(f"[LLM] Stream failed ({type(e).__name__}).")
+        raise RuntimeError("LLM stream failed.") from e

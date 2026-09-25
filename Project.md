@@ -2,7 +2,7 @@
 
 **Repository:** `jonas050210/Mark-LIV-fixed`
 
-**Working branch:** `arena/01a0d47f-mark-liv-fixed`
+**Working branch:** `arena/01a0d6a6-mark-liv-fixed`
 
 **Purpose of this document:** This is the complete project record for the current implementation. It explains the project’s purpose, architecture, files, decisions, safety rules, implemented features, tests, limitations, and the work completed during this development session. It is intentionally more detailed than `README.md`.
 
@@ -75,23 +75,11 @@ The important requirements were:
 
 ## 3. Current implementation status
 
-The implementation, documentation, verification runner, and several bug-hunt fixes are complete on the working branch.
+The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, and local Session Vault are complete on the working branch.
 
-Latest implementation commit before this document:
+The implementation is proposed for `main` in pull request #2. The latest local default suite passes 95 tests with five expected optional/platform skips, discovers 13 active actions, and reports 9 passed, 0 failed, and 2 skipped overall. Pull-request CI validates the same repository on Ubuntu and Windows with Python 3.11 and 3.13.
 
-```text
-a81125c Check dashboard route contract in overall runner
-```
-
-Documentation commit for this file:
-
-```text
-7e3d55e Document complete project architecture and history
-```
-
-The branch also contains the preceding implementation and hardening commits described later in this document.
-
-The working tree is intended to remain clean after commits. The current sandbox is Linux, so Windows hardware behavior and the real Roblox/two-monitor flow cannot be physically verified here.
+The current sandbox is Linux, so destructive Windows hardware integration, real Roblox behavior, physical multi-monitor placement, and actual audio-device behavior still require manual validation on suitable hardware. These are environmental validation limits, not unfinished repository code.
 
 ---
 
@@ -188,6 +176,16 @@ A headless process refuses a destructive operation when it cannot display a conf
 ### 4.5 Undo
 
 `core/undo.py` stores reversible operations. File and window actions use this shared mechanism where appropriate. Destructive operations are not made safe merely by claiming they are undoable; they also pass through confirmation rules.
+
+### 4.6 Persistence and filesystem boundaries
+
+`core/json_store.py` provides bounded, validated, transactionally locked JSON state with atomic replacement, recovery backups, corruption quarantine, private permissions where supported, and Windows/POSIX advisory locking. Configuration, long-term memory, saved sessions, shortcuts, monitors, and Spotify tokens use this shared primitive rather than independent read/modify/write sequences.
+
+`core/path_policy.py` provides the shared user-folder boundary, protected credential/browser paths, link and Windows reparse-point screening, bounded names and paths, fingerprints, no-replace publication, and race-aware atomic write helpers. File actions, processors, reminder scripts, dashboard uploads, and Explorer operations reuse that policy.
+
+### 4.7 Bounded execution and trusted code
+
+Action and plugin discovery validates schemas, source locations, file types, permissions, and links before loading trusted local Python. Execution has bounded worker capacity, deadlines, cancellation, bounded results, and sanitized diagnostics. Model-produced Python is not executed: `core/sandbox.py` rejects generated-code execution rather than presenting an AST filter as a security boundary.
 
 ---
 
@@ -336,27 +334,33 @@ The dashboard already provides:
 - upload support;
 - live messages and system notices.
 
-### 7.2 New dashboard improvements
+### 7.2 Dashboard improvements in the hardened implementation
 
-The following were added during this pass:
+The hardened dashboard includes:
 
-- dedicated Explorer search/open/select panel;
+- dedicated Explorer search/open/select controls;
 - quote-safe HTML escaping for dynamic values;
-- safer Windows firewall setup without Python `shell=True` subprocess calls;
-- dashboard PIN login rate limiting;
-- invalid login request handling;
-- route contract checks in `test_overall.py` when dashboard dependencies are installed.
+- safer Windows firewall setup without Python `shell=True` calls;
+- rate-limited PIN login and bounded authentication/session stores;
+- bounded request bodies, uploads, messages, actions, and asynchronous tasks;
+- authenticated WebSockets and command payloads;
+- bounded, reparse-safe file access and no-replace upload publication;
+- cancellation and lifecycle updates shared with the main action runtime;
+- route, authentication, upload, task, and path-safety regression tests.
 
 ### 7.3 Dashboard security
 
-- API endpoints require an authenticated bearer token.
-- Pairing keys are short-lived and one-time use.
+- API endpoints and WebSockets require an authenticated bearer session.
+- Pairing keys are short-lived, one-time use, capped, and actively expired.
 - Login attempts are rate limited by peer address.
-- Persistent device tokens can be revoked.
+- Persistent device sessions are bounded, expire, and can be revoked.
+- Command payloads are authenticated before decryption.
 - Dynamic dashboard values are HTML escaped, including quotes and apostrophes.
 - File Explorer endpoints do not accept shell commands.
-- Firewall setup uses a generated batch file only for the OS-level firewall operation and invokes it through `cmd.exe` with `shell=False` from Python.
-- The dashboard is still a local/LAN control surface and should not be exposed to the public Internet without additional deployment security.
+- A per-install TLS certificate protects LAN access. If TLS initialization fails, plain HTTP binds only to loopback rather than exposing an unencrypted LAN service.
+- The local CryptoJS asset is SHA-256 pinned and served only when its bytes match the expected digest.
+- Firewall setup uses a generated batch file only for the OS-level operation and invokes it through `cmd.exe` with `shell=False` from Python.
+- The dashboard remains a local/LAN control surface and is not intended for direct public-Internet exposure.
 
 ---
 
@@ -446,11 +450,12 @@ The dashboard shows selected microphone/speaker state, connection status, host A
 
 ### 10.1 Memory
 
-- `memory/config_manager.py` stores configuration values.
-- `memory/memory_manager.py` stores and retrieves persistent assistant memory.
+- `memory/config_manager.py` validates, bounds, redacts, and transactionally stores configuration values.
+- `memory/memory_manager.py` stores durable facts, builds a bounded prompt core/index, supports lexical recall, and acknowledges automatic startup summaries without losing newer data.
+- `memory/session_store.py` stores up to 20 explicitly named conversation bookmarks with at most 40 sanitized turns each. It supports save/update, list, unambiguous lookup, bounded resume context, and confirmed deletion.
 - `memory/__init__.py` marks the package.
 
-Runtime memory and credentials are intentionally excluded from Git.
+All persistent memory uses `core/json_store.py`, so concurrent updates do not silently overwrite unrelated fields and corrupt primaries can recover from a validated backup. Saved sessions are separate from provider resumption handles: resuming a bookmark drops the opaque handle, opens a fresh Live connection, and injects only bounded historical context as a narration-only turn. Runtime memory, session snapshots, sidecars, and credentials are intentionally excluded from Git.
 
 ### 10.2 Voice and language
 
@@ -478,11 +483,26 @@ This section explains every source/document file currently in the repository.
 
 ### 11.1 Root files
 
+#### `.gitattributes`
+Keeps the integrity-pinned CryptoJS vendor asset byte-for-byte stable across operating systems.
+
+#### `.github/workflows/verify.yml`
+Pinned GitHub Actions workflow covering Ubuntu and Windows on Python 3.11 and 3.13. Every job validates setup inputs, compiles the repository, runs all unit tests, constructs the dependency-aware dashboard, and runs overall verification.
+
+#### `.github/scripts/run_tests.py`
+Cross-platform unit-test runner that emits concise GitHub annotations and step summaries when a test fails.
+
+#### `.github/scripts/run_overall.py`
+Cross-platform wrapper that preserves the overall verifier's report and exposes failed gates as GitHub annotations and step summaries.
+
 #### `.gitignore`
-Protects secrets, runtime memory, credentials, certificates, virtual environments, build files, logs, screenshots, test-result output, and Python cache files from being committed.
+Protects secrets, runtime memory, credentials, private-store sidecars, certificates, virtual environments, build files, logs, screenshots, test-result output, and Python cache files from being committed.
 
 #### `LICENSE`
 Project license text.
+
+#### `Project.md`
+This engineering record: current architecture, security decisions, complete tracked-file inventory, verification evidence, development history, and physical-validation limits.
 
 #### `README.md`
 Canonical concise project guide. It covers installation, setup check mode, overall verification, dashboard behavior, Roblox behavior, Explorer behavior, optional capabilities, Spotify notes, and safety rules.
@@ -574,6 +594,9 @@ Proactive assistant behavior and contextual check-ins.
 #### `actions/reminder.py`
 Cross-platform reminder scheduling through platform-native mechanisms where available.
 
+#### `actions/session_manager.py`
+Action-registry interface for explicitly saving, listing, resuming, and deleting private local conversation snapshots. Saving receives a copy of the completed-turn transcript; deletion is confirmation-protected.
+
 #### `actions/screen_processor.py`
 Screen and camera capture/processing. Vision dependencies are optional and imported lazily.
 
@@ -595,9 +618,9 @@ Action-registry wrapper around `core.window_manager.py` for listing, focusing, m
 Marks the core directory as a Python package.
 
 #### `core/action_loader.py`
-Discovers action modules, validates `TOOL` declarations, exposes capability manifests, applies confirmation/admin/timeout policy, and normalizes action results.
+Discovers action modules, validates strict `TOOL` schemas and trusted source files, exposes capability manifests, applies confirmation/admin/deadline/cancellation policy, bounds worker capacity, and normalizes bounded action results.
 
-It also avoids stale module reuse when separate directories contain files with the same module stem.
+It also avoids stale module reuse when separate directories contain files with the same module stem, screens symbolic links/reparse points and unsafe permissions, and reports sanitized load failures.
 
 #### `core/action_result.py`
 Defines the structured action-result contract. It converts legacy strings to statuses such as succeeded, failed, unavailable, cancelled, and confirmation-pending.
@@ -635,20 +658,26 @@ Global/local keyboard shortcut and push-to-talk handling.
 #### `core/installer.py`
 Installation/download helpers, including optional wake-word setup and child-process isolation.
 
+#### `core/json_store.py`
+Shared bounded JSON transaction layer with process-local and cross-process locking, strict validation, atomic replacement, private temporary files, validated backups, corruption quarantine, and recovery.
+
 #### `core/llm_client.py`
-Lower-level language-model client utilities and request handling.
+Lower-level language-model client utilities with bounded requests, loopback/private endpoint policy, response validation, and sanitized failures.
+
+#### `core/path_policy.py`
+Shared filesystem boundary for user-directed paths, protected roots, names, links/reparse points, fingerprints, atomic writes, and no-replace moves/publication.
 
 #### `core/plugin_loader.py`
-Plugin discovery, validation, capability exposure, timeout, and plugin execution.
+Trusted local plugin discovery, strict schema and source validation, capability exposure, bounded worker capacity, deadlines, cancellation, dependency reporting, and sanitized plugin execution failures.
 
 #### `core/process_runner.py`
-Bounded child-process execution, timeouts, output limits, and process-group cleanup.
+Bounded child-process execution with process-group creation, cooperative cancellation, timeout escalation, output-tail limits, and deterministic cleanup.
 
 #### `core/prompt.txt`
 Base prompt and assistant behavior instructions used by MARK LIV.
 
 #### `core/sandbox.py`
-Deny-by-default validator and child-process runner for generated desktop code. It uses an AST allowlist, bounded execution, a restricted namespace, a user-home boundary, and no direct imports in generated code.
+Fail-closed compatibility boundary for the former generated-code feature. Direct execution of model-produced source is disabled, including code that appears read-only; supported work must use a reviewed action or trusted local plugin instead.
 
 #### `core/shortcut_store.py`
 Persistent deterministic shortcut storage and resolution.
@@ -677,9 +706,9 @@ Native and fallback desktop window/monitor enumeration and manipulation.
 Marks the dashboard directory as a Python package.
 
 #### `dashboard/server.py`
-FastAPI/uvicorn dashboard server. It provides authentication, pairing, encryption, command dispatch, uploads, action status, undo endpoints, desktop snapshots, capability manifests, Explorer search/open/select endpoints, and websocket updates.
+FastAPI/uvicorn dashboard server. It provides bounded authentication and pairing state, authenticated encryption, TLS, command dispatch, uploads, action status, undo endpoints, desktop snapshots, capability manifests, Explorer search/open/select endpoints, authenticated WebSockets, and tracked asynchronous tasks.
 
-It also contains platform firewall setup helpers. Windows firewall setup now avoids Python `shell=True` interpolation and validates ports.
+Its file access reuses the shared path policy, uploads are bounded and published without replacement, and LAN exposure fails closed when TLS is unavailable. Platform firewall setup avoids Python `shell=True` interpolation and validates ports.
 
 #### `dashboard/static/app.html`
 Authenticated remote dashboard UI. It contains:
@@ -699,7 +728,7 @@ Authenticated remote dashboard UI. It contains:
 Remote dashboard pairing/login page.
 
 #### `dashboard/static/crypto-js.min.js`
-Local CryptoJS browser dependency used for dashboard payload encryption when available.
+Local CryptoJS browser dependency used for dashboard payload encryption. Its exact SHA-256 digest is pinned by the server, and `.gitattributes` prevents line-ending conversion from changing its bytes.
 
 ### 11.5 `config/`
 
@@ -717,10 +746,13 @@ Runtime secret/config files such as `api_keys.json`, Spotify tokens, OAuth crede
 Marks the memory directory as a package.
 
 #### `memory/config_manager.py`
-Configuration file management and persisted settings.
+Validated transactional configuration storage with bounded display names, atomic patches, private files, and sanitized diagnostics.
 
 #### `memory/memory_manager.py`
-Persistent user memory storage, lookup, update, and session-related memory handling.
+Validated transactional long-term memory with bounded values, prompt-core and index budgets, session-summary save/peek/acknowledge behavior, and safe corruption recovery.
+
+#### `memory/session_store.py`
+Private bounded Session Vault with unique opaque IDs, named upserts, sanitized role-labelled turns, unambiguous lookup, no silent eviction, and injection-labelled resume context.
 
 ### 11.7 `plugins/`
 
@@ -732,17 +764,35 @@ Template and example structure for creating a new plugin.
 
 ### 11.8 `tests/`
 
+#### `tests/test_action_policy.py`
+Tests trusted action loading, strict schemas, confirmation expiry and race handling, bounded web-search workers, reminder storage, process cancellation, process-group escalation, and bounded output tails.
+
 #### `tests/test_action_runtime.py`
-Tests action result normalization, confirmation protection, confirmation cancellation lifecycle, headless fail-closed behavior, action cancellation, optional import availability, and timeout handling.
+Tests result normalization and size bounds, confirmation protection and lifecycle, headless fail-closed behavior, deadlines, cancellation, listener isolation, bounded workers, source validation, and unavailable optional imports.
+
+#### `tests/test_dashboard_safety.py`
+Tests authentication, body/upload limits, encrypted command validation, bounded task tracking, safe file access, action cancellation, and fail-closed dashboard behavior.
 
 #### `tests/test_explorer_and_open_app.py`
-Tests known-folder aliases, exact search, deterministic duplicate results, Windows Explorer argument-list selection, file-search default location, candidate-number selection, app focus behavior, process-name matching, Roblox second-instance movement, monitor verification, and honest failure reporting.
+Tests known-folder aliases, exact and deterministic search, Windows Explorer argument-list selection, file-search defaults, explicit candidate selection, app focusing, process matching, Roblox second-instance movement, monitor verification, and honest failure reporting.
+
+#### `tests/test_filesystem_safety.py`
+Tests protected paths, symbolic-link rejection, no-overwrite mutation, stable parser snapshots, generated-output races, archive traversal/link/bomb rejection, bounded extraction, and cross-platform atomic writes.
 
 #### `tests/test_pc_actions.py`
-Tests shortcut behavior and media-control authentication safety.
+Tests deterministic shortcuts and media-control authentication safety.
+
+#### `tests/test_persistence_safety.py`
+Tests concurrent JSON/config updates, corruption recovery, backups, non-finite values, size bounds, private permissions, platforms without `fchmod`, memory prompt bounds, and transactional session acknowledgement.
+
+#### `tests/test_plugin_safety.py`
+Tests trusted plugin sources, schema validation, sanitized dependency reporting, execution deadlines, cancellation, worker limits, and fail-fast behavior.
 
 #### `tests/test_sandbox.py`
-Tests that dangerous generated-code imports and destructive operations are rejected and that safe read-only inspection uses a child process.
+Tests that generated-code execution is disabled, including source that appears read-only.
+
+#### `tests/test_session_store.py`
+Tests session save/update/list/resume/delete behavior, transcript and context bounds, malformed-primary recovery, selector ambiguity, capacity refusal, explicit deletion confirmation metadata, and empty-session rejection.
 
 #### `tests/test_wake_word.py`
 Tests that wake-word readiness checks do not execute broken native packages in the main process.
@@ -751,7 +801,7 @@ Tests that wake-word readiness checks do not execute broken native packages in t
 Tests named-window matching, monitor snapping, monitor work-area use, and undo registration for window movement.
 
 #### `tests/test_windows_integration.py`
-Opt-in Windows integration tests for audio diagnostics, DPI-aware monitor geometry, and two-display refresh reporting. They skip outside Windows or unless explicitly enabled.
+Opt-in Windows hardware tests for audio diagnostics, DPI-aware monitor geometry, and two-display refresh reporting. They skip outside Windows or unless explicitly enabled.
 
 ---
 
@@ -760,16 +810,18 @@ Opt-in Windows integration tests for audio diagnostics, DPI-aware monitor geomet
 ### Normal unit suite
 
 ```bash
-python -m unittest discover -s tests -v
+python .github/scripts/run_tests.py
 ```
+
+The direct equivalent is `python -m unittest discover -s tests -v`. The CI wrapper keeps local behavior while adding concise GitHub annotations and step summaries on failure.
 
 ### Safe project-wide verification
 
 ```bash
-python test_overall.py
+python .github/scripts/run_overall.py
 ```
 
-This is non-destructive by default.
+The direct verifier is `python test_overall.py`. Verification is non-destructive by default; the CI wrapper only adds machine-readable failure reporting.
 
 ### JSON verification report
 
@@ -799,35 +851,36 @@ python setup.py --check
 
 If Node.js is installed, the overall runner extracts inline dashboard scripts and runs `node --check` on them.
 
+### Cross-platform CI
+
+`.github/workflows/verify.yml` runs setup validation, compilation, unit tests, and overall verification on:
+
+- Ubuntu with Python 3.11;
+- Ubuntu with Python 3.13;
+- Windows with Python 3.11;
+- Windows with Python 3.13.
+
+Workflow actions are pinned to immutable commit SHAs and the job token has read-only repository-content permission.
+
 ---
 
 ## 13. Latest verification result
 
-The latest safe verification completed with:
+The latest local default verification completed with:
 
 ```text
-9 checks passed
-0 checks failed
-2 checks skipped
-31 unit tests passed
-3 Windows integration tests skipped
+95 unit tests run successfully
+5 optional/platform tests skipped
+9 overall checks passed
+0 overall checks failed
+2 overall checks skipped
 ```
 
-The skipped overall checks were:
+The two local overall skips are dashboard route construction, because the lightweight sandbox does not install FastAPI/uvicorn by default, and opt-in Windows hardware integration, because the sandbox is Linux. The dependency-aware CI jobs do construct and test the dashboard.
 
-1. **Dashboard route construction** because FastAPI/uvicorn are not installed in the current sandbox.
-2. **Windows integration** because the current sandbox is Linux.
+Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 95 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
 
-The current environment also does not provide:
-
-- a physical Windows desktop;
-- Roblox;
-- two real monitors;
-- Windows Known Folder runtime behavior;
-- the optional wake-word package;
-- full dashboard dependencies.
-
-Those limitations are environmental, not claims that the corresponding code paths have been physically validated.
+The environment still does not provide a physical Windows desktop, Roblox, two real monitors, actual Windows Known Folder redirection, real audio devices, or the optional wake-word package. Those are environmental limits, not claims that physical behavior has been validated.
 
 ---
 
@@ -839,23 +892,27 @@ The model cannot confirm its own destructive action. Confirmation comes from the
 
 ### File safety
 
-File mutation operations remain restricted to safe user paths through the existing file-controller boundaries. Explorer search/open/select is read-only except for launching the user’s file browser.
+File reads and mutations use a shared home-folder boundary, protected credential/browser roots, link and Windows reparse-point checks, bounded paths/names, no-replace publication, and race-aware fingerprints. Parser inputs use private stable snapshots, archive extraction is bounded and staged, and generated outputs do not silently replace an existing destination. Explorer search/open/select remains read-only except for launching the user’s file browser.
 
-### Subprocess safety
+### Persistence
 
-User/model text is passed through argument lists where possible. The overall runner rejects ordinary application `subprocess` calls that use `shell=True`.
+Configuration, long-term memory, saved sessions, shortcuts, monitor state, and Spotify tokens use bounded transactional JSON stores. Writes are locked, validated, flushed, atomically replaced, recoverable from a last-known-good backup, and private where the platform supports descriptor permissions. Corruption diagnostics are sanitized.
+
+### Subprocess and network safety
+
+User/model text is passed through argument lists rather than shell interpolation. Process execution has timeouts, bounded output, process-group cancellation, and escalation. The overall runner rejects application `shell=True` calls, and network requests use explicit timeouts and bounded responses.
 
 ### Secrets
 
-The repository ignores API keys, Spotify tokens, OAuth credentials, certificates, runtime memory, and related secret files. The overall runner allows protected local secret files but fails if they are unprotected.
+The repository ignores API keys, Spotify tokens, OAuth credentials, certificates, runtime memory, and private-store sidecars. The overall runner permits protected local secret files but fails if it finds an unprotected secret-like file.
 
-### Generated code
+### Generated and plugin code
 
-Generated code runs only through the restricted sandbox path, with AST validation, limited calls, bounded child-process execution, and a home-directory boundary.
+Model-produced source code is not executed. Plugins remain executable Python and are therefore trusted local code; discovery validates regular source files, links/reparse points, permissions, schemas, dependencies, and execution bounds before advertising a capability.
 
 ### Dashboard
 
-The dashboard requires authentication, uses one-time pairing keys, rate limits PIN attempts, and keeps destructive control behind the same action/confirmation system rather than creating a hidden second control path.
+The dashboard uses TLS for LAN access, expiring bearer sessions, one-time pairing keys, login throttling, authenticated encrypted commands, bounded uploads/tasks/state, authenticated WebSockets, and the same action/confirmation system as voice and local UI. Without usable TLS it binds plain HTTP to loopback only.
 
 ### Honest results
 
@@ -894,7 +951,18 @@ The project avoids saying an action succeeded merely because a command was sent.
    - Setup has a no-install check mode.
    - GUI Explorer operations are read-only.
 
-7. **No unrelated expansion**
+7. **Transactional state instead of ad-hoc JSON writes**
+   - Persistent updates are validated, locked, bounded, atomic, and recoverable.
+
+8. **No model-produced code execution**
+   - New behavior must be implemented as a reviewed action or trusted local plugin.
+
+9. **Facts, summaries, and saved sessions are separate**
+   - Durable facts remain searchable across every conversation.
+   - The automatic prior-session summary is consumed by the next briefing.
+   - Explicit bookmarks are user-named, bounded, locally stored snapshots that can be resumed or deleted independently.
+
+10. **No unrelated expansion**
    - The project remains focused on useful, reliable PC control.
 
 ---
@@ -923,48 +991,45 @@ The major implementation history is:
 - `2744f43` — subprocess-safety gate added to overall verification.
 - `dfb8854` — dashboard PIN authentication rate limited.
 - `a81125c` — dashboard route contract added to the overall runner.
+- `70c62dd` — repository-wide runtime, persistence, filesystem, dashboard, plugin, and action hardening.
+- `f4e94f4` — pinned cross-platform verification workflow added.
+- `19d0b60` — Windows-console UTF-8 portability and current pinned workflow actions.
+- `dabcdfb` — concise CI unit-test annotations and summaries.
+- `0036df4` — Windows persistence portability, descriptor cleanup, overall diagnostics, and final cross-platform fixes.
+- `9fab83e` — complete engineering record synchronized with the hardened implementation.
 
-All work is kept on the fixed branch:
+All current work is kept on the fixed branch:
 
 ```text
-arena/01a0d47f-mark-liv-fixed
+arena/01a0d6a6-mark-liv-fixed
 ```
 
 ---
 
 ## 17. Remaining work
 
-The next high-value work is a true cross-platform/dependency bug hunt rather than another broad feature expansion.
+No known repository implementation blocker remains for pull request #2. Automated Linux/Windows CI, dashboard-aware verification, adversarial persistence/filesystem tests, and the repository-wide hardening pass are complete.
 
-### Required next validation
+### Optional physical validation
 
-- Install the full requirements set in a clean environment.
-- Run `test_overall.py` with FastAPI/uvicorn installed.
-- Exercise dashboard authentication and Explorer endpoints.
-- Run on actual Windows.
-- Test normal Roblox focusing.
-- Test explicit second Roblox launch.
-- Test Roblox behavior with one monitor and two monitors.
-- Test Known Folder resolution against redirected Windows folders.
-- Test Explorer search with Everything installed and unavailable.
-- Test optional dependencies missing one at a time.
-- Test fresh install and restart/reconnect behavior.
+The following checks require the target machine or user accounts and cannot be proven in this sandbox:
 
-### Deep bug-hunt categories
+- run `python test_overall.py --windows` on the intended Windows computer;
+- verify microphone/speaker selection and reconnect behavior with real devices;
+- test normal Roblox focusing and an explicitly requested second instance;
+- test Roblox placement with one physical monitor and with two physical monitors;
+- verify redirected Windows Known Folders and Everything search on the target profile;
+- exercise wake-word setup with the optional native package installed;
+- perform a fresh full-requirements installation and a manual restart/reconnect smoke test.
 
-- False success messages.
-- Confirmation races and stale pending confirmations.
-- Dashboard authentication and session expiry.
-- Upload limits and path safety.
-- File processor output paths and overwrite behavior.
-- Action timeout cleanup and worker leaks.
-- Window handle races.
-- Audio reconnect races.
-- Wake-word worker shutdown.
-- Browser session cleanup.
-- Plugin timeout and capability isolation.
-- Configuration migration and corrupt files.
-- Documentation drift against the live action registry.
+These checks may reveal hardware, driver, account, or application-specific behavior, but they are not hidden claims that the automated suite has already exercised physical devices.
+
+### Future maintenance
+
+- Keep action schemas, documentation, and runtime capabilities synchronized.
+- Review dependency bounds and pinned GitHub actions periodically.
+- Add regression tests before changing filesystem, authentication, confirmation, persistence, or worker-limit policy.
+- Preserve the bounded, observable, reversible action model when adding a new capability.
 
 ### Things intentionally not planned
 
@@ -991,4 +1056,4 @@ over:
 A larger action surface that sometimes claims success without knowing.
 ```
 
-That principle governs the launcher, Roblox handling, Explorer, dashboard, action registry, confirmation system, test runner, and the remaining bug hunt.
+That principle governs the launcher, Roblox handling, Explorer, persistence, dashboard, action and plugin registries, confirmation system, and verification pipeline.

@@ -201,8 +201,8 @@
         document.getElementById('err').textContent = 'Connection error';
         shake(); return;
       }
-      if (data.ok && data.token) {
-        sessionStorage.setItem('jarvis_key', key);
+      if (data.ok && data.token && data.key) {
+        sessionStorage.setItem('jarvis_key', data.key);
         sessionStorage.setItem('jarvis_token', data.token);
         location.href = '/';
       } else {

@@ -14,6 +14,7 @@ capabilities that do not help operate the computer:
 - `file_controller`: known-folder Explorer search/open/select plus safe file and folder operations with confirmation/undo
 - `file_processor`: work on user-uploaded files
 - `shortcut_manager`: deterministic app/file aliases
+- `session_manager`: private bounded conversation bookmarks with confirmed deletion
 - `web_search`, `reminder`: supporting assistant capabilities
 
 Developer-agent, messaging, travel, weather, game-updater, YouTube-specific,

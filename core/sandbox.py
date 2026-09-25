@@ -1,19 +1,15 @@
-"""Small, deny-by-default runner for model-generated desktop snippets.
+"""Validation helpers for legacy model-generated desktop snippets.
 
-This is a safety boundary, not a claim of a kernel sandbox.  The generated
-program runs in a separate interpreter with a clean environment, a process
-limit, no imports, no real ``Path``/``os``/``ctypes`` objects, and a strict AST
-allowlist.  A task that needs capabilities outside this surface is refused.
+Generated source execution is disabled. An AST allowlist remains only so old
+callers receive a precise rejection for obviously unsafe snippets before the
+unconditional execution-policy error. A Python subprocess is not a dependable
+security sandbox for model-produced code.
 """
 from __future__ import annotations
 
 import ast
-import base64
-import os
-import sys
 from pathlib import Path
 
-from core.process_runner import run_bounded
 
 
 class UnsafeCode(ValueError):
@@ -38,7 +34,7 @@ _ALLOWED_CALLS = {
 _ALLOWED_ATTRIBUTES = {
     "home", "exists", "is_file", "is_dir", "iterdir", "stat", "read_text",
     "name", "suffix", "parent", "stem", "resolve", "__str__",
-    "copy2", "copytree", "disk_usage", "join", "basename", "dirname",
+    "disk_usage", "join", "basename", "dirname",
     "splitext", "getsize", "sleep",
 }
 _BANNED_WORDS = {
@@ -92,105 +88,12 @@ def validate_generated_code(code: str) -> str:
     return code
 
 
-def _child_script() -> str:
-    """The child interpreter body; kept as a string so it has no project imports."""
-    return r'''
-import ast, base64, os, sys, time as _time
-from pathlib import Path as _RealPath
-
-code = base64.b64decode(sys.argv[1]).decode("utf-8")
-root = _RealPath(sys.argv[2]).resolve()
-
-class SafePath:
-    def __init__(self, value):
-        raw = _RealPath(value).expanduser()
-        resolved = raw.resolve()
-        if resolved != root and root not in resolved.parents:
-            raise PermissionError("path is outside the allowed home directory")
-        self._p = resolved
-    @classmethod
-    def home(cls): return cls(root)
-    def __truediv__(self, other): return SafePath(self._p / str(other))
-    @property
-    def parent(self): return SafePath(self._p.parent)
-    @property
-    def name(self): return self._p.name
-    @property
-    def stem(self): return self._p.stem
-    @property
-    def suffix(self): return self._p.suffix
-    def exists(self): return self._p.exists()
-    def is_file(self): return self._p.is_file()
-    def is_dir(self): return self._p.is_dir()
-    def iterdir(self): return [SafePath(x) for x in self._p.iterdir()]
-    def stat(self): return self._p.stat()
-    def read_text(self, encoding="utf-8", errors="strict"): return self._p.read_text(encoding=encoding, errors=errors)[:100000]
-    def resolve(self): return self
-    def __str__(self): return str(self._p)
-
-class SafeShutil:
-    @staticmethod
-    def copy2(src, dst):
-        from shutil import copy2
-        return copy2(str(src), str(dst))
-    @staticmethod
-    def copytree(src, dst):
-        from shutil import copytree
-        return copytree(str(src), str(dst))
-    @staticmethod
-    def disk_usage(path):
-        from shutil import disk_usage
-        return disk_usage(str(path))
-
-class SafeOsPath:
-    join = staticmethod(os.path.join)
-    exists = staticmethod(os.path.exists)
-    isfile = staticmethod(os.path.isfile)
-    isdir = staticmethod(os.path.isdir)
-    basename = staticmethod(os.path.basename)
-    dirname = staticmethod(os.path.dirname)
-    splitext = staticmethod(os.path.splitext)
-    getsize = staticmethod(os.path.getsize)
-
-safe_builtins = {
-    "print": print, "len": len, "str": str, "int": int, "float": float,
-    "bool": bool, "list": list, "dict": dict, "tuple": tuple,
-    "range": range, "enumerate": enumerate, "sorted": sorted,
-    "isinstance": isinstance,
-    "max": max, "min": min, "sum": sum, "abs": abs,
-    "zip": zip, "map": map, "filter": filter,
-}
-namespace = {
-    "__builtins__": safe_builtins, "Path": SafePath, "shutil": SafeShutil(),
-    "os_path": SafeOsPath(), "time": type("SafeTime", (), {"sleep": staticmethod(_time.sleep)})(),
-}
-exec(compile(code, "<jarvis_sandbox>", "exec"), namespace, namespace)
-'''
-
-
 def run_generated_code(code: str, *, root: Path | None = None, timeout: float = 15.0) -> str:
-    code = validate_generated_code(code)
-    root = (root or Path.home()).expanduser().resolve()
-    home = Path.home().resolve()
-    if root != home and home not in root.parents:
-        raise UnsafeCode("sandbox root must be inside the user home directory")
-    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "TEMP": os.environ.get("TEMP", ""),
-        "TMP": os.environ.get("TMP", ""),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONIOENCODING": "utf-8",
-    }
-    result = run_bounded(
-        [sys.executable, "-I", "-S", "-c", _child_script(), encoded, str(root)],
-        cwd=str(root), env=env, timeout=timeout, max_output=20_000,
+    """Refuse generated source execution regardless of its apparent contents."""
+    validate_generated_code(code)
+    raise UnsafeCode(
+        "model-generated Python execution is disabled; use a declared, validated action"
     )
-    if result.timed_out:
-        return f"Generated desktop code timed out after {timeout:.0f}s and was stopped."
-    if result.returncode not in (0, None):
-        return f"Generated desktop code failed: {result.stderr.strip()[:800]}"
-    return result.stdout.strip() or "Done."
 
 
 __all__ = ["UnsafeCode", "validate_generated_code", "run_generated_code"]

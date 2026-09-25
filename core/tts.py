@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import queue as _queue
+import re
 import threading
 from typing import Callable, Optional
 
@@ -137,18 +138,12 @@ _KOKORO_COMPAT_ERRORS = ("AlbertModel", "AutoModel", "cannot import name")
 
 
 def _import_kokoro_pipeline():
-    """Import KPipeline, auto-upgrading kokoro if a version mismatch is found.
+    """Import KPipeline and explain known version mismatches safely.
 
-    Old kokoro (<0.9) imports AlbertModel / AutoModel from transformers.
-    Newer transformers versions no longer export these at the top level,
-    causing an ImportError.  kokoro>=0.9 removed these dependencies.
-
-    When the error is detected we:
-      1. Upgrade kokoro to >=0.9 via pip (silent, background)
-      2. Flush stale kokoro entries from sys.modules
-      3. Re-import — this time it should succeed
+    Runtime voice synthesis must not silently modify the Python environment or
+    download executable dependencies. Dependency changes remain an explicit
+    setup step controlled by the user.
     """
-    import sys
 
     def _try_import():
         from kokoro import KPipeline  # noqa: PLC0415
@@ -165,34 +160,10 @@ def _import_kokoro_pipeline():
                 "Run: pip install kokoro>=0.9 soundfile"
             ) from first_err
 
-        # ── Version mismatch: upgrade kokoro silently and retry ──────────
-        print("[TTS] Kokoro/transformers version mismatch detected — upgrading kokoro…")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "kokoro>=0.9",
-             "--upgrade", "--quiet", "--disable-pip-version-check"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace").strip()
-            raise RuntimeError(
-                f"Kokoro auto-upgrade failed: {stderr[:200]}\n"
-                "Run manually: pip install kokoro>=0.9 soundfile"
-            ) from first_err
-
-        # Flush any stale kokoro submodules from the import cache
-        stale = [k for k in sys.modules if k == "kokoro" or k.startswith("kokoro.")]
-        for key in stale:
-            del sys.modules[key]
-
-        print("[TTS] Kokoro upgraded — retrying import…")
-        try:
-            return _try_import()
-        except Exception as retry_err:
-            raise RuntimeError(
-                f"Kokoro still broken after upgrade: {retry_err}\n"
-                "Run manually: pip install --upgrade kokoro transformers"
-            ) from retry_err
+        raise RuntimeError(
+            "Kokoro is incompatible with the installed transformers version. "
+            "Run explicitly: pip install --upgrade 'kokoro>=0.9' transformers soundfile"
+        ) from first_err
 
 
 # Kokoro voice prefix → KPipeline lang_code mapping
@@ -293,7 +264,7 @@ class KokoroTTSEngine:
                         f"Internet access is required the first time to download the voice model (~330 MB).\n"
                         f"After the first download it runs fully offline.\n"
                         f"Tip: Switch to EdgeTTS (free, no download) in the Configure panel if offline.\n"
-                        f"Details: {_dl_err}"
+                        f"Details: {type(_dl_err).__name__}"
                     ) from _dl_err
             else:
                 raise
@@ -305,7 +276,7 @@ class KokoroTTSEngine:
                 pass
             print("[TTS] Kokoro ready.")
         except Exception as e:
-            print(f"[TTS] Kokoro warmup warning: {e}")
+            print(f"[TTS] Kokoro warmup warning ({type(e).__name__}).")
 
     def speak(self, text: str) -> None:
         with self._lock:
@@ -354,7 +325,9 @@ class ElevenLabsTTSEngine:
     """ElevenLabs cloud TTS – API key required."""
 
     def __init__(self, api_key: str, voice_id: str = "pNInz6obpgDQGcFmaJgB"):
-        self.api_key  = api_key
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", str(voice_id or "")):
+            raise ValueError("ElevenLabs voice ID has an invalid format")
+        self.api_key  = str(api_key or "")[:1_000]
         self.voice_id = voice_id
 
     def speak(self, text: str) -> None:
@@ -364,16 +337,21 @@ class ElevenLabsTTSEngine:
             "Content-Type": "application/json",
         }
         payload = {
-            "text":     text,
+            "text":     str(text or "")[:100_000],
             "model_id": "eleven_multilingual_v2",
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }
-        resp = requests.post(
+        with requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}",
-            json=payload, headers=headers, timeout=30,
-        )
-        resp.raise_for_status()
-        _play_audio_bytes(resp.content)
+            json=payload, headers=headers, timeout=30, stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            audio = bytearray()
+            for chunk in resp.iter_content(64 * 1024):
+                audio.extend(chunk)
+                if len(audio) > 50 * 1024 * 1024:
+                    raise ValueError("TTS response exceeded the 50 MB limit")
+        _play_audio_bytes(bytes(audio))
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +387,7 @@ class TTSPlayer:
                 on_start()
             self._engine.speak(text)
         except Exception as e:
-            print(f"[TTS] Error: {e}")
+            print(f"[TTS] Error ({type(e).__name__}).")
         finally:
             with self._lock:
                 self._playing = False

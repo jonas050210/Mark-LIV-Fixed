@@ -55,6 +55,15 @@ class _Entry:
 
 _stack: list[_Entry] = []
 _lock = threading.Lock()
+_undo_lock = threading.Lock()
+
+
+class UndoRefused(RuntimeError):
+    """The world changed, so applying an undo would be unsafe."""
+
+
+def refuse(reason: str) -> None:
+    raise UndoRefused(str(reason))
 
 
 def push_undo(label: str, undo_fn: Callable[[], str]) -> None:
@@ -73,7 +82,7 @@ def push_undo(label: str, undo_fn: Callable[[], str]) -> None:
             while len(_stack) > MAX_DEPTH:
                 _stack.pop(0)
     except Exception as e:                                  # pragma: no cover
-        print(f"[Undo] push failed: {e}")
+        print(f"[Undo] push failed ({type(e).__name__}).")
 
 
 def can_undo() -> bool:
@@ -94,24 +103,35 @@ def history() -> list[str]:
 
 
 def undo_last() -> str:
-    """Reverse the most recent reversible operation.
+    """Reverse the newest operation, retaining safely-refused entries.
 
-    The entry is popped *before* running so a failing undo cannot be retried
-    forever against a world that has already moved on (the file the user is
-    trying to restore may have been deleted by something else since)."""
-    with _lock:
-        entry = _stack.pop() if _stack else None
+    Only one undo runs at a time. An operation that raises ``UndoRefused`` stays
+    in its original stack position so the user can resolve the conflict and try
+    again; unexpected failures are consumed because retrying unknown partial
+    work could apply the reverse operation twice.
+    """
+    with _undo_lock:
+        with _lock:
+            entry = _stack.pop() if _stack else None
+            prefix = list(_stack)
 
-    if entry is None:
-        return ("There is nothing to undo. I only track things I changed myself — "
-                "files I moved or wrote, and settings I adjusted.")
+        if entry is None:
+            return ("There is nothing to undo. I only track things I changed myself — "
+                    "files I moved or wrote, and settings I adjusted.")
 
-    try:
-        detail = entry.undo() or ""
-    except Exception as e:
-        return f"Could not undo '{entry.label}': {e}"
+        try:
+            detail = entry.undo() or ""
+        except UndoRefused as exc:
+            with _lock:
+                # New operations may have been pushed while the undo checked the
+                # filesystem. Keep those newer than this retained entry.
+                if _stack[:len(prefix)] == prefix:
+                    _stack.insert(len(prefix), entry)
+            return f"Undo refused for '{entry.label}': {exc}"
+        except Exception as e:
+            return f"Could not undo '{entry.label}' ({type(e).__name__})."
 
-    return f"Undone: {entry.label}." + (f" {detail}" if detail else "")
+        return f"Undone: {entry.label}." + (f" {detail}" if detail else "")
 
 
 def clear() -> None:

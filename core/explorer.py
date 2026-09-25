@@ -16,6 +16,8 @@ import time
 import uuid
 from pathlib import Path
 
+from core.path_policy import PathPolicyError, resolve_user_path
+
 _OS = platform.system()
 
 _KNOWN_FOLDER_GUIDS = {
@@ -85,15 +87,21 @@ def resolve_location(value: str | Path, *, allow_missing: bool = True) -> Path:
     key = " ".join(raw.casefold().split())
     known = locations()
     if key in _LOCATION_ALIASES:
-        return known[_LOCATION_ALIASES[key]]
-    normalized = raw.replace("\\", "/")
-    head, separator, tail = normalized.partition("/")
-    if separator and head.casefold() in _LOCATION_ALIASES:
-        return known[_LOCATION_ALIASES[head.casefold()]] / tail
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = Path.home() / path
-    return path if allow_missing or path.exists() else path
+        path = known[_LOCATION_ALIASES[key]]
+    else:
+        normalized = raw.replace("\\", "/")
+        head, separator, tail = normalized.partition("/")
+        if separator and head.casefold() in _LOCATION_ALIASES:
+            path = known[_LOCATION_ALIASES[head.casefold()]] / tail
+        else:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = Path.home() / path
+    return resolve_user_path(
+        path,
+        allow_missing=allow_missing,
+        reject_symlinks=False,
+    )
 
 
 def _everything_search(query: str, root: Path | None, limit: int) -> list[Path]:
@@ -117,7 +125,7 @@ def _everything_search(query: str, root: Path | None, limit: int) -> list[Path]:
             if not line.strip():
                 continue
             path = Path(line.strip())
-            if not path.exists():
+            if not path.exists() or not _allowed_result(path):
                 continue
             if root_resolved is not None:
                 try:
@@ -131,6 +139,14 @@ def _everything_search(query: str, root: Path | None, limit: int) -> list[Path]:
         return candidates
     except (OSError, subprocess.SubprocessError):
         return []
+
+
+def _allowed_result(path: Path) -> bool:
+    try:
+        resolve_user_path(path, allow_missing=False)
+        return True
+    except (PathPolicyError, FileNotFoundError, OSError, ValueError):
+        return False
 
 
 def _score(path: Path, query: str) -> tuple[int, str]:
@@ -172,11 +188,18 @@ def _walk_search(query: str, roots: list[Path], extension: str, limit: int,
             for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
                 if time.monotonic() >= deadline:
                     break
-                dirs[:] = [d for d in dirs if d.casefold() not in _SKIP_DIRS and not d.startswith(".")]
+                dirs[:] = [
+                    directory for directory in dirs
+                    if directory.casefold() not in _SKIP_DIRS
+                    and not directory.startswith(".")
+                    and _allowed_result(Path(current) / directory)
+                ]
                 for filename in files:
                     if wanted_extension and Path(filename).suffix.casefold() != wanted_extension:
                         continue
                     path = Path(current) / filename
+                    if not _allowed_result(path):
+                        continue
                     score, full = _score(path, query)
                     if score:
                         candidates.append((score, full, path))
