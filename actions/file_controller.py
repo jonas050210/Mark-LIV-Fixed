@@ -72,6 +72,32 @@ def _undo_move(src: Path, dst: Path, expected):
     return _fn
 
 
+def _why(exc: Exception) -> str:
+    """A reason a person can act on, instead of an exception's class name.
+
+    "Could not copy: ValueError" tells the user nothing: they cannot tell a
+    rejected name from a missing folder from a full disk, and neither can the
+    model deciding what to try next. The validation layers already raise with a
+    sentence explaining themselves; this surfaces it.
+    """
+    message = str(exc).strip()
+    if isinstance(exc, PermissionError):
+        return "permission was denied"
+    if isinstance(exc, FileNotFoundError):
+        return "the path no longer exists"
+    if isinstance(exc, FileExistsError):
+        return "something with that name already exists"
+    if isinstance(exc, IsADirectoryError):
+        return "the target is a folder"
+    if isinstance(exc, NotADirectoryError):
+        return "part of that path is not a folder"
+    if isinstance(exc, OSError) and exc.errno == 28:
+        return "the disk is full"
+    if message and len(message) <= 200:
+        return message
+    return f"an unexpected {type(exc).__name__}"
+
+
 def _undo_create(target: Path, expected):
     """Remove a created object only if it still has the captured identity."""
     def _fn():
@@ -359,7 +385,7 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         push_undo(f"created {target.name}", _undo_create(target, after))
         return f"File created: {target.name}"
     except Exception as e:
-        return f"Could not create file: {type(e).__name__}"
+        return f"I could not create the file: {_why(e)}."
 
 
 def create_folder(path: str, name: str = "") -> str:
@@ -382,7 +408,7 @@ def create_folder(path: str, name: str = "") -> str:
             )
         return f"Folder created: {target.name}"
     except Exception as e:
-        return f"Could not create folder: {type(e).__name__}"
+        return f"I could not create the folder: {_why(e)}."
 
 
 def delete_file(path: str, name: str = "") -> str:
@@ -459,7 +485,7 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         return f"Moved: {origin.name} → {final.parent.name}/"
 
     except Exception as e:
-        return f"Could not move: {type(e).__name__}"
+        return f"I could not move it: {_why(e)}."
 
 
 def copy_file(path: str, name: str = "", destination: str = "", cancel_event=None) -> str:
@@ -625,7 +651,7 @@ def copy_file(path: str, name: str = "", destination: str = "", cancel_event=Non
         return f"Copied: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
-        return f"Could not copy: {type(e).__name__}"
+        return f"I could not copy it: {_why(e)}."
 
 
 def rename_file(path: str, name: str = "", new_name: str = "") -> str:
@@ -659,7 +685,7 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         return f"Renamed: {old_path.name} → {clean_name}"
 
     except Exception as e:
-        return f"Could not rename: {type(e).__name__}"
+        return f"I could not rename it: {_why(e)}."
 
 
 def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
