@@ -52,7 +52,19 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import sounddevice as sd
+# The audio backend is optional at import time. PortAudio is a native library,
+# and on a machine without it — a headless CI runner, a container — importing
+# sounddevice raises. Everything except the microphone and the speaker still
+# works there, and the failure belongs where audio is actually opened, not at
+# the top of the file where it takes the whole application down with it.
+try:
+    import sounddevice as sd
+
+    _AUDIO_IMPORT_ERROR = ""
+except Exception as _exc:          # OSError when PortAudio is missing
+    sd = None
+    _AUDIO_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
 import numpy as np
 from google import genai
 from google.genai import types
@@ -1896,6 +1908,11 @@ class JarvisLive:
                 except Exception:
                     pass
 
+        if sd is None:
+            print(f"[JARVIS] ⚠️ No audio backend: {_AUDIO_IMPORT_ERROR}")
+            self.ui.write_log("ERR: No audio backend — the microphone is unavailable.")
+            return
+
         try:
             def _open_mic(dev):
                 return sd.InputStream(
@@ -2173,6 +2190,11 @@ class JarvisLive:
         _spk_dev  = audio_devices.resolve(_spk_name, "output")
         if _spk_dev is not None:
             print(f"[JARVIS] 🔊 Output device: {_spk_name}")
+
+        if sd is None:
+            print(f"[JARVIS] ⚠️ No audio backend: {_AUDIO_IMPORT_ERROR}")
+            self.ui.write_log("ERR: No audio backend — playback is unavailable.")
+            return
 
         def _open_spk(dev):
             st = sd.RawOutputStream(
