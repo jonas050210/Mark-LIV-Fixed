@@ -356,6 +356,9 @@ class ActionRegistry:
         title, detail = titles.get(
             operation, (f"Run {rec.name}", f"MARK LIV is ready to run: {operation}.")
         )
+        if rec.name == "session_manager" and operation == "delete":
+            title = "Delete a saved session"
+            detail = "The private conversation snapshot will be permanently removed."
         target_parts = []
         for key in ("file_path", "path", "source", "destination", "app", "name", "setting", "value"):
             value = parameters.get(key)

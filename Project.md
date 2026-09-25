@@ -75,15 +75,9 @@ The important requirements were:
 
 ## 3. Current implementation status
 
-The repository-wide implementation, security hardening, persistence work, regression suite, and cross-platform CI are complete on the working branch.
+The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, and local Session Vault are complete on the working branch.
 
-Latest verified implementation baseline before this documentation refresh:
-
-```text
-0036df4 Fix Windows persistence and CI portability
-```
-
-The implementation is proposed for `main` in pull request #2. GitHub Actions run `36118968199` passed all four Ubuntu/Windows and Python 3.11/3.13 jobs. The local default suite passes 86 tests with five expected optional/platform skips, and the default overall verification reports 9 passed, 0 failed, and 2 skipped.
+The implementation is proposed for `main` in pull request #2. The latest local default suite passes 94 tests with five expected optional/platform skips, discovers 13 active actions, and reports 9 passed, 0 failed, and 2 skipped overall. Pull-request CI validates the same repository on Ubuntu and Windows with Python 3.11 and 3.13.
 
 The current sandbox is Linux, so destructive Windows hardware integration, real Roblox behavior, physical multi-monitor placement, and actual audio-device behavior still require manual validation on suitable hardware. These are environmental validation limits, not unfinished repository code.
 
@@ -185,7 +179,7 @@ A headless process refuses a destructive operation when it cannot display a conf
 
 ### 4.6 Persistence and filesystem boundaries
 
-`core/json_store.py` provides bounded, validated, transactionally locked JSON state with atomic replacement, recovery backups, corruption quarantine, private permissions where supported, and Windows/POSIX advisory locking. Configuration, memory, shortcuts, monitors, and Spotify tokens use this shared primitive rather than independent read/modify/write sequences.
+`core/json_store.py` provides bounded, validated, transactionally locked JSON state with atomic replacement, recovery backups, corruption quarantine, private permissions where supported, and Windows/POSIX advisory locking. Configuration, long-term memory, saved sessions, shortcuts, monitors, and Spotify tokens use this shared primitive rather than independent read/modify/write sequences.
 
 `core/path_policy.py` provides the shared user-folder boundary, protected credential/browser paths, link and Windows reparse-point screening, bounded names and paths, fingerprints, no-replace publication, and race-aware atomic write helpers. File actions, processors, reminder scripts, dashboard uploads, and Explorer operations reuse that policy.
 
@@ -457,10 +451,11 @@ The dashboard shows selected microphone/speaker state, connection status, host A
 ### 10.1 Memory
 
 - `memory/config_manager.py` validates, bounds, redacts, and transactionally stores configuration values.
-- `memory/memory_manager.py` validates and transactionally stores persistent assistant memory, bounds prompt material, and acknowledges session summaries without losing newer data.
+- `memory/memory_manager.py` stores durable facts, builds a bounded prompt core/index, supports lexical recall, and acknowledges automatic startup summaries without losing newer data.
+- `memory/session_store.py` stores up to 20 explicitly named conversation bookmarks with at most 40 sanitized turns each. It supports save/update, list, unambiguous lookup, bounded resume context, and confirmed deletion.
 - `memory/__init__.py` marks the package.
 
-Both managers use `core/json_store.py`, so concurrent updates do not silently overwrite unrelated fields and corrupt primaries can recover from a validated backup. Runtime memory, sidecar files, and credentials are intentionally excluded from Git.
+All persistent memory uses `core/json_store.py`, so concurrent updates do not silently overwrite unrelated fields and corrupt primaries can recover from a validated backup. Saved sessions are separate from provider resumption handles: resuming a bookmark supplies bounded historical context to the active Live conversation. Runtime memory, session snapshots, sidecars, and credentials are intentionally excluded from Git.
 
 ### 10.2 Voice and language
 
@@ -598,6 +593,9 @@ Proactive assistant behavior and contextual check-ins.
 
 #### `actions/reminder.py`
 Cross-platform reminder scheduling through platform-native mechanisms where available.
+
+#### `actions/session_manager.py`
+Action-registry interface for explicitly saving, listing, resuming, and deleting private local conversation snapshots. Saving receives a copy of the completed-turn transcript; deletion is confirmation-protected.
 
 #### `actions/screen_processor.py`
 Screen and camera capture/processing. Vision dependencies are optional and imported lazily.
@@ -753,6 +751,9 @@ Validated transactional configuration storage with bounded display names, atomic
 #### `memory/memory_manager.py`
 Validated transactional long-term memory with bounded values, prompt-core and index budgets, session-summary save/peek/acknowledge behavior, and safe corruption recovery.
 
+#### `memory/session_store.py`
+Private bounded Session Vault with unique opaque IDs, named upserts, sanitized role-labelled turns, unambiguous lookup, no silent eviction, and injection-labelled resume context.
+
 ### 11.7 `plugins/`
 
 #### `plugins/__init__.py`
@@ -789,6 +790,9 @@ Tests trusted plugin sources, schema validation, sanitized dependency reporting,
 
 #### `tests/test_sandbox.py`
 Tests that generated-code execution is disabled, including source that appears read-only.
+
+#### `tests/test_session_store.py`
+Tests session save/update/list/resume/delete behavior, transcript and context bounds, selector ambiguity, capacity refusal, explicit deletion confirmation metadata, and empty-session rejection.
 
 #### `tests/test_wake_word.py`
 Tests that wake-word readiness checks do not execute broken native packages in the main process.
@@ -865,7 +869,7 @@ Workflow actions are pinned to immutable commit SHAs and the job token has read-
 The latest local default verification completed with:
 
 ```text
-86 unit tests run successfully
+94 unit tests run successfully
 5 optional/platform tests skipped
 9 overall checks passed
 0 overall checks failed
@@ -874,7 +878,7 @@ The latest local default verification completed with:
 
 The two local overall skips are dashboard route construction, because the lightweight sandbox does not install FastAPI/uvicorn by default, and opt-in Windows hardware integration, because the sandbox is Linux. The dependency-aware CI jobs do construct and test the dashboard.
 
-GitHub Actions run `36118968199` passed all four Ubuntu/Windows and Python 3.11/3.13 jobs. Each job completed setup validation, Python compilation, all 86 discovered tests with only applicable guarded skips, and overall verification.
+Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 94 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
 
 The environment still does not provide a physical Windows desktop, Roblox, two real monitors, actual Windows Known Folder redirection, real audio devices, or the optional wake-word package. Those are environmental limits, not claims that physical behavior has been validated.
 
@@ -892,7 +896,7 @@ File reads and mutations use a shared home-folder boundary, protected credential
 
 ### Persistence
 
-Configuration, memory, shortcuts, monitor state, and Spotify tokens use bounded transactional JSON stores. Writes are locked, validated, flushed, atomically replaced, recoverable from a last-known-good backup, and private where the platform supports descriptor permissions. Corruption diagnostics are sanitized.
+Configuration, long-term memory, saved sessions, shortcuts, monitor state, and Spotify tokens use bounded transactional JSON stores. Writes are locked, validated, flushed, atomically replaced, recoverable from a last-known-good backup, and private where the platform supports descriptor permissions. Corruption diagnostics are sanitized.
 
 ### Subprocess and network safety
 
@@ -953,7 +957,12 @@ The project avoids saying an action succeeded merely because a command was sent.
 8. **No model-produced code execution**
    - New behavior must be implemented as a reviewed action or trusted local plugin.
 
-9. **No unrelated expansion**
+9. **Facts, summaries, and saved sessions are separate**
+   - Durable facts remain searchable across every conversation.
+   - The automatic prior-session summary is consumed by the next briefing.
+   - Explicit bookmarks are user-named, bounded, locally stored snapshots that can be resumed or deleted independently.
+
+10. **No unrelated expansion**
    - The project remains focused on useful, reliable PC control.
 
 ---
@@ -987,6 +996,7 @@ The major implementation history is:
 - `19d0b60` — Windows-console UTF-8 portability and current pinned workflow actions.
 - `dabcdfb` — concise CI unit-test annotations and summaries.
 - `0036df4` — Windows persistence portability, descriptor cleanup, overall diagnostics, and final cross-platform fixes.
+- `9fab83e` — complete engineering record synchronized with the hardened implementation.
 
 All current work is kept on the fixed branch:
 

@@ -77,6 +77,7 @@ def protected_roots(home: Path | None = None) -> tuple[Path, ...]:
         project / "config" / "certs",
         project / "config" / "browser_profiles",
         project / "memory" / "long_term.json",
+        project / "memory" / "sessions.json",
     ]
     return tuple(path.resolve(strict=False) for path in values)
 

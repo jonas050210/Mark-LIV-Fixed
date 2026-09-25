@@ -21,6 +21,7 @@ config/whatsapp_web/          # a LINKED WhatsApp session — committing it hand
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
+memory/sessions.json          # explicitly saved private conversation snapshots
 memory/*.json.*               # private-store backups, locks, quarantine, and temp files
 memory/.*.json.*              # hidden private-store sidecars
 memory/*.db

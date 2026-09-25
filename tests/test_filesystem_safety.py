@@ -16,9 +16,12 @@ class PathPolicyTests(unittest.TestCase):
     def test_traversal_and_protected_credentials_are_denied(self) -> None:
         with self.assertRaises(PathPolicyError):
             resolve_user_path("../../etc/passwd", allow_missing=True)
-        protected = Path(__file__).resolve().parents[1] / "config" / "api_keys.json"
+        project = Path(__file__).resolve().parents[1]
+        protected = project / "config" / "api_keys.json"
         with self.assertRaises(PathPolicyError):
             resolve_user_path(protected, allow_missing=True)
+        with self.assertRaises(PathPolicyError):
+            resolve_user_path(project / "memory" / "sessions.json", allow_missing=True)
         with self.assertRaises(PathPolicyError):
             resolve_user_path(
                 Path.home(), allow_missing=False, protect_ancestors=True

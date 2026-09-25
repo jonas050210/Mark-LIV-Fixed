@@ -121,7 +121,7 @@ def _discover_actions() -> str:
     messages: list[str] = []
     registry = discover_actions(REPO / "actions", logger=messages.append)
     names = registry.names()
-    required = {"open_app", "file_controller", "window_manager"}
+    required = {"open_app", "file_controller", "session_manager", "window_manager"}
     missing = required - names
     if missing:
         raise RuntimeError("required actions missing: " + ", ".join(sorted(missing)))
@@ -241,7 +241,12 @@ def _setup_and_requirements() -> str:
 
 def _secret_hygiene() -> str:
     ignore = (REPO / ".gitignore").read_text(encoding="utf-8")
-    expected = ("config/api_keys.json", "config/spotify_token.json", "memory/long_term.json")
+    expected = (
+        "config/api_keys.json",
+        "config/spotify_token.json",
+        "memory/long_term.json",
+        "memory/sessions.json",
+    )
     missing = [entry for entry in expected if entry not in ignore]
     if missing:
         raise RuntimeError(".gitignore does not protect: " + ", ".join(missing))

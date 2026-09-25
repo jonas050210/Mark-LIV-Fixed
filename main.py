@@ -1655,7 +1655,13 @@ class JarvisLive:
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None,
+                        "response": None,
+                        # A snapshot, never the live list: session_manager may
+                        # persist an explicit bookmark without racing the audio
+                        # receive loop that appends completed turns.
+                        "session_memory": (
+                            list(self._session_log) if name == "session_manager" else None
+                        ),
                         "action_id": self._active_action_ids.get(id(fc)),
                         "cancel_event": action_runtime.cancellation_event(
                             self._active_action_ids.get(id(fc))),

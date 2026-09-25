@@ -48,6 +48,14 @@ Audio can also be controlled by voice or the dashboard: say `list audio devices`
 
 On Windows, monitor enumeration opts into per-monitor DPI awareness before reading HWND coordinates and uses the current display mode for refresh rate. This keeps two 1920×1080 displays and high-refresh modes such as 180 Hz visible as physical pixel geometry rather than scaled logical coordinates. The native ctypes fallback still reports geometry when pywin32 is not installed.
 
+## Memory and saved sessions
+
+MARK LIV keeps durable facts—identity, preferences, projects, relationships, plans, and notes—separate from conversation bookmarks. Long-term facts are retrieved through the existing bounded memory index, while the automatic end-of-session summary only feeds the next startup briefing.
+
+The `session_manager` action adds an explicit local Session Vault. Say `save this session as launch plan`, `list my saved sessions`, `resume launch plan`, or `delete launch plan`. A bookmark stores at most 40 sanitized turns plus an optional summary; at most 20 named sessions are retained, duplicate names update the same bookmark, and an ambiguous name must be replaced by the displayed ID. Resuming loads bounded historical context into the active Live conversation instead of persisting a provider resume token. Deletion requires human confirmation.
+
+Saved sessions live in the private transactional `memory/sessions.json` store. The file is ignored by Git, protected from file actions, atomically updated, recoverable after corruption, and never sent to an external memory service merely for storage.
+
 ### Spotify background control
 
 `media_control` uses the Spotify Web API and Spotify Connect rather than clicking the Spotify window. It can search, play, pause, skip, change volume, inspect the current track, and list devices while Spotify remains minimized or in the background. The one-time `connect` flow requires a Spotify developer client ID, the local redirect URI `http://127.0.0.1:8765/callback`, and a Spotify Premium account for playback control. Playback requires an active Spotify Connect device; MARK LIV does not falsely claim that a track started when Spotify has no available device.
