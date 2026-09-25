@@ -340,6 +340,19 @@ Reminders stay outside this loop on purpose: they are registered with the
 operating system's scheduler so that they fire while MARK LIV is closed, which
 no in-process loop can do.
 
+### The speech path is testable now
+
+`main.py` carried the loudness meter, the viseme extractor and the transcript
+helpers, and nothing in that file was tested because almost all of it needs a
+live session, a microphone and a window. Those functions need none of that:
+they are `core/speech_shaping.py` now, with 26 tests.
+
+Doing it surfaced a defect that had no symptom anyone would report as a bug:
+`_pcm_level(None)` returned **1.0**. A non-audio block produces a NaN RMS, and
+every comparison against NaN is False, so it slipped past the silence floor and
+`min(1.0, nan)` answered 1.0 — full deflection on the HUD waveform and a gaping
+mouth on the avatar, from input containing no sound.
+
 ### Text from the internet
 
 Search results, news snippets and the text of a page are written by whoever

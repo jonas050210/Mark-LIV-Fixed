@@ -333,6 +333,9 @@ COVERAGE_FLOORS = {
     "actions/open_app.py": 60,
     "actions/reminder.py": 58,
     "dashboard/server.py": 40,
+    "core/speech_shaping.py": 85,
+    "core/untrusted.py": 85,
+    "core/plugin_loader.py": 70,
 }
 
 
