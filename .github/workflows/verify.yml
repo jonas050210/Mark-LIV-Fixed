@@ -42,7 +42,7 @@ jobs:
           python -m pip install --disable-pip-version-check
           "fastapi<1" "uvicorn<1" "cryptography<47"
           "python-multipart<1" "httpx<0.28" "coverage<8"
-          "rapidfuzz<4" "PyQt6<7"
+          "rapidfuzz<4" "PyQt6<7" "psutil<8"
 
       # The panel tests need a platform plugin. Without these the widget tests
       # skip, and a panel that fails to build would reach a user unnoticed.
