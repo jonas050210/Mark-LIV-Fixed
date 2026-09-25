@@ -45,7 +45,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         report_path = Path(directory) / "overall.json"
         completed = subprocess.run(
-            [sys.executable, "test_overall.py", "--json", str(report_path)],
+            [sys.executable, "test_overall.py", "--json", str(report_path), *sys.argv[1:]],
             cwd=_REPOSITORY_ROOT,
             check=False,
         )

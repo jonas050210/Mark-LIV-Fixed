@@ -1015,62 +1015,32 @@ Opt-in Windows hardware tests for audio diagnostics, DPI-aware monitor geometry,
 
 ## 12. Verification and test commands
 
-### Normal unit suite
-
 ```bash
-python .github/scripts/run_tests.py
+python test_overall.py              # ten gates, including the unit suite
+python test_overall.py --coverage   # also measure coverage and enforce the floors
+python test_overall.py --windows    # add the Windows hardware checks (Windows only)
+python -m unittest discover -s tests
 ```
 
-The direct equivalent is `python -m unittest discover -s tests -v`. The CI wrapper keeps local behavior while adding concise GitHub annotations and step summaries on failure.
+### Coverage floors
 
-### Safe project-wide verification
+A single total percentage would say nothing useful here: the number is
+dominated by the GUI and by platform branches that cannot execute on the
+machine running the suite. What is gated instead is a per-module floor on the
+fifteen modules that decide what MARK LIV is allowed to do — the JSON store,
+the path policy, the action runtime, the launcher index, undo, the confirmation
+gate, the session store, and the scheduler among them. `--coverage` fails the
+run when any of them drops below its floor, which is how `core/app_index.py`
+was found sitting at 48%.
 
-```bash
-python .github/scripts/run_overall.py
-```
+### What cannot be verified here
 
-The direct verifier is `python test_overall.py`. Verification is non-destructive by default; the CI wrapper only adds machine-readable failure reporting.
-
-### JSON verification report
-
-```bash
-python test_overall.py --json test-results/overall-report.json
-```
-
-`test-results/` and `*.overall-report.json` are ignored by Git.
-
-### Windows integration suite
-
-Run on the actual Windows machine:
-
-```bash
-python test_overall.py --windows
-```
-
-This enables the hardware integration suite. It should not be treated as a substitute for manually testing Roblox and two monitors.
-
-### Setup validation
-
-```bash
-python setup.py --check
-```
-
-### Dashboard JavaScript syntax
-
-If Node.js is installed, the overall runner extracts inline dashboard scripts and runs `node --check` on them.
-
-### Cross-platform CI
-
-`.github/workflows/verify.yml` runs setup validation, compilation, unit tests, and overall verification on:
-
-- Ubuntu with Python 3.11;
-- Ubuntu with Python 3.13;
-- Windows with Python 3.11;
-- Windows with Python 3.13.
-
-Workflow actions are pinned to immutable commit SHAs and the job token has read-only repository-content permission.
-
----
+The Windows-only paths — registry scanning, `.lnk` resolution through `pylnk3`,
+icon extraction, Task Scheduler, WMI brightness, `user32` window handles — have
+no equivalent on Linux or macOS. `tests/test_windows_integration.py` covers
+them and runs on the `windows-latest` CI runner, where it indexes the real
+machine, launches Notepad and checks the pid, extracts a real icon, and
+schedules, lists and cancels a real reminder.
 
 ## 13. Latest verification result
 
