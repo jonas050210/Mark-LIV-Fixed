@@ -19,6 +19,12 @@ _ENABLED = platform.system() == "Windows" and os.environ.get("RUN_WINDOWS_INTEGR
 
 @unittest.skipUnless(_ENABLED, "set RUN_WINDOWS_INTEGRATION=1 on Windows")
 class WindowsHardwareIntegrationTests(unittest.TestCase):
+    """Display and audio hardware; all of it needs a real desktop session."""
+
+    def setUp(self) -> None:
+        if not _HAS_DESKTOP:
+            self.skipTest("no interactive desktop in this session")
+
     def test_dpi_aware_monitors_have_physical_geometry(self) -> None:
         from core.window_manager import list_monitors
 
@@ -51,6 +57,26 @@ class WindowsHardwareIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _has_interactive_desktop() -> bool:
+    """Whether this Windows session has a visible desktop.
+
+    A CI runner executes as a service in session 0: there is no desktop, no
+    window ever becomes visible, and no icon can be rendered. Those tests are
+    skipped there rather than failed, because nothing is broken — the machine
+    simply has nothing to show. The checks that do not need a desktop still
+    run, which is the point of having the runner at all.
+    """
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return False
+
+
+_HAS_DESKTOP = _ENABLED and _has_interactive_desktop()
 
 
 @unittest.skipUnless(_ENABLED, "set RUN_WINDOWS_INTEGRATION=1 on Windows")
@@ -98,6 +124,7 @@ class WindowsLauncherIntegrationTests(unittest.TestCase):
         resolved = [entry for entry in start_menu if entry.kind == "exec"]
         self.assertTrue(resolved, "no Start-menu shortcut could be resolved to an .exe")
 
+    @unittest.skipUnless(_HAS_DESKTOP, "no interactive desktop in this session")
     def test_notepad_launches_and_reports_a_pid(self) -> None:
         import os
         import signal
@@ -126,6 +153,7 @@ class WindowsLauncherIntegrationTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=switch):
                 sanitise_arguments(switch)
 
+    @unittest.skipUnless(_HAS_DESKTOP, "no interactive desktop in this session")
     def test_an_icon_can_be_extracted_for_at_least_one_application(self) -> None:
         from core.app_icons import icon_png
         from core.app_index import load_index
@@ -137,15 +165,20 @@ class WindowsLauncherIntegrationTests(unittest.TestCase):
         self.assertTrue(extracted, "no icon could be extracted from ten applications")
 
     def test_the_window_backend_is_the_native_one(self) -> None:
-        from core.window_manager import backend_name, list_windows
+        from core.window_manager import backend_name
 
         self.assertEqual(backend_name(), "user32")
+
+    @unittest.skipUnless(_HAS_DESKTOP, "no interactive desktop in this session")
+    def test_enumerated_windows_carry_handles_and_pids(self) -> None:
+        from core.window_manager import list_windows
+
         windows = list_windows()
         self.assertTrue(windows, "no windows were enumerated")
         self.assertTrue(all(window.handle for window in windows))
         self.assertTrue(any(window.pid for window in windows))
 
-    def test_a_scheduled_reminder_can_be_listed_and_cancelled(self) -> None:
+    def test_a_scheduled_reminder_can_be_listed_and_cancelled(self) -> None:  # noqa: D401
         """The whole round trip against the real Task Scheduler."""
         from datetime import datetime, timedelta
 
@@ -173,6 +206,7 @@ class WindowsLauncherIntegrationTests(unittest.TestCase):
             "MARK LIV integration check", reminder_module.reminder({"action": "list"})
         )
 
+    @unittest.skipUnless(_HAS_DESKTOP, "an audio endpoint needs a desktop session")
     def test_reading_the_volume_gives_a_percentage(self) -> None:
         from actions.computer_settings import volume_get
 

@@ -76,4 +76,14 @@ jobs:
         if: runner.os == 'Windows'
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python test_overall.py --windows
+        run: python -m unittest tests.test_windows_integration -v
+
+      # The transcript is what makes a red Windows run diagnosable from here;
+      # the hosted log API is not always readable after the fact.
+      - name: Upload the verification report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verification-${{ matrix.os }}-py${{ matrix.python }}
+          path: overall-report.json
+          if-no-files-found: ignore

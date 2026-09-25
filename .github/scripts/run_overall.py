@@ -44,15 +44,25 @@ def _write_step_summary(failures: list[dict]) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         report_path = Path(directory) / "overall.json"
+        # A copy is kept in the working tree so CI can upload it: the hosted
+        # log API is not reliably readable after a run, and a red build nobody
+        # can diagnose is barely better than no build at all.
+        kept_path = _REPOSITORY_ROOT / "overall-report.json"
         completed = subprocess.run(
             [sys.executable, "test_overall.py", "--json", str(report_path), *sys.argv[1:]],
             cwd=_REPOSITORY_ROOT,
             check=False,
         )
         try:
-            report = json.loads(report_path.read_text(encoding="utf-8"))
+            raw = report_path.read_text(encoding="utf-8")
+            report = json.loads(raw)
         except (OSError, ValueError):
-            report = {}
+            raw, report = "", {}
+        if raw:
+            try:
+                kept_path.write_text(raw, encoding="utf-8")
+            except OSError:
+                pass
 
     failures = _failed_checks(report)
     _write_step_summary(failures)
