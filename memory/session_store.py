@@ -3,8 +3,8 @@
 Long-term memory stores durable facts and the existing session-summary queue feeds
 the next startup briefing.  This module serves a different purpose: a user can
 bookmark a conversation, list those bookmarks later, and load a bounded context
-snapshot into a Gemini Live session without persisting a provider resume handle
-or an unbounded transcript.
+snapshot into a fresh Gemini Live session without persisting a provider resume
+handle or an unbounded transcript.
 """
 from __future__ import annotations
 
@@ -204,7 +204,10 @@ def save_session(
         if existing is not None:
             if clean_summary:
                 existing["summary"] = clean_summary
-            existing["turns"] = normalized
+            # A named save after resuming is a continuation, not a replacement:
+            # retain the newest bounded span across the old checkpoint and the
+            # current runtime transcript.
+            existing["turns"] = normalize_turns([*existing["turns"], *normalized])
             existing["updated_at"] = timestamp
             outcome["snapshot"] = copy.deepcopy(existing)
             outcome["created"] = False

@@ -455,7 +455,7 @@ The dashboard shows selected microphone/speaker state, connection status, host A
 - `memory/session_store.py` stores up to 20 explicitly named conversation bookmarks with at most 40 sanitized turns each. It supports save/update, list, unambiguous lookup, bounded resume context, and confirmed deletion.
 - `memory/__init__.py` marks the package.
 
-All persistent memory uses `core/json_store.py`, so concurrent updates do not silently overwrite unrelated fields and corrupt primaries can recover from a validated backup. Saved sessions are separate from provider resumption handles: resuming a bookmark supplies bounded historical context to the active Live conversation. Runtime memory, session snapshots, sidecars, and credentials are intentionally excluded from Git.
+All persistent memory uses `core/json_store.py`, so concurrent updates do not silently overwrite unrelated fields and corrupt primaries can recover from a validated backup. Saved sessions are separate from provider resumption handles: resuming a bookmark drops the opaque handle, opens a fresh Live connection, and injects only bounded historical context as a narration-only turn. Runtime memory, session snapshots, sidecars, and credentials are intentionally excluded from Git.
 
 ### 10.2 Voice and language
 

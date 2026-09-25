@@ -1,6 +1,7 @@
 """Save, list, resume, and delete bounded local conversation snapshots."""
 from __future__ import annotations
 
+from core.action_result import ActionResult
 from memory import session_store
 
 
@@ -18,7 +19,7 @@ def session_manager(
     player=None,
     session_memory=None,
     **_context,
-) -> str:
+) -> str | ActionResult:
     values = parameters if isinstance(parameters, dict) else {}
     action = str(values.get("action") or "list").strip().casefold().replace(" ", "_")
 
@@ -54,7 +55,13 @@ def session_manager(
             if not identifier:
                 return "Invalid session request: provide the saved session name or ID to resume."
             snapshot = session_store.load_session(identifier)
-            return session_store.format_resume_context(snapshot)
+            return ActionResult.success(
+                "session_manager",
+                f"Loaded saved session '{snapshot['title']}' for a fresh Live conversation.",
+                resume_context=session_store.format_resume_context(snapshot),
+                session_id=snapshot["id"],
+                title=snapshot["title"],
+            )
 
         if action in {"delete", "remove", "forget"}:
             identifier = _identifier(values)

@@ -34,7 +34,10 @@ class SessionStoreTests(unittest.TestCase):
                 ["User: Final update"], title="Launch plan"
             )
             self.assertEqual(len(session_store.list_sessions()), 1)
-            self.assertEqual(session_store.load_session(first["id"][:8])["summary"], "Added CI.")
+            loaded = session_store.load_session(first["id"][:8])
+            self.assertEqual(loaded["summary"], "Added CI.")
+            self.assertEqual(loaded["turns"][0]["text"], "Plan the launch")
+            self.assertEqual(loaded["turns"][-1]["text"], "Final update")
 
     def test_transcript_is_sanitized_and_bounded(self) -> None:
         values = [f"User: turn {index}\n" + "x" * 4_000 for index in range(60)]
@@ -91,8 +94,10 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIn("Saved session 'Demo'", saved)
             self.assertIn("Demo", session_manager({"action": "list"}))
             resumed = session_manager({"action": "resume", "title": "Demo"})
-            self.assertIn("USER-SELECTED SAVED SESSION", resumed)
-            self.assertIn("Build a demo", resumed)
+            self.assertTrue(resumed.ok)
+            self.assertIn("fresh Live conversation", resumed.message)
+            self.assertIn("USER-SELECTED SAVED SESSION", resumed.data["resume_context"])
+            self.assertIn("Build a demo", resumed.data["resume_context"])
             self.assertEqual(
                 session_manager({"action": "delete", "title": "Demo"}),
                 "Deleted saved session 'Demo'.",

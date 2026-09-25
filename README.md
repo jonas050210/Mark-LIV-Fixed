@@ -52,7 +52,7 @@ On Windows, monitor enumeration opts into per-monitor DPI awareness before readi
 
 MARK LIV keeps durable facts—identity, preferences, projects, relationships, plans, and notes—separate from conversation bookmarks. Long-term facts are retrieved through the existing bounded memory index, while the automatic end-of-session summary only feeds the next startup briefing.
 
-The `session_manager` action adds an explicit local Session Vault. Say `save this session as launch plan`, `list my saved sessions`, `resume launch plan`, or `delete launch plan`. A bookmark stores at most 40 sanitized turns plus an optional summary; at most 20 named sessions are retained, duplicate names update the same bookmark, and an ambiguous name must be replaced by the displayed ID. Resuming loads bounded historical context into the active Live conversation instead of persisting a provider resume token. Deletion requires human confirmation.
+The `session_manager` action adds an explicit local Session Vault. Say `save this session as launch plan`, `list my saved sessions`, `resume launch plan`, or `delete launch plan`. A bookmark stores at most 40 sanitized turns plus an optional summary; at most 20 named sessions are retained, duplicate names update the same bookmark, and an ambiguous name must be replaced by the displayed ID. Resuming drops the provider resume token, opens a fresh Live conversation, and injects only the bounded historical context. Deletion requires human confirmation.
 
 Saved sessions live in the private transactional `memory/sessions.json` store. The file is ignored by Git, protected from file actions, atomically updated, recoverable after corruption, and never sent to an external memory service merely for storage.
 

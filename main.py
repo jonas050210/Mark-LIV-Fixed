@@ -674,6 +674,10 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
+        # A Session Vault restore intentionally crosses a clean reconnect. The
+        # historical context stays here only until the newly connected Live
+        # session accepts its first narration-only turn.
+        self._pending_saved_session_context: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         # Synthetic turns (news, monitor alerts, plugin speech, screenshots)
         # are narration-only. Even if their untrusted data asks for a tool, any
@@ -918,6 +922,15 @@ class JarvisLive:
                     return True
             if not retry:
                 return False
+
+    async def _restore_saved_session(self, context: str) -> None:
+        """Inject a saved transcript once, after a clean Live reconnect."""
+        sent = await self._send_readonly_turn(
+            {"role": "user", "parts": [{"text": context}]}
+        )
+        if sent and self._pending_saved_session_context == context:
+            self._pending_saved_session_context = None
+            self.ui.write_log("SYS: Saved session restored in a fresh conversation.")
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -1681,6 +1694,14 @@ class JarvisLive:
                     )
                     r = structured.as_text()
                     _result_status = structured.status
+                    if name == "session_manager" and structured.ok:
+                        restore_context = structured.data.get("resume_context")
+                        if isinstance(restore_context, str) and restore_context:
+                            # Do not feed an old transcript into the conversation
+                            # that requested it. Queue it across a clean reconnect;
+                            # _receive_audio requests that reconnect only after the
+                            # tool response has reached the current session.
+                            self._pending_saved_session_context = restore_context
                 except asyncio.TimeoutError:
                     timeout_cancel = action_runtime.cancellation_event(
                         self._active_action_ids.get(id(fc))
@@ -2110,6 +2131,14 @@ class JarvisLive:
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
+                        if self._pending_saved_session_context is not None:
+                            # The tool response is now delivered. Drop the opaque
+                            # provider handle and rebuild before historical data
+                            # enters the model, so a bookmark always opens in a
+                            # genuinely fresh Live conversation.
+                            self.request_reconnect(
+                                keep_context=False, reason="saved session"
+                            )
                         await self._flush_pending_vision()
                     if readonly_turn_completed and not response.tool_call:
                         self._finish_readonly_turn()
@@ -2708,6 +2737,7 @@ class JarvisLive:
                     self._readonly_idle_event.set()
                     self._readonly_send_lock = asyncio.Lock()
                     self._tool_turn_active = False
+                    saved_session_context = self._pending_saved_session_context
 
                     # Reset transient state that must not carry over from a previous session
                     self._pending_vision       = None
@@ -2724,9 +2754,10 @@ class JarvisLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
-                    # Wake word: if enabled, come up ASLEEP (mic gated, silent)
-                    # until the user says "Hey Jarvis" or taps wake in the UI.
-                    if self._wake_enabled:
+                    # Wake word: normally reconnect asleep. An explicit saved-
+                    # session restore stays awake because the user just requested
+                    # it and the first turn must deliver the restored topic.
+                    if self._wake_enabled and saved_session_context is None:
                         self._ensure_wake_detector()
                         self._awake = False
                         self.ui.set_state("SLEEPING")
@@ -2751,6 +2782,10 @@ class JarvisLive:
                     tg.create_task(self._run_sleep_watch())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
+                    if saved_session_context is not None:
+                        tg.create_task(
+                            self._restore_saved_session(saved_session_context)
+                        )
 
                     # Morning briefing — fires once per process launch (if enabled).
                     # Skipped in wake-word mode: it comes up asleep, and a briefing
@@ -2781,6 +2816,16 @@ class JarvisLive:
                         self._resume_handle = None
                     self._conn_backoff = 0
                     continue
+
+                # A saved checkpoint must never be layered onto the provider's
+                # old opaque context. Even if delivering the final tool response
+                # failed before the reconnect event fired, force the retry to be
+                # a clean Live connection and retain the bounded local context.
+                if self._pending_saved_session_context is not None:
+                    self._resume_handle = None
+                    if _resumed_with:
+                        self._conn_backoff = 0
+                        continue
 
                 # A resumption handle the server will not accept — expired, or
                 # belonging to a session it has since dropped. Without this, the
@@ -2875,6 +2920,11 @@ class JarvisLive:
                             self._save_session_summary(completed_log),
                             name="session-summary",
                         )
+                if self._pending_saved_session_context is not None:
+                    # The checkpoint is the new conversation boundary. Never let
+                    # even a one- or two-turn pre-restore transcript leak into a
+                    # later explicit save from the restored session.
+                    self._session_log = []
 
             self.set_speaking(False)
             self.ui.set_state("SLEEPING")
