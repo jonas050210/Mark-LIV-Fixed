@@ -310,6 +310,12 @@ def _run_unit_tests() -> str:
 # The modules where a gap in the tests is a safety problem rather than a
 # cosmetic one: they decide what is allowed to touch the filesystem, what is
 # persisted, what a failed action reports, and what a launch actually starts.
+#
+# The floors are a few points below what the suite actually reaches, because
+# the same tests cover slightly different lines on each platform: POSIX
+# permission bits, Windows reparse points and the native window API are each
+# unreachable somewhere. A floor that only holds on Linux would fail the
+# Windows runner for no defect.
 COVERAGE_FLOORS = {
     "core/action_result.py": 90,
     "core/action_runtime.py": 85,
@@ -317,7 +323,7 @@ COVERAGE_FLOORS = {
     "core/background_scheduler.py": 88,
     "core/browser_handoff.py": 90,
     "core/confirm.py": 70,
-    "core/json_store.py": 85,
+    "core/json_store.py": 84,
     "core/path_policy.py": 62,
     "core/sandbox.py": 78,
     "core/text_match.py": 82,

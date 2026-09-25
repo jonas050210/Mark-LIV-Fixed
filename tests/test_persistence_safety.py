@@ -213,3 +213,152 @@ class ManagerTransactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JsonStoreRecoveryTests(unittest.TestCase):
+    """What the store does when the file on disk is not what it wrote.
+
+    Every persistent piece of state in the project — configuration, tokens,
+    shortcuts, the app index, pins, layouts, reminders — goes through this
+    class, so its failure modes are the project's failure modes.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "store.json"
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _store(self, validator=None, private: bool = False, max_bytes: int = 1_000_000):
+        from core.json_store import JsonStore
+
+        return JsonStore(
+            self.path, dict, validator=validator, private=private, max_bytes=max_bytes
+        )
+
+    def test_a_missing_file_reads_as_the_default(self) -> None:
+        self.assertEqual(self._store().read(), {})
+
+    def test_a_corrupt_primary_is_recovered_from_the_backup(self) -> None:
+        store = self._store()
+        store.write({"value": 1})
+        store.write({"value": 2})          # the first write becomes the backup
+        self.path.write_text("{ truncated", encoding="utf-8")
+        recovered = store.read()
+        self.assertEqual(recovered, {"value": 1})
+        # The unreadable file is kept for inspection rather than deleted.
+        quarantined = list(self.path.parent.glob(f".{self.path.name}.corrupt-*"))
+        self.assertTrue(quarantined)
+
+    def test_a_corrupt_primary_without_a_usable_backup_raises(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store()
+        store.write({"value": 1})
+        self.path.write_text("{ truncated", encoding="utf-8")
+        store.backup_path.write_text("{ also truncated", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read()
+
+    def test_recovery_can_be_refused_by_the_caller(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store()
+        store.write({"value": 1})
+        store.write({"value": 2})
+        self.path.write_text("{ truncated", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read(recover=False)
+
+    def test_a_value_the_validator_rejects_is_never_written(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store(validator=lambda value: "allowed" in value)
+        store.write({"allowed": True})
+        with self.assertRaises(JsonStoreCorruptError):
+            store.write({"something": "else"})
+        self.assertEqual(store.read(), {"allowed": True})
+
+    def test_a_validator_that_raises_is_treated_as_a_rejection(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        def explode(_value):
+            raise KeyError("missing")
+
+        with self.assertRaises(JsonStoreCorruptError):
+            self._store(validator=explode).write({"x": 1})
+
+    def test_a_file_over_the_size_limit_is_refused(self) -> None:
+        from core.json_store import JsonStoreCorruptError
+
+        store = self._store(max_bytes=2_048)
+        self.path.write_text("[" + "0," * 5_000 + "0]", encoding="utf-8")
+        with self.assertRaises(JsonStoreCorruptError):
+            store.read()
+
+    def test_update_applies_a_mutation_atomically(self) -> None:
+        store = self._store()
+        store.write({"count": 1})
+        result = store.update(lambda data: {**data, "count": data["count"] + 1})
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(store.read()["count"], 2)
+
+    def test_a_mutator_returning_none_keeps_its_in_place_edits(self) -> None:
+        store = self._store()
+        store.write({"items": []})
+
+        def mutate(data):
+            data["items"].append("added")
+
+        store.update(mutate)
+        self.assertEqual(store.read()["items"], ["added"])
+
+    def test_a_failing_mutator_leaves_the_stored_value_untouched(self) -> None:
+        store = self._store()
+        store.write({"count": 1})
+
+        def mutate(_data):
+            raise RuntimeError("no")
+
+        with self.assertRaises(RuntimeError):
+            store.update(mutate)
+        self.assertEqual(store.read(), {"count": 1})
+
+    def test_concurrent_updates_do_not_lose_an_increment(self) -> None:
+        import threading
+
+        store = self._store()
+        store.write({"count": 0})
+
+        def bump():
+            for _ in range(20):
+                store.update(lambda data: {**data, "count": data["count"] + 1})
+
+        threads = [threading.Thread(target=bump) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(store.read()["count"], 80)
+
+    def test_no_temporary_files_are_left_behind(self) -> None:
+        store = self._store()
+        for index in range(5):
+            store.write({"index": index})
+        leftovers = [p.name for p in self.path.parent.glob("*.tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_private_store_is_readable_only_by_its_owner(self) -> None:
+        import os
+        import stat as stat_module
+
+        store = self._store(private=True)
+        store.write({"token": "secret"})
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits do not apply on Windows")
+        mode = stat_module.S_IMODE(self.path.stat().st_mode)
+        self.assertEqual(mode & 0o077, 0, oct(mode))
