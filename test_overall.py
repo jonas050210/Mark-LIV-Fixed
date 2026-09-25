@@ -28,6 +28,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+for _stream_name in ("stdout", "stderr"):
+    try:
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 REPO = Path(__file__).resolve().parent
 TESTS = REPO / "tests"
 
@@ -268,6 +276,8 @@ def _run_unit_tests() -> str:
         raise RuntimeError("tests directory is missing")
     env = os.environ.copy()
     env.pop("RUN_WINDOWS_INTEGRATION", None)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", "test_*.py", "-v"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=300, check=False,
@@ -284,6 +294,8 @@ def _run_windows_tests() -> str:
         raise SkipCheck("Windows integration checks require Windows")
     env = os.environ.copy()
     env["RUN_WINDOWS_INTEGRATION"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "tests.test_windows_integration", "-v"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=180, check=False,
