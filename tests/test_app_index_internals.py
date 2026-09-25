@@ -82,6 +82,9 @@ class DesktopEntryTests(unittest.TestCase):
     def test_an_unreadable_file_returns_nothing_rather_than_raising(self) -> None:
         self.assertIsNone(app_index._parse_desktop_entry(self.root / "missing.desktop"))
 
+    @unittest.skipIf(os.name == "nt", "XDG_DATA_DIRS is colon-separated; a Windows "
+                                      "path contains a colon and this scanner never "
+                                      "runs there")
     def test_the_linux_scan_reads_the_xdg_directories(self) -> None:
         apps = self.root / "applications"
         apps.mkdir()
