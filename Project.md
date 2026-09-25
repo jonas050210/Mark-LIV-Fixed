@@ -296,6 +296,24 @@ nothing more.
   prints no job number, the reminder is still set, and the answer says plainly
   that it will not be cancellable.
 
+### One loop for recurring jobs
+
+The topic monitor and the proactive check-in each ran their own `while True`
+loop in `main.py`, and each re-implemented the question "may I speak right
+now?" — with different answers: the monitor accepted 30 seconds of silence, the
+check-in used its own gate and cooldown.
+
+`core/background_scheduler.py` now owns the timing and the gate.
+`JarvisLive._may_interrupt()` is the single definition of when a background job
+may talk (live session, awake, not mid-sentence, 30 s since the user spoke), and
+each job is a coroutine with an interval. A job that fails backs off
+exponentially to at most eight intervals instead of repeating the same failure
+every tick, and one failing job cannot stop the others.
+
+Reminders stay outside this loop on purpose: they are registered with the
+operating system's scheduler so that they fire while MARK LIV is closed, which
+no in-process loop can do.
+
 ### Two browsers, one page
 
 MARK LIV can put a web page on screen in two ways and they used to be unaware
