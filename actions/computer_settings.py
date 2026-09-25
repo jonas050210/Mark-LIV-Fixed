@@ -131,22 +131,35 @@ def brightness_get() -> int | None:
     return None
 
 
-def brightness_set(value: int) -> None:
-    """Set brightness to an absolute percentage. Only used to restore a value
-    captured before a change, so it is undo's counterpart to the up/down pair."""
+def brightness_set(value: int) -> bool:
+    """Set brightness to an absolute percentage; True when it was applied.
+
+    Whether this works at all depends on the monitor: WmiSetBrightness is a
+    laptop-panel interface and simply fails on most desktop displays. Reporting
+    the exit status is what lets the caller say "could not" instead of "done".
+    """
     value = max(0, min(100, int(value)))
-    if _OS == "Windows":
-        subprocess.run(
-            ["powershell", "-Command",
-             "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-             f".WmiSetBrightness(1, {value})"],
-            capture_output=True, timeout=5, **_WIN_HIDE
-        )
-    elif _OS == "Linux":
-        subprocess.run(["brightnessctl", "set", f"{value}%"], capture_output=True, timeout=5)
+    try:
+        if _OS == "Windows":
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
+                 f".WmiSetBrightness(1, {value})"],
+                capture_output=True, timeout=5, **_WIN_HIDE
+            )
+            return result.returncode == 0
+        if _OS == "Linux":
+            result = subprocess.run(
+                ["brightnessctl", "set", f"{value}%"], capture_output=True, timeout=5
+            )
+            return result.returncode == 0
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    return False
 
 
-def volume_set(value: int):
+def volume_set(value: int) -> bool:
+    """Set the master volume; True only when the platform accepted it."""
     value = max(0, min(100, int(value)))
     if _OS == "Windows":
         try:
@@ -159,19 +172,28 @@ def volume_set(value: int):
             vol       = cast(interface, POINTER(IAudioEndpointVolume))
             vol_db    = -65.25 if value == 0 else max(-65.25, 20 * math.log10(value / 100))
             vol.SetMasterVolumeLevel(vol_db, None)
-            return
+            return True
         except Exception as e:
-            print(f"[Settings] pycaw failed ({type(e).__name__}); using keypress fallback.")
-            pyautogui.press("volumemute")
-            pyautogui.press("volumemute")
-    elif _OS == "Darwin":
-        subprocess.run(["osascript", "-e", f"set volume output volume {value}"],
-            capture_output=True, timeout=5)
-        return
-    else:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"],
-            capture_output=True, timeout=5)
-        return
+            # The old fallback pressed the mute key twice, which sets nothing:
+            # it toggles mute off and on again and leaves the volume exactly
+            # where it was, while the caller went on to report the requested
+            # percentage as applied.
+            print(f"[Settings] pycaw failed ({type(e).__name__}); volume unchanged.")
+            return False
+    try:
+        if _OS == "Darwin":
+            result = subprocess.run(
+                ["osascript", "-e", f"set volume output volume {value}"],
+                capture_output=True, timeout=5,
+            )
+        else:
+            result = subprocess.run(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"],
+                capture_output=True, timeout=5,
+            )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    return result.returncode == 0
 
 def brightness_up():
     if _OS == "Darwin":
@@ -501,6 +523,22 @@ def open_run():
     if _OS == "Windows":
         pyautogui.hotkey("win", "r")
 
+def _must_run(argv: list[str], *, timeout: int = 5, **kwargs) -> subprocess.CompletedProcess:
+    """Run a command and raise when it fails.
+
+    The dispatcher answers "Done: <action>" for anything that returns without
+    raising, so a command whose non-zero exit status is swallowed turns a
+    refused operation into a reported success. Disabling a network adapter
+    needs administrator rights and `gsettings` needs a session bus: both fail
+    quietly and often.
+    """
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(detail[-1][:160] if detail else f"exit code {result.returncode}")
+    return result
+
+
 def dark_mode():
     if _OS == "Darwin":
         subprocess.run(["osascript", "-e",
@@ -519,48 +557,39 @@ def dark_mode():
         except Exception as e:
             print(f"[Settings] dark_mode registry update failed ({type(e).__name__}).")
     else:
-        try:
-            result = subprocess.run(
-                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-                capture_output=True, text=True, timeout=5
-            )
-            current = result.stdout.strip()
-            new_scheme = "'default'" if "dark" in current else "'prefer-dark'"
-            subprocess.run(
-                ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", new_scheme],
-                capture_output=True, timeout=5
-            )
-        except Exception as e:
-            print(f"[Settings] dark_mode Linux update failed ({type(e).__name__}).")
+        result = _must_run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"]
+        )
+        current = result.stdout.strip()
+        new_scheme = "'default'" if "dark" in current else "'prefer-dark'"
+        _must_run(
+            ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", new_scheme]
+        )
 
 def toggle_wifi():
     if _OS == "Darwin":
         iface = _get_macos_wifi_interface()
-        result = subprocess.run(
-            ["networksetup", "-getairportpower", iface],
-            capture_output=True, text=True, timeout=5
-        )
+        result = _must_run(["networksetup", "-getairportpower", iface])
         state = "off" if "On" in result.stdout else "on"
-        subprocess.run(["networksetup", "-setairportpower", iface, state],
-            capture_output=True, timeout=5)
+        _must_run(["networksetup", "-setairportpower", iface, state])
     elif _OS == "Windows":
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 "$adapter = Get-NetAdapter | Where-Object {$_.PhysicalMediaType -eq 'Native 802.11'};"
-                 "if ($adapter.Status -eq 'Up') { Disable-NetAdapter -Name $adapter.Name -Confirm:$false }"
-                 "else { Enable-NetAdapter -Name $adapter.Name -Confirm:$false }"],
-                capture_output=True, timeout=10, **_WIN_HIDE
-            )
-        except Exception as e:
-            print(f"[Settings] toggle_wifi failed on Windows ({type(e).__name__}).")
+        # Disabling a network adapter requires administrator rights. Without
+        # them PowerShell writes an error and exits non-zero, which used to be
+        # discarded — the user was told the Wi-Fi had been toggled while it was
+        # still on.
+        _must_run(
+            ["powershell", "-Command",
+             "$ErrorActionPreference='Stop';"
+             "$adapter = Get-NetAdapter | Where-Object {$_.PhysicalMediaType -eq 'Native 802.11'};"
+             "if (-not $adapter) { throw 'No Wi-Fi adapter found.' }"
+             "if ($adapter.Status -eq 'Up') { Disable-NetAdapter -Name $adapter.Name -Confirm:$false }"
+             "else { Enable-NetAdapter -Name $adapter.Name -Confirm:$false }"],
+            timeout=10, **_WIN_HIDE
+        )
     else:
-        try:
-            result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True, timeout=5)
-            state  = "off" if "enabled" in result.stdout else "on"
-            subprocess.run(["nmcli", "radio", "wifi", state], capture_output=True, timeout=5)
-        except Exception as e:
-            print(f"[Settings] toggle_wifi failed on Linux ({type(e).__name__}).")
+        result = _must_run(["nmcli", "radio", "wifi"])
+        state = "off" if "enabled" in result.stdout else "on"
+        _must_run(["nmcli", "radio", "wifi", state])
 
 def restart_computer():
     if _OS == "Windows":
@@ -836,10 +865,19 @@ def computer_settings(
         try:
             target = int(value if value is not None else 50)
             before = volume_get()
-            volume_set(target)
+            if not volume_set(target):
+                return (
+                    f"I could not set the volume to {target}%. "
+                    "This system did not accept the change."
+                )
             if before is not None:
-                push_undo(f"volume {before}% → {target}%",
-                          lambda b=before: (volume_set(b), f"Back to {b}%.")[1])
+                push_undo(
+                    f"volume {before}% → {target}%",
+                    lambda b=before: (
+                        f"Volume back to {b}%." if volume_set(b)
+                        else f"I could not restore the volume to {b}%."
+                    ),
+                )
             return f"Volume set to {target}%."
         except Exception as e:
             return f"Could not set volume: {type(e).__name__}"
@@ -894,6 +932,14 @@ def computer_settings(
 
     try:
         func()
+    except FileNotFoundError:
+        print(f"[Settings] Action failed ({action}, missing tool).")
+        return f"I could not run '{action}': this system has no tool for it."
+    except RuntimeError as e:
+        # _must_run raises this with the command's own last line of output,
+        # which is usually the reason the operation was refused.
+        print(f"[Settings] Action failed ({action}): {e}")
+        return f"I could not complete '{action}': {e}"
     except Exception as e:
         print(f"[Settings] Action failed ({action}, {type(e).__name__}).")
         return f"Action failed ({action}): {type(e).__name__}"
@@ -902,11 +948,21 @@ def computer_settings(
         kind, old = _before
         if old is not None:
             if kind == "volume":
-                push_undo(f"volume ({action})",
-                          lambda b=old: (volume_set(b), f"Volume back to {b}%.")[1])
+                push_undo(
+                    f"volume ({action})",
+                    lambda b=old: (
+                        f"Volume back to {b}%." if volume_set(b)
+                        else f"I could not restore the volume to {b}%."
+                    ),
+                )
             elif kind == "brightness":
-                push_undo(f"brightness ({action})",
-                          lambda b=old: (brightness_set(b), f"Brightness back to {b}%.")[1])
+                push_undo(
+                    f"brightness ({action})",
+                    lambda b=old: (
+                        f"Brightness back to {b}%." if brightness_set(b)
+                        else f"I could not restore the brightness to {b}%."
+                    ),
+                )
     elif action == "dark_mode":
         # A pure toggle: calling it again is the undo.
         push_undo("dark mode toggled",

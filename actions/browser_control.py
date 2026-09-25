@@ -36,6 +36,12 @@ def _normalize_url(url: str) -> str:
     if len(url) > 4096 or any(ord(char) < 32 for char in url):
         raise ValueError("The URL is too long or contains control characters.")
     if "://" not in url:
+        # "javascript:alert(1)" or "mailto:x" would otherwise be treated as a
+        # bare host name and end up rejected for an invented reason ("invalid
+        # port"), which tells the user nothing about what was wrong.
+        scheme = url.split(":", 1)[0].casefold()
+        if ":" in url and scheme.isalpha() and len(scheme) > 1 and scheme not in {"http", "https"}:
+            raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
         if any(char.isspace() for char in url):
             raise ValueError("A web address cannot contain spaces.")
         # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
@@ -43,24 +49,55 @@ def _normalize_url(url: str) -> str:
             url += ".com"
         url = "https://" + url
     parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
     try:
         parsed.port
     except ValueError as exc:
         raise ValueError("The web address contains an invalid port.") from exc
+    if not parsed.hostname:
+        raise ValueError("The web address has no host name.")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("Web addresses containing credentials are not allowed.")
     host = parsed.hostname.rstrip(".").casefold()
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         raise ValueError("Local-network web addresses are not available to browser automation.")
-    try:
-        address = ipaddress.ip_address(host.split("%", 1)[0])
-    except ValueError:
-        address = None
+    address = _host_as_ip(host)
     if address is not None and not address.is_global:
         raise ValueError("Private, local, and reserved network addresses are not allowed.")
     return url
+
+
+def _host_as_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Interpret a host as an IP address the way a browser would, or None.
+
+    Dotted quads are not the only way to write an address: browsers also accept
+    the plain integer form and its hexadecimal and octal spellings, so
+    ``http://2130706433/`` and ``http://0x7f000001/`` both reach 127.0.0.1.
+    Checking only ``ipaddress.ip_address`` therefore left the loopback and
+    link-local guards trivially bypassable — including the cloud metadata
+    endpoint at 169.254.169.254.
+    """
+    text = str(host or "").split("%", 1)[0]
+    if not text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        pass
+    for base in (16, 8, 10):
+        prefix = {16: ("0x", "0X"), 8: ("0o", "0O", "0")}.get(base, ())
+        if base != 10 and not text.startswith(prefix):
+            continue
+        if base == 10 and not text.isdigit():
+            continue
+        try:
+            number = int(text, base)
+        except ValueError:
+            continue
+        if 0 <= number <= 0xFFFFFFFF:
+            return ipaddress.ip_address(number)
+    return None
 
 
 def _is_global_address(value: str) -> bool:
@@ -1071,6 +1108,17 @@ class _SessionRegistry:
 
 _registry = _SessionRegistry()
 
+_INTERACTIVE_ACTIONS = frozenset({
+    "click", "type", "scroll", "fill_form", "smart_click", "smart_type",
+    "get_text", "get_url", "press", "close_tab", "screenshot", "back",
+    "forward", "reload",
+})
+_DIRECT_ACTIONS = frozenset({
+    "switch", "list_browsers", "close_all", "close", "go_to", "search",
+    "new_tab",
+})
+
+
 def browser_control(
     parameters:    dict = None,
     response=None,
@@ -1157,6 +1205,19 @@ def browser_control(
     # These require a physically controllable browser; the automation window
     # only opens here, and as soon as it opens it goes to the user's last
     # navigated page — it doesn't sit on a blank page.
+    #
+    # The action is checked before that window is started. It used to be
+    # checked after, which meant a typo in the action name launched an entire
+    # Playwright browser, navigated it to the last page, and only then answered
+    # "unknown browser action".
+    if action not in _INTERACTIVE_ACTIONS:
+        result = (
+            f"Unknown browser action: '{action}'. Available: "
+            + ", ".join(sorted(_INTERACTIVE_ACTIONS | _DIRECT_ACTIONS))
+        )
+        _log(player, result)
+        return result
+
     try:
         sess = _registry.get(browser)
     except Exception as e:
@@ -1178,7 +1239,8 @@ def browser_control(
             result = sess.run(sess.type_text(
                 params.get("selector"), params.get("text", ""), params.get("clear_first", True)))
         elif action == "scroll":
-            result = sess.run(sess.scroll(params.get("direction", "down"), int(params.get("amount", 500))))
+            result = sess.run(sess.scroll(
+                params.get("direction", "down"), _pixels(params.get("amount", 500))))
         elif action == "fill_form":
             raw_fields = params.get("fields", [])
             fields = {
@@ -1207,10 +1269,8 @@ def browser_control(
             result = sess.run(sess.back())
         elif action == "forward":
             result = sess.run(sess.forward())
-        elif action == "reload":
+        else:  # action == "reload"
             result = sess.run(sess.reload())
-        else:
-            result = f"Unknown browser action: '{action}'"
 
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
@@ -1219,6 +1279,15 @@ def browser_control(
 
     _log(player, result)
     return result
+
+
+def _pixels(value, default: int = 500) -> int:
+    """A scroll distance, clamped. A model that sends "a lot" must not raise."""
+    try:
+        amount = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+    return max(-20_000, min(20_000, amount))
 
 
 def _log(player, text: str):
