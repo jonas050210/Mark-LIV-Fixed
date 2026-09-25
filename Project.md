@@ -1044,21 +1044,47 @@ schedules, lists and cancels a real reminder.
 
 ## 13. Latest verification result
 
-The latest local default verification completed with:
+Local default run:
 
 ```text
-95 unit tests run successfully
-5 optional/platform tests skipped
-9 overall checks passed
-0 overall checks failed
-2 overall checks skipped
+338 unit tests run, 38 guarded skips
+9 overall checks passed, 0 failed, 3 skipped
 ```
 
-The two local overall skips are dashboard route construction, because the lightweight sandbox does not install FastAPI/uvicorn by default, and opt-in Windows hardware integration, because the sandbox is Linux. The dependency-aware CI jobs do construct and test the dashboard.
+With the optional tooling installed (`coverage`, `PyQt6`, `rapidfuzz`, FastAPI):
 
-Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 95 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
+```text
+338 unit tests run, 5 guarded skips
+10 overall checks passed, 0 failed, 2 skipped
+15 safety-critical modules at or above their coverage floor
+```
 
-The environment still does not provide a physical Windows desktop, Roblox, two real monitors, actual Windows Known Folder redirection, real audio devices, or the optional wake-word package. Those are environmental limits, not claims that physical behavior has been validated.
+The skips in the default run are the panel tests, which need a Qt platform
+plugin, the dashboard route contract, which needs FastAPI, the coverage gate,
+which needs `coverage`, and the Windows hardware suite.
+
+### Continuous integration
+
+Six jobs: Ubuntu, Windows and macOS against Python 3.11 and 3.13. Each runs
+setup validation, compilation, the full unit suite, and the overall
+verification with `--coverage`; the Linux jobs install the Qt runtime so the
+panel tests execute rather than skip. The Windows jobs additionally run
+`tests/test_windows_integration.py`, and every job uploads its JSON report as
+an artifact.
+
+A GitHub Windows runner has no desktop — it executes in session 0 — so the
+tests that need one skip themselves there. What does run on every Windows
+build: the registry scan, a check that every indexed executable exists on disk,
+`.lnk` resolution through `pylnk3`, the refusal of slash-style switches, the
+native `user32` window backend, and a real Task Scheduler reminder being
+created, listed and cancelled.
+
+### What is still unverified
+
+No physical Windows desktop with two monitors, no Roblox, no real audio
+hardware, no Store applications, and no wake-word model. Those are
+environmental limits, and nothing in this document should be read as a claim
+that they have been exercised.
 
 ---
 
