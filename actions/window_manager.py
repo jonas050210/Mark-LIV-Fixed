@@ -6,6 +6,7 @@ from core.window_manager import (
     describe_monitors,
     describe_windows,
     find_window,
+    find_windows,
     list_monitors,
     list_windows,
     monitor_for,
@@ -54,6 +55,28 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         return describe_windows()
     if action in {"monitors", "list_monitors", "displays", "display_info"}:
         return describe_monitors()
+    if action in {"list_app_windows", "app_windows", "close_all", "minimize_all"}:
+        if not target:
+            return f"A target application is required for {action}."
+        matches = find_windows(target)
+        if not matches:
+            return f"I could not find a visible window matching '{target}'."
+        if action in {"list_app_windows", "app_windows"}:
+            rows = [
+                f"{index}. {window.title} [{window.process}] HWND {window.handle}"
+                for index, window in enumerate(matches[:40], 1)
+            ]
+            return f"Windows matching '{target}':\n" + "\n".join(rows)
+        operation = "close" if action == "close_all" else "minimize"
+        completed = 0
+        for item in matches:
+            try:
+                operate(item, operation)
+                completed += 1
+            except Exception:
+                continue
+        verb = "Closed" if operation == "close" else "Minimized"
+        return f"{verb} {completed} of {len(matches)} window(s) matching '{target}'."
 
     window = find_window(target)
     if window is None:
@@ -134,7 +157,8 @@ TOOL = {
     "description": (
         "Controls a named desktop window and the user's monitors. Use this instead "
         "of a blind hotkey when the user names an app: list open windows, focus, "
-        "minimize, maximize, fullscreen, restore, close immediately, move an app to a "
+        "list all windows of one app, minimize or close one/all, maximize, fullscreen, "
+        "restore, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "
         "If no target is supplied, use the currently active window."
@@ -144,11 +168,12 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["list_windows", "list_monitors", "focus", "minimize", "maximize", "fullscreen", "restore", "close", "move_to_monitor", "snap", "move"],
+                "enum": ["list_windows", "list_monitors", "list_app_windows", "focus", "minimize", "minimize_all", "maximize", "fullscreen", "restore", "close", "close_all", "move_to_monitor", "snap", "move"],
                 "maxLength": 32,
                 "description": (
-                    "list_windows | list_monitors | focus | minimize | maximize | "
-                    "fullscreen | restore | close | move_to_monitor | snap | move"
+                    "list_windows | list_monitors | list_app_windows | focus | minimize | "
+                    "minimize_all | maximize | fullscreen | restore | close | close_all | "
+                    "move_to_monitor | snap | move"
                 ),
             },
             "target": {

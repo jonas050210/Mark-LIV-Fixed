@@ -934,6 +934,46 @@ def open_explorer(
         return f"Could not open Explorer: {type(exc).__name__}"
 
 
+def open_with_application(
+    path: str,
+    application: str,
+    name: str = "",
+    match_index: int | None = None,
+) -> str:
+    """Resolve one safe file and pass it to an indexed application as argv."""
+    app_name = str(application or "").strip()[:160]
+    if not app_name:
+        return "An application name is required for open_with."
+    try:
+        target = _resolve_path(path)
+    except (OSError, ValueError, PathPolicyError) as exc:
+        return f"Access denied: {type(exc).__name__}"
+    if not _is_safe_path(target):
+        return f"Access denied: {target}"
+    if name:
+        try:
+            clean_name = validate_child_name(name)
+        except ValueError as exc:
+            return f"Invalid file name: {type(exc).__name__}"
+        candidate = target / clean_name
+        if candidate.exists():
+            target = candidate
+        else:
+            matches = explorer.search(name, root=target, limit=20)
+            if match_index is not None:
+                if not 1 <= match_index <= len(matches):
+                    return f"Choose a candidate number between 1 and {len(matches)}."
+                target = matches[match_index - 1]
+            elif len(matches) != 1:
+                return explorer.format_matches(matches, name)
+            else:
+                target = matches[0]
+    if not target.exists() or not target.is_file():
+        return f"I could not find a file to open at {target}."
+    from actions.open_app import open_app
+    return open_app({"app_name": app_name, "arguments": [str(target)]})
+
+
 def _as_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -973,6 +1013,14 @@ def file_controller(
     try:
         if action in {"open", "open_folder", "explorer"}:
             return open_explorer(path, name=name, select=False, match_index=match_index)
+
+        elif action == "open_with":
+            return open_with_application(
+                path,
+                application=params.get("application", ""),
+                name=name,
+                match_index=match_index,
+            )
 
         elif action in {"select", "show_in_explorer", "reveal"}:
             return open_explorer(path, name=name, select=True, match_index=match_index)
@@ -1056,13 +1104,13 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Reliable Windows Explorer and file control: open folders, reveal exact files, search known folders, list, create, delete, move, copy, rename, read, write, and disk usage.",
+    "description": "Reliable Explorer and file control: open a file normally or with a named installed application, open folders, reveal exact files, search known folders, list, create, delete, move, copy, rename, read, write, and inspect disk usage.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["open", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "info"],
+                "enum": ["open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "info"],
                 "maxLength": 32,
                 "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | info"
             },
@@ -1070,6 +1118,11 @@ TOOL = {
                 "type": "STRING",
                 "maxLength": 500,
                 "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+            },
+            "application": {
+                "type": "STRING",
+                "maxLength": 160,
+                "description": "Installed application name for open_with, such as Edge or Photoshop"
             },
             "destination": {
                 "type": "STRING",

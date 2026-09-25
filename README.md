@@ -38,7 +38,7 @@ The assistant now has named window and monitor control. Examples:
 - `List my open windows and monitors`
 - `Restart MARK LIV`
 
-The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing a named application is immediate and does not add a MARK LIV confirmation; the application can still present its own native save prompt when it genuinely has unsaved work. Power actions and Windows administrator/UAC operations are never silently bypassed.
+The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing a named application is immediate and does not add a MARK LIV confirmation; the application can still present its own native save prompt when it genuinely has unsaved work. The `app_lifecycle` action reports installation/process/window state and performs graceful app restarts without hotkeys or force-killing unsaved work. Power actions and Windows administrator/UAC operations are never silently bypassed.
 
 The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It is the primary control surface rather than a hotkey collection: press **Ctrl/Cmd-K** for the command palette, use quick cards for windows, monitors, audio, Explorer, Task Manager, and relaunch, and use the per-window FOCUS/MIN/MAX/CLOSE controls. The FILE EXPLORER panel searches Home, Desktop, Downloads, Documents, or Pictures and offers separate OPEN and SELECT actions for each verified result. It shows live action IDs, progress, cancellation, confirmations, named-window occupancy, monitor tiles, audio health, and undo history. It is a control surface, not an unrestricted way around Windows security.
 
@@ -98,6 +98,8 @@ panel searches the same application index and opens an app on a chosen monitor
 and state.
 
 Application and Explorer control are deliberately conservative. `open Chrome` or `open Roblox` focuses an existing window instead of silently creating another one. A second Roblox client is only attempted for an explicit request such as `open another Roblox`; MARK LIV verifies the new window and moves it to the opposite monitor when a second display is available, otherwise it reports the limitation. File searches resolve Windows known folders, search the user's home folder by default, use Everything when installed, and show numbered candidates when more than one file matches. `open` and `select` only act on a unique exact or search result, so MARK LIV does not guess between similarly named files.
+
+The settings drawer includes a live HUD maximum frame-rate selector for 30, 60, 120, 240, or unlimited FPS. This changes MARK LIV's own software-rendered HUD, not game frame rates. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
 
 Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.
 
