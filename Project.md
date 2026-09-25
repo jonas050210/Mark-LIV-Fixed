@@ -296,6 +296,27 @@ nothing more.
   prints no job number, the reminder is still set, and the answer says plainly
   that it will not be cancellable.
 
+### file_processor split into handlers
+
+`actions/file_processor.py` was 1626 lines covering eleven unrelated formats,
+so a change to video trimming was made in the same file as PDF extraction and
+zip-bomb defence. The action keeps its name, its tool declaration and its
+dispatcher — 250 lines — and the work moved into `actions/file_handlers/`:
+
+| Module | Formats |
+| --- | --- |
+| `common.py` | path validation, stable-input snapshot, parameter coercion, output naming, size limits |
+| `images.py` | describe, OCR, resize, convert, compress, crop |
+| `documents.py` | PDF, Word, text and Markdown, PowerPoint |
+| `data.py` | CSV and spreadsheets, JSON, XML |
+| `code.py` | explain, review, fix, run, document |
+| `media.py` | audio and video |
+| `archives.py` | zip and tar, with the traversal and expansion guards |
+
+Every import is explicit rather than a star import, so it is visible at the top
+of each module which shared helpers it depends on. The action loader globs
+`actions/*.py`, so the package directory is not mistaken for an action.
+
 ### One loop for recurring jobs
 
 The topic monitor and the proactive check-in each ran their own `while True`

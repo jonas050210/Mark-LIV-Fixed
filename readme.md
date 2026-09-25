@@ -332,6 +332,7 @@ Mark LIV/
 │   ├── screen_processor.py   # Screen & webcam capture for vision
 │   ├── background_monitor.py # User-configured topic watching — daily DDG check
 │   ├── proactive.py          # Proactive 2.0 — time/context/rotation-aware check-ins
+│   ├── file_handlers/        # per-format handlers behind file_processor
 │   ├── reminder.py           # OS-native scheduled notifications, with a cancellable registry
 │   ├── system_monitor.py     # CPU / RAM / GPU / temperature telemetry
 │   ├── computer_settings.py  # System settings, media keys, and confirmed power actions
