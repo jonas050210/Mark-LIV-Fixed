@@ -50,6 +50,27 @@ so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming
 success. Say `rescan my apps` after installing something new.
 
+The launcher also remembers what you actually use: the dashboard's **APP
+LAUNCHER** panel shows pinned and recently opened applications as icon buttons,
+and the index refreshes itself when a Start-menu folder or desktop entry changes,
+so a freshly installed program appears without waiting out the cache. Opening an
+application is undoable — `undo` closes the window that launch created, and
+refuses if you already closed it yourself.
+
+Applications can be opened with a document or URL, for example
+`open Chrome with youtube.com`. Arguments are passed as a real argv list, never
+through a shell, and command-line switches are rejected.
+
+Window arrangements can be saved and restored by name:
+
+- `Save this layout as work`
+- `Set up work`
+- `List my layouts` / `Delete the layout gaming`
+
+A layout stores each window's monitor, position, size and state, matched by
+process name rather than by window handle, so it survives a restart. Windows
+that are not running are reported, never launched behind your back.
+
 Placement is part of the same request:
 
 - `Open Chrome on monitor 2 in fullscreen`

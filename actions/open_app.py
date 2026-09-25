@@ -5,6 +5,8 @@ import time
 from core.app_index import (
     LaunchError,
     build_index,
+    record_launch,
+    sanitise_arguments,
     is_uri,
     launch as launch_app,
     launch_uri,
@@ -12,6 +14,7 @@ from core.app_index import (
     meaningful_terms,
     normalize_key,
     resolve as resolve_app,
+    sanitise_arguments as _sanitise_arguments,
     score_entry,
 )
 from core.shortcut_store import resolve as resolve_shortcut
@@ -159,10 +162,10 @@ def _resolve_candidates(*queries: str) -> tuple[list, bool]:
     return [], True
 
 
-def _launch_resolved(entry) -> tuple[bool, int | None, str]:
+def _launch_resolved(entry, arguments=None) -> tuple[bool, int | None, str]:
     """Start one indexed application.  Never simulates keyboard input."""
     try:
-        pid = launch_app(entry)
+        pid = launch_app(entry, arguments)
         return True, pid, ""
     except LaunchError as exc:
         return False, None, str(exc)
@@ -388,6 +391,12 @@ def open_app(
 
     foreground = parameters.get("foreground")
     foreground = True if foreground is None else bool(foreground)
+    try:
+        arguments = sanitise_arguments(
+            parameters.get("arguments", parameters.get("open_with"))
+        )
+    except ValueError as exc:
+        return f"I cannot pass that to the application: {exc}."
     monitor_index, state = _placement_request(parameters)
     if state and state not in _ALLOWED_STATES:
         return f"state must be one of: {', '.join(sorted(_ALLOWED_STATES))}."
@@ -455,19 +464,22 @@ def open_app(
     existing_keys = {_window_key(window) for window in existing}
 
     try:
-        started, pid, failure = _launch_resolved(entry)
+        started, pid, failure = _launch_resolved(entry, arguments)
         if not started:
             return f"I could not start {entry.name}: {failure or 'the launch was refused'}."
 
         if is_roblox and explicit_second:
             return _second_roblox_instance(app_name, normalized, existing, existing_keys)
 
+        record_launch(entry.name)
         window = _await_launched_window(app_name, normalized, pid, existing_keys)
         if window is None:
             return (
                 f"I started {entry.name}, but no window appeared within the wait window. "
                 "It may still be loading or it may have failed to start."
             )
+
+        _remember_launch(entry.name, window)
 
         if monitor_index is not None or state:
             ok, detail = _apply_placement(window, monitor_index, state, focus=foreground)
@@ -489,6 +501,32 @@ def open_app(
     except Exception as exc:
         print(f"[open_app] Launch failed ({type(exc).__name__}).")
         return f"Failed to open {app_name} ({type(exc).__name__})."
+
+
+def _remember_launch(name: str, window) -> None:
+    """Make an application launch reversible by closing the window it opened.
+
+    Only the window this launch produced is closed, and only if it is still the
+    same window, so an undo cannot take down something the user opened since.
+    """
+    handle = int(getattr(window, "handle", 0) or 0)
+    if not handle:
+        return
+
+    def _undo() -> str:
+        from core import undo as undo_stack
+        from core.window_manager import list_windows, operate
+        current = next((item for item in list_windows() if item.handle == handle), None)
+        if current is None:
+            undo_stack.refuse(f"{name} is no longer open, so there is nothing to close.")
+        operate(current, "close")
+        return f"Closed {name} again."
+
+    try:
+        from core.undo import push_undo
+        push_undo(f"opening {name}", _undo)
+    except Exception:
+        pass
 
 
 def _confident_match(candidates, *queries: str) -> bool:
@@ -571,7 +609,8 @@ TOOL = {
         "opens focus an existing app instead of duplicating it. Set foreground false to start "
         "or leave an app in the background. Use monitor and state to place the window, for "
         "example monitor 2 with state fullscreen. Set new_instance true only when the user "
-        "explicitly asks for another instance; for Roblox this attempts a second window, moves "
+        "explicitly asks for another instance. Pass arguments to open a URL or document with "
+        "the application, for example Chrome with https://youtube.com. For Roblox new_instance attempts a second window, moves "
         "it to the opposite monitor when possible, and verifies the result."
     ),
     "parameters": {
@@ -595,6 +634,12 @@ TOOL = {
                 "enum": ["normal", "maximized", "fullscreen", "minimized", "left", "right", "top", "bottom"],
                 "maxLength": 16,
                 "description": "Window state after opening: fullscreen, maximized, minimized, or a snap side."
+            },
+            "arguments": {
+                "type": "ARRAY",
+                "maxItems": 8,
+                "items": {"type": "STRING", "maxLength": 2048},
+                "description": "Documents or URLs to open with the application, e.g. ['https://youtube.com']. Command-line switches are rejected."
             },
             "new_instance": {
                 "type": "BOOLEAN",

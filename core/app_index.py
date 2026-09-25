@@ -37,8 +37,12 @@ from core.json_store import JsonStore, JsonStoreCorruptError
 _OS = platform.system()
 BASE_DIR = Path(__file__).resolve().parent.parent
 INDEX_FILE = BASE_DIR / "config" / "app_index.json"
+USAGE_FILE = BASE_DIR / "config" / "app_usage.json"
 
 CACHE_TTL_SECONDS = 24 * 60 * 60
+MAX_RECENT = 12
+MAX_PINNED = 12
+MAX_USAGE_ENTRIES = 200
 MAX_ENTRIES = 4_000
 MAX_SCAN_FILES = 20_000
 FUZZY_THRESHOLD = 0.62
@@ -134,11 +138,48 @@ def _read_cache() -> dict:
         return {}
 
 
+def _source_directories() -> list[Path]:
+    """Folders whose contents decide whether the cached index is still current."""
+    directories: list[Path] = []
+    if _OS == "Windows":
+        for variable in ("ProgramData", "APPDATA"):
+            base = os.environ.get(variable, "")
+            if base:
+                directories.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    elif _OS == "Darwin":
+        directories += [Path("/Applications"), Path.home() / "Applications"]
+    else:
+        data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/share:/usr/local/share").split(":")
+        directories += [Path(item) / "applications" for item in data_dirs if item]
+        directories.append(Path.home() / ".local" / "share" / "applications")
+    return directories
+
+
+def _source_signature() -> float:
+    """Newest modification time across the discovery folders.
+
+    Installing or removing an application rewrites its Start-menu folder or
+    desktop entry, so this changes immediately.  It lets a fresh install show up
+    without waiting out the 24-hour TTL and without a filesystem watcher.
+    """
+    newest = 0.0
+    for directory in _source_directories():
+        try:
+            newest = max(newest, directory.stat().st_mtime)
+            for child in directory.iterdir():
+                if child.is_dir():
+                    newest = max(newest, child.stat().st_mtime)
+        except OSError:
+            continue
+    return round(newest, 3)
+
+
 def _write_cache(entries: list[AppEntry]) -> None:
     payload = {
         "version": 1,
         "system": _OS,
         "built_at": time.time(),
+        "signature": _source_signature(),
         "entries": [entry.as_dict() for entry in entries[:MAX_ENTRIES]],
     }
     try:
@@ -398,6 +439,11 @@ def load_index(*, refresh: bool = False) -> list[AppEntry]:
     if not refresh:
         cache = _read_cache()
         stale = (time.time() - float(cache.get("built_at") or 0)) > CACHE_TTL_SECONDS
+        try:
+            moved = float(cache.get("signature") or -1.0) != _source_signature()
+        except Exception:
+            moved = False
+        stale = stale or moved
         same_system = cache.get("system") == _OS
         raw = cache.get("entries") if isinstance(cache.get("entries"), list) else []
         if raw and same_system and not stale:
@@ -477,6 +523,41 @@ def _reap_spawned() -> None:
     _SPAWNED[:] = alive[-64:]
 
 
+_MAX_ARGUMENTS = 8
+_MAX_ARGUMENT_LENGTH = 2_048
+
+
+def sanitise_arguments(arguments) -> list[str]:
+    """Validate command-line arguments handed to a launched application.
+
+    Arguments are passed as a real argv list, never through a shell, so quoting
+    and metacharacters carry no meaning.  What still matters is that a model
+    cannot smuggle switches in: anything starting with a dash is rejected, which
+    keeps this to documents and URLs.
+    """
+    if arguments in (None, "", []):
+        return []
+    if isinstance(arguments, str):
+        arguments = [arguments]
+    if not isinstance(arguments, (list, tuple)):
+        raise ValueError("arguments must be a list of strings")
+    if len(arguments) > _MAX_ARGUMENTS:
+        raise ValueError(f"at most {_MAX_ARGUMENTS} arguments are allowed")
+    cleaned = []
+    for item in arguments:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        if len(value) > _MAX_ARGUMENT_LENGTH:
+            raise ValueError("an argument is too long")
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("an argument contains control characters")
+        if value.startswith("-"):
+            raise ValueError(f"command-line switches are not allowed: {value[:32]}")
+        cleaned.append(value)
+    return cleaned
+
+
 def _spawn(argv: list[str]) -> int | None:
     _reap_spawned()
     process = subprocess.Popen(
@@ -492,20 +573,25 @@ def _spawn(argv: list[str]) -> int | None:
     return process.pid
 
 
-def launch(entry: AppEntry) -> int | None:
+def launch(entry: AppEntry, arguments=None) -> int | None:
     """Start an indexed application.  Returns the child pid when one is known.
 
     A ``None`` pid means the launch was delegated to the shell (Store app,
     ``.lnk``, URI, macOS ``open``) and the caller must verify by window rather
     than by process handle.  It never means failure — failure raises.
     """
+    argv_extra = sanitise_arguments(arguments)
+
     if entry.kind == _KIND_EXEC:
         if not Path(entry.target).is_file():
             raise LaunchError(f"{entry.name} is no longer installed at its indexed location")
-        return _spawn([entry.target])
+        return _spawn([entry.target, *argv_extra])
 
     if entry.kind == _KIND_BUNDLE:
-        completed = subprocess.run(["open", "-a", entry.target], capture_output=True, timeout=15)
+        command = ["open", "-a", entry.target]
+        if argv_extra:
+            command += ["--args", *argv_extra]
+        completed = subprocess.run(command, capture_output=True, timeout=15)
         if completed.returncode != 0:
             raise LaunchError(f"macOS refused to open {entry.name}")
         return None
@@ -513,12 +599,21 @@ def launch(entry: AppEntry) -> int | None:
     if entry.kind == _KIND_LNK:
         if not Path(entry.target).is_file():
             raise LaunchError(f"the shortcut for {entry.name} no longer exists")
+        if argv_extra:
+            # startfile cannot pass arguments to a shortcut; resolve the real
+            # target through the shell verb instead of silently dropping them.
+            raise LaunchError(
+                f"{entry.name} is indexed as a Start-menu shortcut, which cannot "
+                "receive arguments. Ask me to open the document directly instead."
+            )
         os.startfile(entry.target)  # type: ignore[attr-defined]
         return None
 
     if entry.kind == _KIND_AUMID:
         if not re.fullmatch(r"[A-Za-z0-9_.\-+!{}\\ ]{1,512}", entry.target):
             raise LaunchError(f"{entry.name} has an unusable application id")
+        if argv_extra:
+            raise LaunchError(f"{entry.name} is a Store application and cannot take arguments")
         explorer = Path(os.environ.get("WINDIR", r"C:\Windows")) / "explorer.exe"
         return _spawn([str(explorer), f"shell:AppsFolder\\{entry.target}"])
 
@@ -543,3 +638,120 @@ def launch_uri(target: str) -> int | None:
 
 def describe(entries: list[AppEntry], limit: int = 5) -> str:
     return ", ".join(entry.name for entry in entries[:limit])
+
+
+# ── usage: pinned and recently launched ──────────────────────────────────────
+# The index answers "what is installed"; this answers "what do you actually
+# open". A launcher that always starts from an empty search box makes the user
+# retype the same six names every day.
+
+def _valid_usage(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key in ("pinned", "recent"):
+        item = value.get(key, [])
+        if not isinstance(item, list) or len(item) > MAX_USAGE_ENTRIES:
+            return False
+        if any(not isinstance(name, str) or len(name) > 200 for name in item):
+            return False
+    counts = value.get("counts", {})
+    if not isinstance(counts, dict) or len(counts) > MAX_USAGE_ENTRIES:
+        return False
+    for name, total in counts.items():
+        if not isinstance(name, str) or len(name) > 200:
+            return False
+        if isinstance(total, bool) or not isinstance(total, int) or not 0 <= total <= 1_000_000:
+            return False
+    return True
+
+
+def _usage_store() -> JsonStore[dict]:
+    return JsonStore(USAGE_FILE, dict, validator=_valid_usage)
+
+
+def read_usage() -> dict:
+    if not USAGE_FILE.exists():
+        return {"pinned": [], "recent": [], "counts": {}}
+    try:
+        data = _usage_store().read()
+    except (JsonStoreCorruptError, OSError, ValueError):
+        return {"pinned": [], "recent": [], "counts": {}}
+    return {
+        "pinned": list(data.get("pinned") or [])[:MAX_PINNED],
+        "recent": list(data.get("recent") or [])[:MAX_RECENT],
+        "counts": dict(data.get("counts") or {}),
+    }
+
+
+def _write_usage(data: dict) -> None:
+    try:
+        _usage_store().write({
+            "pinned": list(data.get("pinned") or [])[:MAX_PINNED],
+            "recent": list(data.get("recent") or [])[:MAX_RECENT],
+            "counts": {
+                name: int(total)
+                for name, total in sorted(
+                    (data.get("counts") or {}).items(), key=lambda item: -int(item[1])
+                )[:MAX_USAGE_ENTRIES]
+            },
+        })
+    except Exception as exc:
+        print(f"[app_index] could not persist launcher usage ({type(exc).__name__}).")
+
+
+def record_launch(name: str) -> None:
+    """Remember that an application was opened, for the recent list."""
+    clean = str(name or "").strip()[:200]
+    if not clean:
+        return
+    data = read_usage()
+    recent = [item for item in data["recent"] if item.casefold() != clean.casefold()]
+    recent.insert(0, clean)
+    data["recent"] = recent[:MAX_RECENT]
+    data["counts"][clean] = int(data["counts"].get(clean, 0)) + 1
+    _write_usage(data)
+
+
+def set_pinned(name: str, pinned: bool) -> list[str]:
+    """Pin or unpin an application in the launcher. Returns the new pin list."""
+    clean = str(name or "").strip()[:200]
+    if not clean:
+        raise ValueError("an application name is required")
+    data = read_usage()
+    pins = [item for item in data["pinned"] if item.casefold() != clean.casefold()]
+    if pinned:
+        if len(pins) >= MAX_PINNED:
+            raise ValueError(f"you can pin at most {MAX_PINNED} applications")
+        pins.append(clean)
+    data["pinned"] = pins
+    _write_usage(data)
+    return pins
+
+
+def quick_list(entries: list[AppEntry] | None = None) -> dict:
+    """Pinned first, then most recent, resolved against the live index.
+
+    Entries that no longer resolve are dropped rather than offered as dead
+    buttons, which is what happens after an application is uninstalled.
+    """
+    pool = entries if entries is not None else load_index()
+    known = {entry.key: entry for entry in pool}
+    usage = read_usage()
+
+    def _resolved(names: list[str]) -> list[AppEntry]:
+        found = []
+        seen = set()
+        for name in names:
+            entry = known.get(normalize_key(name))
+            if entry is None:
+                matches = resolve(name, limit=1, entries=pool)
+                entry = matches[0] if matches else None
+            if entry is not None and entry.key not in seen:
+                seen.add(entry.key)
+                found.append(entry)
+        return found
+
+    pinned = _resolved(usage["pinned"])
+    pinned_keys = {entry.key for entry in pinned}
+    recent = [entry for entry in _resolved(usage["recent"]) if entry.key not in pinned_keys]
+    return {"pinned": pinned, "recent": recent[:MAX_RECENT]}

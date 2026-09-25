@@ -17,6 +17,10 @@ config/spotify_token.json
 config/shortcuts.json
 # the local index of every application installed on this machine
 config/app_index.json
+# which applications you pin and open most often
+config/app_usage.json
+# extracted application icons for the launcher panel
+config/app_icons/
 # private-store backups, locks, quarantine, and temp files
 config/*.json.*
 # hidden private-store sidecars
@@ -42,6 +46,8 @@ memory/sessions.json
 memory/*.json.*
 # hidden private-store sidecars
 memory/.*.json.*
+# saved desktop window arrangements
+memory/layouts.json
 memory/*.db
 
 # ── Python build noise ────────────────────────────────────────────────────────

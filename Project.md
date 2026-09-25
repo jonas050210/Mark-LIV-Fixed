@@ -240,6 +240,39 @@ whichever application had focus rather than the one the user named. The guard
 runs before the PyAutoGUI availability check, so a refusal is an explanation
 rather than a missing-dependency error.
 
+### Launcher usage, icons, and arguments
+
+`config/app_usage.json` records pinned applications, a bounded recent list, and
+launch counts; `quick_list()` resolves those names against the live index and
+drops entries that no longer exist, so an uninstalled application cannot linger
+as a dead button. Cache staleness is decided by a signature over the discovery
+folders' modification times as well as the 24-hour TTL, which makes a newly
+installed application appear immediately.
+
+`core/app_icons.py` extracts 64×64 PNG icons — `ExtractAssociatedIcon` through
+PowerShell on Windows, `.icns` from the bundle on macOS, XDG icon themes on
+Linux — and caches them under `config/app_icons` keyed by a digest of the launch
+target. Every path degrades to "no icon" rather than raising, because an icon
+must never be able to break a launch.
+
+`sanitise_arguments()` allows documents and URLs to be passed to an application
+as a real argv list. Arguments beginning with a dash are rejected, so a model
+cannot smuggle switches such as `--remote-debugging-port` into a browser launch,
+and shortcut/Store launches that cannot carry arguments say so instead of
+silently dropping them.
+
+A successful launch pushes an undo entry that closes the specific window handle
+it produced, and refuses when that window is already gone.
+
+### Window layouts
+
+`actions/layout_manager.py` saves and restores named arrangements. A layout
+records each window's process, title fragment, monitor index, geometry and state
+— never a window handle, which would not survive a restart. Shell windows such
+as `explorer.exe` are skipped so a restore does not fight the desktop. Save,
+apply and delete are all undoable, and applying reports the windows that are not
+currently open rather than launching them.
+
 ### Placement
 
 `core/window_manager.place_window()` moves a window to a monitor and applies a

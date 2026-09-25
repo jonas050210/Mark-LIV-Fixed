@@ -24,9 +24,11 @@ from pathlib import Path
 
 from core.action_runtime import runtime as action_runtime
 from core import app_index
+from core import app_icons
 from core import undo as undo_stack
 from core import confirm as confirm_gate
 from core import explorer as explorer_core
+from actions import layout_manager as layout_core
 from actions import media_control as media_control_core
 from core.path_policy import (
     PathPolicyError,
@@ -67,6 +69,7 @@ _APP_LAUNCH_STATES = frozenset({
     "normal", "maximized", "fullscreen", "minimized",
     "left", "right", "top", "bottom",
 })
+_LAYOUT_PANEL_ACTIONS = frozenset({"list", "save", "apply", "delete"})
 _SPOTIFY_PANEL_ACTIONS = frozenset({
     "status", "devices", "play", "pause", "next", "previous",
     "shuffle", "repeat", "seek", "volume", "search", "queue",
@@ -990,11 +993,24 @@ class DashboardServer:
                     entries = await asyncio.to_thread(
                         app_index.resolve, query, limit=max(1, min(int(limit), 50)), entries=entries
                     )
-                rows = [
-                    {"name": entry.name, "kind": entry.kind, "source": entry.source}
-                    for entry in entries[: max(1, min(int(limit), 200))]
-                ]
-                return JSONResponse({"ok": True, "query": query, "count": len(rows), "apps": rows})
+                def _row(entry) -> dict:
+                    return {
+                        "name": entry.name,
+                        "kind": entry.kind,
+                        "source": entry.source,
+                        "icon": app_icons.has_icon(entry),
+                    }
+
+                rows = [_row(entry) for entry in entries[: max(1, min(int(limit), 200))]]
+                quick = await asyncio.to_thread(app_index.quick_list)
+                return JSONResponse({
+                    "ok": True,
+                    "query": query,
+                    "count": len(rows),
+                    "apps": rows,
+                    "pinned": [_row(entry) for entry in quick["pinned"]],
+                    "recent": [_row(entry) for entry in quick["recent"]],
+                })
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": "Invalid parameters."}, status_code=400)
             except Exception as exc:
@@ -1060,6 +1076,116 @@ class DashboardServer:
                 )
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Launch failed: {type(exc).__name__}"},
+                                    status_code=500)
+            await self.broadcast({"type": "sys", "text": result})
+            return JSONResponse({"ok": True, "result": result})
+
+        @app.post("/api/apps/pin")
+        async def app_pin(req: Request):
+            """Pin or unpin an application in the launcher's quick row."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            pinned = body.get("pinned")
+            if not name or len(name) > 160 or not isinstance(pinned, bool):
+                return JSONResponse({"ok": False, "error": "A name and a pinned flag are required."},
+                                    status_code=400)
+            try:
+                pins = await asyncio.to_thread(app_index.set_pinned, name, pinned)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Pin failed: {type(exc).__name__}"},
+                                    status_code=500)
+            return JSONResponse({"ok": True, "pinned": pins})
+
+        @app.get("/api/apps/icon")
+        async def app_icon(req: Request, name: str = ""):
+            """Serve a cached application icon as PNG.
+
+            The lookup goes through the index by name, so the browser cannot ask
+            for an arbitrary file: only an indexed application resolves.
+            """
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            name = str(name or "").strip()[:160]
+            if not name:
+                return JSONResponse({"ok": False, "error": "A name is required."}, status_code=400)
+            try:
+                matches = await asyncio.to_thread(app_index.resolve, name, limit=1)
+                if not matches:
+                    return JSONResponse({"ok": False, "error": "Unknown application."}, status_code=404)
+                data = await asyncio.to_thread(app_icons.icon_png, matches[0])
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Icon failed: {type(exc).__name__}"},
+                                    status_code=500)
+            if not data:
+                return JSONResponse({"ok": False, "error": "No icon available."}, status_code=404)
+            return Response(
+                content=data,
+                media_type="image/png",
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
+
+        @app.get("/api/layouts")
+        async def layout_list(req: Request):
+            """Saved window layouts, as a plain list for the panel."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                data = await asyncio.to_thread(layout_core._read)
+                layouts = [
+                    {
+                        "name": name,
+                        "windows": len(layout.get("windows", [])),
+                        "saved_at": str(layout.get("saved_at", ""))[:19],
+                    }
+                    for name, layout in sorted((data.get("layouts") or {}).items())
+                ]
+                return JSONResponse({"ok": True, "layouts": layouts})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Layouts unavailable: {type(exc).__name__}"},
+                                    status_code=500)
+
+        @app.post("/api/layouts")
+        async def layout_command(req: Request):
+            """Save, apply, or delete a window layout through the action registry."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await _read_json_body(req)
+            except _RequestBodyTooLarge:
+                return JSONResponse({"ok": False, "error": "Request too large"}, status_code=413)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+            action = body.get("action")
+            action = action.strip().casefold() if isinstance(action, str) else ""
+            if action not in _LAYOUT_PANEL_ACTIONS:
+                return JSONResponse({"ok": False, "error": "Unsupported layout action."},
+                                    status_code=400)
+            name = body.get("name")
+            name = name.strip() if isinstance(name, str) else ""
+            if action != "list" and (not name or len(name) > 40):
+                return JSONResponse({"ok": False, "error": "A layout name is required."},
+                                    status_code=400)
+            parameters = {"action": action}
+            if name:
+                parameters["name"] = name
+            try:
+                result = await asyncio.to_thread(action_registry_run, "layout_manager", parameters)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": f"Layout command failed: {type(exc).__name__}"},
                                     status_code=500)
             await self.broadcast({"type": "sys", "text": result})
             return JSONResponse({"ok": True, "result": result})

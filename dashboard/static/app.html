@@ -180,6 +180,21 @@
     .launcher-form button:hover, .app-tile button:hover { color:var(--accent); border-color:var(--accent); }
     .launcher-opts { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:9px; margin-bottom:6px; }
     .app-tile { border-top:1px solid var(--border); padding:6px 0; display:flex; align-items:center; gap:6px; }
+    .app-icon { width:20px; height:20px; border-radius:4px; flex-shrink:0; object-fit:contain; background:#0d1220; }
+    .pin-btn { background:none; border:none; cursor:pointer; font-size:11px; color:#3d4a68; padding:2px 4px; }
+    .pin-btn.on { color:var(--accent); }
+    .quick-apps { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
+    .quick-app { display:flex; align-items:center; gap:5px; background:#101629; border:1px solid #293451; border-radius:6px; padding:5px 7px; font-size:9px; font-weight:700; color:#b9c7e0; cursor:pointer; max-width:150px; }
+    .quick-app:hover { color:var(--accent); border-color:var(--accent); }
+    .quick-app span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .quick-label { color:var(--muted); font-size:8px; letter-spacing:.6px; margin:2px 0 4px; }
+    .layout-row { display:flex; align-items:center; gap:6px; border-top:1px solid var(--border); padding:6px 0; }
+    .layout-row b { flex:1; min-width:0; color:var(--text); font:600 10px monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .layout-row small { color:var(--muted); font-size:8px; }
+    .layout-form { display:grid; grid-template-columns:1fr auto; gap:5px; margin-bottom:7px; }
+    .layout-form input { min-width:0; background:#07090f; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px; outline:none; font-size:10px; }
+    .layout-form button, .layout-row button { background:#101629; color:#b9c7e0; border:1px solid #293451; border-radius:6px; padding:6px 8px; font-size:9px; font-weight:700; cursor:pointer; }
+    .layout-form button:hover, .layout-row button:hover { color:var(--accent); border-color:var(--accent); }
     .app-tile b { flex:1; min-width:0; color:var(--text); font:600 10px monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .app-tile small { color:var(--muted); font-size:8px; letter-spacing:.4px; }
     .spotify-now { display:flex; gap:9px; align-items:center; padding:6px 0; }
@@ -253,7 +268,15 @@
           <label><input type="checkbox" id="launcher-background"> open in background (keep focus)</label>
           <button class="undo-btn" onclick="searchApps(true)">RESCAN</button>
         </div>
+        <div id="launcher-quick"></div>
         <div id="launcher-results">Search your installed applications.</div>
+      </div>
+      <div class="admin-card"><h3>WINDOW LAYOUTS</h3>
+        <div class="layout-form">
+          <input id="layout-name" placeholder="Layout name, e.g. work" aria-label="Layout name" maxlength="40">
+          <button onclick="saveLayout()">SAVE CURRENT</button>
+        </div>
+        <div id="layout-list">Loading…</div>
       </div>
       <div class="admin-card"><h3>SPOTIFY</h3>
         <div id="spotify-panel">Loading…</div>
@@ -573,6 +596,8 @@
         fillMonitorChoices(desktop.monitors || []);
         renderUndo(desktop.undo || []);
         loadSpotify();
+        loadLayouts();
+        searchApps();
       } catch (e) {
         document.getElementById('desktop-info').textContent = 'Admin data unavailable: ' + e;
       }
@@ -749,8 +774,10 @@
         return;
       }
       box.innerHTML = _appResults.map((app, index) =>
-        `<div class="app-tile"><b title="${esc(app.name)}">${esc(app.name)}</b>` +
+        `<div class="app-tile">${_iconTag(app)}<b title="${esc(app.name)}">${esc(app.name)}</b>` +
         `<small>${esc(app.source || app.kind || '')}</small>` +
+        `<button class="pin-btn" data-name="${esc(app.name)}" title="Pin" ` +
+        `onclick="pinApp(this.dataset.name, true)">★</button>` +
         `<button data-index="${index}" onclick="launchApp(this.dataset.index)">OPEN</button></div>`
       ).join('');
     }
@@ -766,6 +793,7 @@
         const payload = await response.json();
         if (!response.ok || !payload.ok) { box.textContent = payload.error || 'Application index unavailable.'; return; }
         renderApps(payload.apps);
+        renderQuickApps(payload.pinned, payload.recent);
       } catch (error) {
         box.textContent = 'Application index unavailable: ' + error;
       }
@@ -798,6 +826,104 @@
         (monitors || []).map(m => `<option value="${m.index}">MONITOR ${m.index}</option>`).join('');
       select.value = previous;
     }
+
+
+    // ── Pinned and recent applications ───────────────────────────────────────
+    function _iconTag(app) {
+      if (!app.icon) return '<span class="app-icon"></span>';
+      return `<img class="app-icon" src="/api/apps/icon?name=${encodeURIComponent(app.name)}" alt="" ` +
+             `onerror="this.style.visibility='hidden'">`;
+    }
+
+    function renderQuickApps(pinned, recent) {
+      const box = document.getElementById('launcher-quick');
+      const section = (label, apps, isPinned) => {
+        if (!apps || !apps.length) return '';
+        return `<div class="quick-label">${label}</div><div class="quick-apps">` +
+          apps.map(app =>
+            `<div class="quick-app" title="${esc(app.name)}" data-name="${esc(app.name)}" ` +
+            `onclick="launchNamed(this.dataset.name)">${_iconTag(app)}<span>${esc(app.name)}</span>` +
+            `<button class="pin-btn ${isPinned ? 'on' : ''}" data-name="${esc(app.name)}" data-pin="${isPinned ? '0' : '1'}" ` +
+            `title="${isPinned ? 'Unpin' : 'Pin'}" onclick="event.stopPropagation();pinApp(this.dataset.name,this.dataset.pin==='1')">★</button></div>`
+          ).join('') + '</div>';
+      };
+      box.innerHTML = section('PINNED', pinned, true) + section('RECENT', recent, false);
+    }
+
+    async function pinApp(name, pinned) {
+      try {
+        const response = await _authFetch('/api/apps/pin', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name, pinned })
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) { toast(payload.error || 'Pin failed'); return; }
+        toast(pinned ? 'Pinned ' + name : 'Unpinned ' + name);
+        searchApps();
+      } catch (error) { toast('Pin unavailable: ' + error); }
+    }
+
+    async function launchNamed(name) {
+      const body = Object.assign({ name }, launcherOptions());
+      try {
+        const response = await _authFetch('/api/apps/launch', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (payload.result || 'Launched') : (payload.error || 'Launch failed'));
+        if (response.ok && payload.ok) setTimeout(loadAdmin, 1200);
+      } catch (error) { toast('Launch unavailable: ' + error); }
+    }
+
+    // ── Window layouts ───────────────────────────────────────────────────────
+    function renderLayouts(layouts) {
+      const box = document.getElementById('layout-list');
+      if (!layouts || !layouts.length) {
+        box.innerHTML = '<div style="color:var(--muted);font-size:10px">No layouts saved. Arrange your windows, then press SAVE CURRENT.</div>';
+        return;
+      }
+      box.innerHTML = layouts.map(item =>
+        `<div class="layout-row"><b title="${esc(item.name)}">${esc(item.name)}</b>` +
+        `<small>${item.windows} windows</small>` +
+        `<button data-name="${esc(item.name)}" onclick="layoutCommand('apply', this.dataset.name)">APPLY</button>` +
+        `<button data-name="${esc(item.name)}" onclick="layoutCommand('delete', this.dataset.name)">DELETE</button></div>`
+      ).join('');
+    }
+
+    async function loadLayouts() {
+      try {
+        const response = await _authFetch('/api/layouts');
+        const payload = await response.json();
+        if (response.ok && payload.ok) renderLayouts(payload.layouts);
+        else document.getElementById('layout-list').textContent = payload.error || 'Layouts unavailable.';
+      } catch (error) {
+        document.getElementById('layout-list').textContent = 'Layouts unavailable.';
+      }
+    }
+
+    async function layoutCommand(action, name) {
+      try {
+        const response = await _authFetch('/api/layouts', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ action, name })
+        });
+        const payload = await response.json();
+        toast(response.ok && payload.ok ? (payload.result || 'Done') : (payload.error || 'Layout command failed'));
+        loadLayouts();
+      } catch (error) { toast('Layout command unavailable: ' + error); }
+    }
+
+    function saveLayout() {
+      const input = document.getElementById('layout-name');
+      const name = (input.value || '').trim();
+      if (!name) { toast('Give the layout a name first.'); return; }
+      input.value = '';
+      layoutCommand('save', name);
+    }
+
+    document.getElementById('layout-name').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); saveLayout(); }
+    });
 
     // ── Spotify panel ────────────────────────────────────────────────────────
     let _spotify = {};
