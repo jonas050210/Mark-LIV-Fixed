@@ -204,7 +204,7 @@ Three things it deliberately does *not* do:
 * **It does not hoard.** Undoing a write means keeping the old contents in memory, so files over 1 MB are excluded and it says so rather than holding a 200 MB log for the session.
 * **It does not delete your files to undo a copy.** The reverse of a copy is removing the copy; the reverse of "create a folder" is removing it *only while it's still empty*.
 
-`organize_desktop` gets special treatment — one command that moves dozens of files, which made it the least reversible thing the assistant could do. It journals every move and puts all of them back in one go, cleaning up the folders it created if they're still empty.
+Bulk desktop reorganisation used to live here, with a journal that could put every moved file back. It was removed anyway: a user who cannot see where fifty files went does not know there is anything to undo, and asking for three specific files to be moved is both clearer and safer.
 
 **Undo costs nothing at runtime.** It appends a closure to a list; nothing in it runs unless you ask.
 

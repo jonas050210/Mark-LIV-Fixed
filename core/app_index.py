@@ -12,8 +12,9 @@ result instead of assuming success.  Three Windows sources are consulted:
 
 * the ``App Paths`` registry keys, which is where classic installers (Chrome,
   Firefox, VS Code, Steam, …) register their executables;
-* the Start-menu shortcut trees, launched through the ``.lnk`` itself so no COM
-  dependency is needed to resolve the target;
+* the Start-menu shortcut trees, whose ``.lnk`` targets are resolved with
+  ``pylnk3`` where it is installed so the real executable is launched and a
+  process id comes back; the shortcut itself is the fallback;
 * ``shell:AppsFolder`` AUMIDs for Store/UWP applications.
 
 macOS enumerates application bundles and launches through ``open -a``; Linux
@@ -576,13 +577,25 @@ _MAX_ARGUMENTS = 8
 _MAX_ARGUMENT_LENGTH = 2_048
 
 
+def _is_existing_path(value: str) -> bool:
+    """True when the text names a file or directory that exists right now."""
+    try:
+        return Path(value).expanduser().exists()
+    except (OSError, ValueError):
+        return False
+
+
 def sanitise_arguments(arguments) -> list[str]:
     """Validate command-line arguments handed to a launched application.
 
     Arguments are passed as a real argv list, never through a shell, so quoting
     and metacharacters carry no meaning.  What still matters is that a model
     cannot smuggle switches in: anything starting with a dash is rejected, which
-    keeps this to documents and URLs.
+    keeps this to documents and URLs.  On Windows the switch character is the
+    forward slash rather than the dash — ``/s``, ``/q``, ``/f`` — so a
+    slash-prefixed argument is refused there too unless it names a file that
+    actually exists, which is how a POSIX-style path reaches a cross-platform
+    application.
     """
     if arguments in (None, "", []):
         return []
@@ -602,6 +615,8 @@ def sanitise_arguments(arguments) -> list[str]:
         if any(ord(char) < 32 for char in value):
             raise ValueError("an argument contains control characters")
         if value.startswith("-"):
+            raise ValueError(f"command-line switches are not allowed: {value[:32]}")
+        if _OS == "Windows" and value.startswith("/") and not _is_existing_path(value):
             raise ValueError(f"command-line switches are not allowed: {value[:32]}")
         cleaned.append(value)
     return cleaned
@@ -733,14 +748,26 @@ def read_usage() -> dict:
 
 
 def _write_usage(data: dict) -> None:
+    pinned = list(data.get("pinned") or [])[:MAX_PINNED]
+    recent = list(data.get("recent") or [])[:MAX_RECENT]
+    # The count table is capped, and once it is full a plain "highest count
+    # first" cut would evict every newly used application before its second
+    # launch — the table would freeze forever. Anything pinned or recently used
+    # is therefore kept regardless of its count.
+    protected = {name.casefold() for name in pinned + recent}
+
+    def _order(item: tuple[str, object]) -> tuple[int, int]:
+        name, total = item
+        return (0 if name.casefold() in protected else 1, -int(total))
+
     try:
         _usage_store().write({
-            "pinned": list(data.get("pinned") or [])[:MAX_PINNED],
-            "recent": list(data.get("recent") or [])[:MAX_RECENT],
+            "pinned": pinned,
+            "recent": recent,
             "counts": {
                 name: int(total)
                 for name, total in sorted(
-                    (data.get("counts") or {}).items(), key=lambda item: -int(item[1])
+                    (data.get("counts") or {}).items(), key=_order
                 )[:MAX_USAGE_ENTRIES]
             },
         })
@@ -757,7 +784,11 @@ def record_launch(name: str) -> None:
     recent = [item for item in data["recent"] if item.casefold() != clean.casefold()]
     recent.insert(0, clean)
     data["recent"] = recent[:MAX_RECENT]
-    data["counts"][clean] = int(data["counts"].get(clean, 0)) + 1
+    # Count under the name already stored, so "Chrome" and "chrome" are one
+    # application rather than two half-counted ones.
+    counts = data["counts"]
+    existing = next((key for key in counts if key.casefold() == clean.casefold()), clean)
+    counts[existing] = int(counts.get(existing, 0)) + 1
     _write_usage(data)
 
 

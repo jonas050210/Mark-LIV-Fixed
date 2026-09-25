@@ -162,3 +162,165 @@ class ShortcutResolutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandleStabilityTests(unittest.TestCase):
+    """A handle that changes between two enumerations is not a handle.
+
+    Only Windows hands out a real HWND. On every other platform the window
+    object is a fresh wrapper each time the desktop is enumerated, so deriving
+    the handle from the object's identity would break ``refresh_window`` and,
+    through it, every placement verification.
+    """
+
+    class _FakeWindow:
+        def __init__(self, title: str, pid: int) -> None:
+            self.title = title
+            self._pid = pid
+            self.left = self.top = 0
+            self.right, self.bottom = 800, 600
+            self.isMinimized = self.isMaximized = False
+
+        def getPID(self) -> int:
+            return self._pid
+
+    def test_the_same_window_yields_the_same_handle_twice(self) -> None:
+        from core import window_manager
+
+        first = window_manager._stable_handle(self._FakeWindow("Editor", 42), "Editor", 42)
+        second = window_manager._stable_handle(self._FakeWindow("Editor", 42), "Editor", 42)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, 0)
+
+    def test_different_windows_yield_different_handles(self) -> None:
+        from core import window_manager
+
+        self.assertNotEqual(
+            window_manager._stable_handle(self._FakeWindow("Editor", 42), "Editor", 42),
+            window_manager._stable_handle(self._FakeWindow("Editor", 43), "Editor", 43),
+        )
+
+    def test_a_native_handle_always_wins(self) -> None:
+        from core import window_manager
+
+        window = self._FakeWindow("Editor", 42)
+        window._hWnd = 12345
+        self.assertEqual(window_manager._stable_handle(window, "Editor", 42), 12345)
+
+    def test_refresh_falls_back_to_pid_and_title(self) -> None:
+        from core import window_manager
+
+        live = WindowInfo(999, "Editor", "code", 42, 0, 0, 800, 600)
+        stale = WindowInfo(111, "Editor", "code", 42, 0, 0, 100, 100)
+        with patch.object(window_manager, "list_windows", return_value=[live]):
+            self.assertEqual(window_manager.refresh_window(stale), live)
+
+
+class WindowsSwitchArgumentTests(unittest.TestCase):
+    """On Windows the switch character is the slash, not the dash."""
+
+    def test_a_slash_switch_is_refused_on_windows(self) -> None:
+        from core import app_index
+
+        with patch.object(app_index, "_OS", "Windows"):
+            for switch in ("/s", "/Q", "/delete"):
+                with self.assertRaises(ValueError, msg=switch):
+                    app_index.sanitise_arguments(switch)
+
+    def test_an_existing_posix_path_still_passes_on_windows(self) -> None:
+        import tempfile
+
+        from core import app_index
+
+        with tempfile.NamedTemporaryFile(suffix=".txt") as handle:
+            with patch.object(app_index, "_OS", "Windows"):
+                self.assertEqual(
+                    app_index.sanitise_arguments(handle.name), [handle.name]
+                )
+
+    def test_a_dash_switch_is_refused_everywhere(self) -> None:
+        from core import app_index
+
+        with self.assertRaises(ValueError):
+            app_index.sanitise_arguments("--profile-directory=Default")
+
+
+class UsageCountTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        from core import app_index
+
+        self.app_index = app_index
+        self.previous = app_index.USAGE_FILE
+        self.directory = tempfile.TemporaryDirectory()
+        app_index.USAGE_FILE = __import__("pathlib").Path(self.directory.name) / "usage.json"
+
+    def tearDown(self) -> None:
+        self.app_index.USAGE_FILE = self.previous
+        self.directory.cleanup()
+
+    def test_a_name_is_counted_once_regardless_of_case(self) -> None:
+        self.app_index.record_launch("Chrome")
+        self.app_index.record_launch("chrome")
+        counts = self.app_index.read_usage()["counts"]
+        self.assertEqual(counts, {"Chrome": 2})
+
+    def test_a_full_count_table_still_records_a_new_launch(self) -> None:
+        for index in range(self.app_index.MAX_USAGE_ENTRIES + 20):
+            self.app_index.record_launch(f"app{index}")
+        counts = self.app_index.read_usage()["counts"]
+        self.assertLessEqual(len(counts), self.app_index.MAX_USAGE_ENTRIES)
+        # The most recent launch must survive the cut, otherwise the table
+        # freezes at its first two hundred entries forever.
+        newest = f"app{self.app_index.MAX_USAGE_ENTRIES + 19}"
+        self.assertIn(newest, counts)
+
+
+class LayoutMatchingTests(unittest.TestCase):
+    """Two windows of one application must not collapse onto the same window."""
+
+    def _setup(self):
+        import tempfile
+        from pathlib import Path as _Path
+
+        from actions import layout_manager
+        from core.window_manager import MonitorInfo
+
+        directory = tempfile.TemporaryDirectory()
+        layout_manager.LAYOUT_FILE = _Path(directory.name) / "layouts.json"
+        monitors = [MonitorInfo(0, "HDMI", 0, 0, 1920, 1080, 0, 0, 1920, 1040, 60, True)]
+        windows = [
+            WindowInfo(1, "Report - Word", "winword.exe", 10, 0, 0, 800, 600),
+            WindowInfo(2, "Notes - Word", "winword.exe", 11, 100, 100, 900, 700),
+        ]
+        return layout_manager, monitors, windows, directory
+
+    def test_applying_a_layout_places_each_window_once(self) -> None:
+        layout_manager, monitors, windows, directory = self._setup()
+        touched = []
+        try:
+            with patch.multiple(
+                layout_manager,
+                list_windows=lambda: windows,
+                list_monitors=lambda: monitors,
+                monitor_of=lambda window: monitors[0],
+                place_window=lambda *a, **k: True,
+                operate=lambda window, op, *a: touched.append(window.handle),
+            ):
+                layout_manager.layout_manager({"action": "save", "name": "work"})
+                result = layout_manager.layout_manager({"action": "apply", "name": "work"})
+        finally:
+            directory.cleanup()
+        self.assertIn("2 windows", result)
+        self.assertEqual(sorted(set(touched)), [1, 2])
+
+    def test_a_claimed_window_is_not_offered_to_a_second_row(self) -> None:
+        layout_manager, _monitors, windows, directory = self._setup()
+        try:
+            with patch.multiple(layout_manager, list_windows=lambda: windows):
+                row = {"process": "winword.exe", "title": "Report - Word"}
+                self.assertIsNone(layout_manager._match_window(row, {1, 2}))
+                self.assertEqual(layout_manager._match_window(row, {1}).handle, 2)
+        finally:
+            directory.cleanup()

@@ -8,6 +8,7 @@ return a useful error when the desktop does not expose a window manager.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import platform
 import re
@@ -148,6 +149,22 @@ def backend_name() -> str:
     return _DESKTOP_BACKEND_NAME or "none"
 
 
+def _stable_handle(win, title: str, pid: int) -> int:
+    """A handle that survives re-enumeration.
+
+    Only Windows gives every window a real HWND. Using ``id()`` of the backend
+    wrapper instead would look like a handle but change on every enumeration,
+    so ``refresh_window`` would never find the window it just moved and every
+    placement would report as unverified. A digest of pid and title is stable
+    for as long as both are, which is exactly the lifetime a caller needs.
+    """
+    native = int(getattr(win, "_hWnd", 0) or 0)
+    if native:
+        return native
+    digest = hashlib.blake2b(f"{pid}:{title}".encode("utf-8", "replace"), digest_size=7)
+    return int.from_bytes(digest.digest(), "big")
+
+
 def _window_pid(win) -> int:
     """PyWinCtl exposes the owning pid; PyGetWindow does not."""
     getter = getattr(win, "getPID", None)
@@ -174,7 +191,7 @@ def _windows() -> list[WindowInfo]:
             pid = _window_pid(win)
             out.append(
                 WindowInfo(
-                    handle=int(getattr(win, "_hWnd", 0) or id(win)),
+                    handle=_stable_handle(win, title, pid),
                     title=title,
                     process=_process_name(pid) if pid else "",
                     pid=pid,
@@ -493,8 +510,8 @@ def _desktop_window_for(info: WindowInfo):
         return None
     windows = list(module.getAllWindows())
     for window in windows:
-        handle = int(getattr(window, "_hWnd", 0) or id(window))
-        if handle == info.handle:
+        title = str(getattr(window, "title", "") or "").strip()
+        if _stable_handle(window, title, _window_pid(window)) == info.handle:
             return window
     for window in windows:
         if str(getattr(window, "title", "") or "").strip() == info.title:
@@ -725,8 +742,18 @@ def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
 
 
 def refresh_window(window: WindowInfo) -> WindowInfo | None:
-    """Re-read a window by handle so callers can verify a placement."""
-    for candidate in list_windows():
+    """Re-read a window so callers can verify a placement.
+
+    The handle is tried first. A window whose title changed while it was being
+    moved would otherwise look closed, so process and title are accepted as a
+    second identity.
+    """
+    candidates = list_windows()
+    for candidate in candidates:
         if candidate.handle == window.handle:
             return candidate
+    if window.pid:
+        for candidate in candidates:
+            if candidate.pid == window.pid and candidate.title == window.title:
+                return candidate
     return None

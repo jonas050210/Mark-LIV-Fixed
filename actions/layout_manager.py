@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.json_store import JsonStore, JsonStoreCorruptError
+from core.text_match import partial_ratio
 from core.undo import push_undo
 from core.window_manager import (
     WindowInfo,
@@ -138,14 +139,46 @@ def _capture() -> list[dict]:
     return rows
 
 
-def _match_window(row: dict):
-    """Find the live window a saved row refers to, preferring the process."""
-    for candidate in (row.get("process", ""), row.get("title", "")):
-        target = str(candidate or "").strip()
-        if not target:
+def _match_window(row: dict, used: set[int] | None = None):
+    """Find the live window a saved row refers to.
+
+    A layout routinely contains two windows of the same application — two
+    editor windows, two browser windows — so matching on the process alone
+    would hand every one of those rows the same window: the first row would be
+    placed, then immediately displaced by the second, and the layout would
+    still report both as applied. Windows already claimed by an earlier row are
+    therefore excluded, and the saved title is tried before the process because
+    it is what tells two windows of one application apart.
+    """
+    claimed = used if used is not None else set()
+    windows = [item for item in list_windows() if item.handle not in claimed]
+    if not windows:
+        return None
+    title = str(row.get("title") or "").strip()
+    process = str(row.get("process") or "").strip()
+
+    if title:
+        for window in windows:
+            if window.title.strip().casefold() == title.casefold():
+                return window
+    if process:
+        by_process = [
+            window for window in windows
+            if Path(window.process).stem.casefold() == Path(process).stem.casefold()
+        ]
+        if len(by_process) == 1:
+            return by_process[0]
+        if by_process:
+            if title:
+                best = max(by_process, key=lambda window: partial_ratio(title, window.title))
+                if partial_ratio(title, best.title) >= 0.6:
+                    return best
+            return by_process[0]
+    for candidate in (title, process):
+        if not candidate:
             continue
-        window = find_window(target)
-        if window is not None:
+        window = find_window(candidate)
+        if window is not None and window.handle not in claimed:
             return window
     return None
 
@@ -153,12 +186,14 @@ def _match_window(row: dict):
 def _apply(rows: list[dict]) -> tuple[int, list[str]]:
     applied = 0
     missing = []
+    used: set[int] = set()
     monitor_count = len(list_monitors())
     for row in rows:
-        window = _match_window(row)
+        window = _match_window(row, used)
         if window is None:
             missing.append(str(row.get("process") or row.get("title") or "unknown"))
             continue
+        used.add(window.handle)
         state = str(row.get("state") or "normal")
         try:
             if state == "minimized":
