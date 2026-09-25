@@ -87,8 +87,11 @@ class AliasResolutionTests(unittest.TestCase):
     def test_unrelated_word_containing_an_alias_is_not_rewritten(self) -> None:
         self.assertEqual(open_app._alias_target("digital"), "digital")
 
-    def test_exact_alias_still_resolves(self) -> None:
-        self.assertNotEqual(open_app._alias_target("chrome"), "chrome")
+    def test_exact_alias_resolves_to_this_platform_s_name(self) -> None:
+        # On Windows the canonical name happens to be "chrome" itself, so
+        # asserting that the text changed only holds on the other platforms.
+        expected = open_app._APP_ALIASES["chrome"][open_app._SYSTEM]
+        self.assertEqual(open_app._alias_target("chrome"), expected)
 
     def test_multiword_request_prefers_the_full_alias(self) -> None:
         self.assertEqual(

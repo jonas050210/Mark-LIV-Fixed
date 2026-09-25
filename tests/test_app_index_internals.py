@@ -28,32 +28,40 @@ class DesktopEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
+        # A real file, addressed absolutely: resolving through PATH would find
+        # a different binary on every platform (on Windows "sh" resolves to
+        # Git's sh.EXE), which says nothing about the parser.
+        self.binary = self.root / "editor-bin"
+        self.binary.write_text("#!/bin/sh\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def test_a_normal_entry_resolves_to_a_binary_on_path(self) -> None:
+    def test_a_normal_entry_resolves_to_its_binary(self) -> None:
         path = _entry(self.root / "editor.desktop",
-                      "[Desktop Entry]\nType=Application\nName=Editor\nExec=sh %U\n")
+                      f"[Desktop Entry]\nType=Application\nName=Editor\n"
+                      f"Exec={self.binary} %U\n")
         entry = app_index._parse_desktop_entry(path)
         self.assertIsNotNone(entry)
         self.assertEqual(entry.name, "Editor")
         self.assertEqual(entry.kind, "exec")
-        self.assertTrue(entry.target.endswith("sh"))
+        self.assertEqual(Path(entry.target), self.binary)
 
     def test_field_codes_are_not_treated_as_arguments(self) -> None:
         path = _entry(self.root / "a.desktop",
-                      "[Desktop Entry]\nType=Application\nName=A\nExec=sh %f %U %i\n")
-        self.assertTrue(app_index._parse_desktop_entry(path).target.endswith("sh"))
+                      f"[Desktop Entry]\nType=Application\nName=A\n"
+                      f"Exec={self.binary} %f %U %i\n")
+        self.assertEqual(Path(app_index._parse_desktop_entry(path).target), self.binary)
 
     def test_a_hidden_entry_is_skipped(self) -> None:
         path = _entry(self.root / "h.desktop",
-                      "[Desktop Entry]\nType=Application\nName=H\nExec=sh\nNoDisplay=true\n")
+                      f"[Desktop Entry]\nType=Application\nName=H\n"
+                      f"Exec={self.binary}\nNoDisplay=true\n")
         self.assertIsNone(app_index._parse_desktop_entry(path))
 
     def test_a_non_application_entry_is_skipped(self) -> None:
         path = _entry(self.root / "l.desktop",
-                      "[Desktop Entry]\nType=Link\nName=L\nExec=sh\n")
+                      f"[Desktop Entry]\nType=Link\nName=L\nExec={self.binary}\n")
         self.assertIsNone(app_index._parse_desktop_entry(path))
 
     def test_an_entry_whose_binary_does_not_exist_is_skipped(self) -> None:
@@ -63,8 +71,8 @@ class DesktopEntryTests(unittest.TestCase):
 
     def test_keys_outside_the_desktop_entry_group_are_ignored(self) -> None:
         path = _entry(self.root / "s.desktop",
-                      "[Desktop Action New]\nName=Wrong\nExec=sh\n"
-                      "[Desktop Entry]\nType=Application\nName=Right\nExec=sh\n")
+                      f"[Desktop Action New]\nName=Wrong\nExec={self.binary}\n"
+                      f"[Desktop Entry]\nType=Application\nName=Right\nExec={self.binary}\n")
         self.assertEqual(app_index._parse_desktop_entry(path).name, "Right")
 
     def test_an_absurdly_large_file_is_refused(self) -> None:
@@ -77,8 +85,10 @@ class DesktopEntryTests(unittest.TestCase):
     def test_the_linux_scan_reads_the_xdg_directories(self) -> None:
         apps = self.root / "applications"
         apps.mkdir()
-        _entry(apps / "one.desktop", "[Desktop Entry]\nType=Application\nName=One\nExec=sh\n")
-        _entry(apps / "two.desktop", "[Desktop Entry]\nType=Application\nName=Two\nExec=sh\n")
+        _entry(apps / "one.desktop",
+               f"[Desktop Entry]\nType=Application\nName=One\nExec={self.binary}\n")
+        _entry(apps / "two.desktop",
+               f"[Desktop Entry]\nType=Application\nName=Two\nExec={self.binary}\n")
         with patch.dict(os.environ, {"XDG_DATA_DIRS": str(self.root)}):
             found = app_index._scan_linux()
         self.assertEqual(sorted(item.name for item in found), ["One", "Two"])
