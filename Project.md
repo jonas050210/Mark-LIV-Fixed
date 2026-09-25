@@ -296,6 +296,23 @@ nothing more.
   prints no job number, the reminder is still set, and the answer says plainly
   that it will not be cancellable.
 
+### Two browsers, one page
+
+MARK LIV can put a web page on screen in two ways and they used to be unaware
+of each other. Navigation (`browser_control` `go_to`/`search`/`new_tab`, and
+`open_app` with a URL argument) opens the user's real browser — their profile,
+their logins. The interactive actions (`click`, `type`, `get_text`,
+`smart_click`) need a browser Playwright can drive, which is a separate window.
+
+`core/browser_handoff.py` is the single line of shared state between them: the
+last page opened natively, recorded by both surfaces and consumed once by the
+automation window. "Open the BBC" followed by "click the top story" therefore
+lands on the BBC rather than on `about:blank`.
+
+When there is nothing to resume and the automation window has only just been
+created, the action stops and says there is no page open yet, instead of
+searching a blank page and blaming the element for not existing.
+
 ### Panels outside ui.py
 
 `ui.py` is 5500 lines. New HUD panels therefore live in `ui_panels/`, and

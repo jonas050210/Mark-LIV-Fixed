@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus, urlsplit
 
+from core import browser_handoff
 from core.path_policy import move_no_replace, resolve_user_path
 
 # Playwright is optional: native URL navigation remains useful without it.
@@ -1031,7 +1032,6 @@ class _SessionRegistry:
         self._sessions:        dict[str, _BrowserSession] = {}
         self._active_browser:  str                        = ""
         self._lock             = threading.Lock()
-        self._last_native_url: str                        = ""
 
     def has(self, browser_name: str | None = None) -> bool:
         """Is there an active automation session for this browser (or any)?"""
@@ -1042,29 +1042,41 @@ class _SessionRegistry:
             return name in self._sessions
 
     def note_native_url(self, url: str) -> None:
-        self._last_native_url = url
+        """Remember the page the user's own browser was just sent to.
+
+        The record lives in core.browser_handoff rather than here, because
+        open_app opens pages too — a browser launched with a URL argument is
+        the same event as a go_to, and the automation window has to resume from
+        whichever happened last.
+        """
+        browser_handoff.note(url)
 
     def pop_native_url(self) -> str:
-        """Returns the last natively-opened URL once (consumed to avoid repeats)."""
-        url, self._last_native_url = self._last_native_url, ""
-        return url
+        """The last natively-opened URL, once (consumed to avoid repeats)."""
+        return browser_handoff.pop()
 
-    def _get_or_create(self, browser_name: str) -> _BrowserSession:
+    def _get_or_create(self, browser_name: str) -> tuple[_BrowserSession, bool]:
+        """The session for a browser, plus whether this call created it."""
         with self._lock:
             if browser_name not in self._sessions:
                 sess = _BrowserSession(browser_name)
                 sess.start()
                 self._sessions[browser_name] = sess
                 print(f"[Registry] New session: {browser_name}")
-            return self._sessions[browser_name]
+                return sess, True
+            return self._sessions[browser_name], False
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
+        sess, _created = self.get_with_state(browser_name)
+        return sess
+
+    def get_with_state(self, browser_name: str | None = None) -> tuple[_BrowserSession, bool]:
         if not browser_name:
             browser_name = self._active_browser or _detect_default_browser()
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-        sess = self._get_or_create(browser_name)
+        sess, created = self._get_or_create(browser_name)
         self._active_browser = browser_name
-        return sess
+        return sess, created
 
     def switch(self, browser_name: str) -> str:
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
@@ -1219,7 +1231,7 @@ def browser_control(
         return result
 
     try:
-        sess = _registry.get(browser)
+        sess, created = _registry.get_with_state(browser)
     except Exception as e:
         result = f"Could not start browser session: {type(e).__name__}"
         _log(player, result)
@@ -1232,6 +1244,18 @@ def browser_control(
                 sess.run(sess.go_to(last))
             except Exception as e:
                 print(f"[Browser] Could not resume the last page ({type(e).__name__}).")
+        elif created:
+            # A window that has just been created and has no page to resume is
+            # sitting on about:blank. Clicking or reading there finds nothing,
+            # and reporting "element not found" would blame the page instead of
+            # explaining that there is no page.
+            _registry.close_one(_registry._active_browser)
+            result = (
+                "There is no page open to work with yet. Ask me to open the "
+                "site first, then I can click, type, or read on it."
+            )
+            _log(player, result)
+            return result
 
         if action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
@@ -1300,7 +1324,7 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser: open a site, search the web, click, fill in forms, scroll, read a page, take a screenshot. Navigation (go_to, search, new_tab) opens the user's own browser with their profile and logged-in accounts. Interactive actions (click, type, fill_form, get_text, smart_click) need a browser that can be driven, so they use a separate automation window; that window continues on the page that was last opened, including a page opened through open_app. To work on a site, navigate to it first and then act on it in the same conversation. Use open_app only to start the browser application itself with no particular page. Always pass the 'browser' parameter when the user names one ('open in Edge'). Multiple browsers can run simultaneously.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

@@ -162,6 +162,24 @@ def _resolve_candidates(*queries: str) -> tuple[list, bool]:
     return [], True
 
 
+def _note_opened_pages(arguments) -> None:
+    """Tell the browser handoff about a web page opened through an argument.
+
+    Opening Chrome with a URL puts a page on screen exactly as a browser_control
+    'go_to' would. Recording it here is what lets a following "click the login
+    button" resume on that page instead of starting the automation window on a
+    blank one.
+    """
+    for argument in arguments or []:
+        try:
+            from core import browser_handoff
+
+            if browser_handoff.is_web_url(argument):
+                browser_handoff.note(str(argument))
+        except Exception:
+            return
+
+
 def _launch_resolved(entry, arguments=None) -> tuple[bool, int | None, str]:
     """Start one indexed application.  Never simulates keyboard input."""
     try:
@@ -472,6 +490,7 @@ def open_app(
             return _second_roblox_instance(app_name, normalized, existing, existing_keys)
 
         record_launch(entry.name)
+        _note_opened_pages(arguments)
         window = _await_launched_window(app_name, normalized, pid, existing_keys)
         if window is None:
             return (
@@ -610,8 +629,11 @@ TOOL = {
         "or leave an app in the background. Use monitor and state to place the window, for "
         "example monitor 2 with state fullscreen. Set new_instance true only when the user "
         "explicitly asks for another instance. Pass arguments to open a URL or document with "
-        "the application, for example Chrome with https://youtube.com. For Roblox new_instance attempts a second window, moves "
-        "it to the opposite monitor when possible, and verifies the result."
+        "the application, for example Chrome with https://youtube.com. For a web page the "
+        "user wants to look at or work on, prefer browser_control: it opens the same real "
+        "browser and can then click, type and read on the page. For Roblox new_instance "
+        "attempts a second window, moves it to the opposite monitor when possible, and "
+        "verifies the result."
     ),
     "parameters": {
         "type": "OBJECT",
