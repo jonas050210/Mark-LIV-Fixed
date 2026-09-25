@@ -77,7 +77,7 @@ The important requirements were:
 
 The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, and local Session Vault are complete on the working branch.
 
-The implementation is proposed for `main` in pull request #2. The latest local default suite passes 94 tests with five expected optional/platform skips, discovers 13 active actions, and reports 9 passed, 0 failed, and 2 skipped overall. Pull-request CI validates the same repository on Ubuntu and Windows with Python 3.11 and 3.13.
+The implementation is proposed for `main` in pull request #2. The latest local default suite passes 95 tests with five expected optional/platform skips, discovers 13 active actions, and reports 9 passed, 0 failed, and 2 skipped overall. Pull-request CI validates the same repository on Ubuntu and Windows with Python 3.11 and 3.13.
 
 The current sandbox is Linux, so destructive Windows hardware integration, real Roblox behavior, physical multi-monitor placement, and actual audio-device behavior still require manual validation on suitable hardware. These are environmental validation limits, not unfinished repository code.
 
@@ -792,7 +792,7 @@ Tests trusted plugin sources, schema validation, sanitized dependency reporting,
 Tests that generated-code execution is disabled, including source that appears read-only.
 
 #### `tests/test_session_store.py`
-Tests session save/update/list/resume/delete behavior, transcript and context bounds, selector ambiguity, capacity refusal, explicit deletion confirmation metadata, and empty-session rejection.
+Tests session save/update/list/resume/delete behavior, transcript and context bounds, malformed-primary recovery, selector ambiguity, capacity refusal, explicit deletion confirmation metadata, and empty-session rejection.
 
 #### `tests/test_wake_word.py`
 Tests that wake-word readiness checks do not execute broken native packages in the main process.
@@ -869,7 +869,7 @@ Workflow actions are pinned to immutable commit SHAs and the job token has read-
 The latest local default verification completed with:
 
 ```text
-94 unit tests run successfully
+95 unit tests run successfully
 5 optional/platform tests skipped
 9 overall checks passed
 0 overall checks failed
@@ -878,7 +878,7 @@ The latest local default verification completed with:
 
 The two local overall skips are dashboard route construction, because the lightweight sandbox does not install FastAPI/uvicorn by default, and opt-in Windows hardware integration, because the sandbox is Linux. The dependency-aware CI jobs do construct and test the dashboard.
 
-Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 94 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
+Pull-request CI covers all four Ubuntu/Windows and Python 3.11/3.13 combinations. Each job completes setup validation, Python compilation, all 95 discovered tests with only applicable guarded skips, dashboard-aware checks, and overall verification.
 
 The environment still does not provide a physical Windows desktop, Roblox, two real monitors, actual Windows Known Folder redirection, real audio devices, or the optional wake-word package. Those are environmental limits, not claims that physical behavior has been validated.
 

@@ -56,6 +56,21 @@ class SessionStoreTests(unittest.TestCase):
                 session_store.save_session(["User: two"], title="Two")
             self.assertEqual([item["title"] for item in session_store.list_sessions()], ["One"])
 
+    def test_malformed_primary_recovers_from_valid_backup(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory, patch.object(
+            session_store, "SESSION_PATH", self._path(directory)
+        ):
+            session_store.save_session(["User: alpha"], title="Alpha")
+            session_store.save_session(["User: beta"], title="Beta")
+            self._path(directory).write_text(
+                '{"version": 1, "sessions": [{"id": "malformed"}]}',
+                encoding="utf-8",
+            )
+            recovered = session_store.list_sessions()
+            self.assertEqual([item["title"] for item in recovered], ["Alpha"])
+            quarantined = list(Path(directory).glob(".sessions.json.corrupt-*"))
+            self.assertEqual(len(quarantined), 1)
+
     def test_ambiguous_selector_requires_an_id(self) -> None:
         with TemporaryDirectory(dir=Path.home()) as directory, patch.object(
             session_store, "SESSION_PATH", self._path(directory)
