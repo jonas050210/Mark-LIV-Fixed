@@ -2,7 +2,7 @@
 
 **Repository:** `jonas050210/Mark-LIV-fixed`
 
-**Working branch:** `arena/01a0d6a6-mark-liv-fixed`
+**Working branch:** `arena/01a0d987-mark-liv-fixed`
 
 **Purpose of this document:** This is the complete project record for the current implementation. It explains the project’s purpose, architecture, files, decisions, safety rules, implemented features, tests, limitations, and the work completed during this development session. It is intentionally more detailed than `README.md`.
 
@@ -75,9 +75,9 @@ The important requirements were:
 
 ## 3. Current implementation status
 
-The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, and local Session Vault are complete on the working branch.
+The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, local Session Vault, reliable Windows application launching, and native window-control work are complete on the working branch.
 
-The implementation is proposed for `main` in pull request #2. The latest local default suite passes 95 tests with five expected optional/platform skips, discovers 13 active actions, and reports 9 passed, 0 failed, and 2 skipped overall. Pull-request CI validates the same repository on Ubuntu and Windows with Python 3.11 and 3.13.
+As of 2026-09-25, `python test_overall.py` discovers 16 active actions and runs 479 unit tests successfully, with 69 expected optional/platform skips. The overall verification reports 9 passed, 0 failed, and 3 skipped checks in the Linux sandbox. The physical Windows integration suite remains opt-in because it requires an interactive Windows desktop, installed PWAs, Roblox, and real hardware.
 
 The current sandbox is Linux, so destructive Windows hardware integration, real Roblox behavior, physical multi-monitor placement, and actual audio-device behavior still require manual validation on suitable hardware. These are environmental validation limits, not unfinished repository code.
 
@@ -417,14 +417,15 @@ searching a blank page and blaming the element for not existing.
 ### Panels outside ui.py
 
 `ui.py` was 5600 lines, and every panel added to it made the next one harder to
-place. All floating panels now live in `ui_panels/`; `ui.py` is down to 4170
-lines and only learns how to open them.
+place. Reusable floating panels live in `ui_panels/`; `ui.py` imports only the
+remaining settings/confirmation overlays. The Launcher and Layouts settings
+panels, their open methods, and their widget tests were removed rather than left
+as unreachable duplicate surfaces. Application launching and named layouts
+remain available through actions and the authenticated dashboard where relevant.
 
 | Module | Panel |
 | --- | --- |
 | `ui_panels/base.py` | `HudPanel` base (ghost-frame repaint), palette proxy, shared widget styling |
-| `ui_panels/launcher.py` | search the application index, pin, rescan, launch |
-| `ui_panels/layouts.py` | save, restore and delete window layouts |
 | `ui_panels/setup.py` | first-run API key entry |
 | `ui_panels/customize.py` | accent colour wheel, avatar and identity |
 | `ui_panels/plugins.py` | plugin manager and plugin settings |
@@ -438,14 +439,6 @@ time rather than importing it, because `ui` imports this package; that also
 means a live theme change is picked up the next time a panel is built. A widget
 test constructs all of them, because a panel that fails to build is otherwise
 noticed only when a user clicks the button that opens it.
-
-The palette is read from `ui.C` at call time rather than imported, because
-`ui` imports these modules; the indirection also means a live theme change is
-picked up the next time a panel opens. Both panels call the same actions the
-voice path uses (`actions.open_app`, `actions.layout_manager`), so a click and a
-spoken command share one implementation, one store, and one undo entry — and
-both panels print the action's own sentence rather than deciding for themselves
-that the operation worked.
 
 ### Placement
 
@@ -781,7 +774,7 @@ Canonical concise project guide. It covers installation, setup check mode, overa
 Extended product and visual-design notes inherited from the broader MARK LIV product documentation. It now points readers to `README.md` for current supported behavior.
 
 #### `requirements.txt`
-Python dependency specification, grouped by core, optional, OS-specific, dashboard, document, browser, and plugin capabilities.
+Python dependency specification, grouped by core, optional, OS-specific, dashboard, document, browser, and plugin capabilities. Its `pylnk3` documentation now reflects the split between argument-free executable resolution and parameter-preserving PWA shortcuts.
 
 #### `setup.py`
 OS-aware installer and asset checker. Supports normal installation and safe `--check` mode.
@@ -804,7 +797,7 @@ Primary MARK LIV application entry point. It coordinates:
 - memory and proactive behavior.
 
 #### `ui.py`
-Main local desktop GUI. It renders the avatar, HUD, settings, confirmations, logs, status, input controls, audio controls, wake-word controls, and local control surface.
+Main local desktop GUI. It renders the avatar, HUD, settings, confirmations, logs, status, input controls, audio controls, wake-word controls, and local control surface. The settings drawer exposes a live 30/60/120/240/unlimited HUD render cap. Animation, audio decay, smoothing, blinking, and fallback-core interpolation are wall-clock based so changing FPS does not alter motion speed. Clipboard-change detection and its popup were removed; explicit clipboard commands remain separate actions.
 
 #### `check_wake_word.py`
 Safe standalone diagnostic for optional wake-word readiness. It avoids importing or executing unsafe native functionality in the main GUI process.
@@ -828,8 +821,11 @@ It checks:
 
 ### 11.2 `actions/`
 
-#### `actions/README.md`
-Documents the bundled action surface and explicitly lists capabilities that are intentionally not bundled.
+#### `actions/app_catalog.py`
+Lists the bounded installed-application index and performs an explicit full rescan after an app, game, or browser web app is installed or updated.
+
+#### `actions/app_lifecycle.py`
+Reports whether an application is installed/running, diagnoses indexed launch type plus visible windows/processes, and performs a graceful handle-addressed restart. It refuses to force-kill an app that does not close within ten seconds.
 
 #### `actions/audio_manager.py`
 Audio device listing, selection, reconnect, and health/diagnostic actions.
@@ -844,19 +840,22 @@ Browser opening and browser interaction. It supports native browser launching an
 Mouse, keyboard, clipboard, screenshots, and computer-level interaction helpers.
 
 #### `actions/computer_settings.py`
-System-level settings and controls, including volume, brightness, Wi-Fi, power operations, task manager, file explorer, settings, window-related operations, and confirmation-sensitive actions.
+System-level settings and controls, including volume, brightness, Wi-Fi, power operations, task manager, file explorer, and settings. Legacy close/minimize/maximize/snap requests now delegate to native handle-based `window_manager` operations instead of sending focus-dependent hotkeys. Task Manager, Explorer, and Windows Settings also use native launch paths.
 
 #### `actions/file_controller.py`
-File and folder operations plus the integrated reliable Explorer search/open/select interface. It handles safe paths, confirmation-sensitive deletion, undo registration, exact file selection, and candidate-number selection.
+File and folder operations plus the integrated reliable Explorer search/open/select interface. It handles safe paths, confirmation-sensitive deletion, undo registration, exact file selection, candidate-number selection, and `open_with` for passing one verified file to a named indexed application as a real argument.
 
 #### `actions/file_processor.py`
 Processing of uploaded and local files such as images, PDFs, documents, spreadsheets, JSON, archives, audio, video, and code. Optional dependencies are loaded lazily.
+
+#### `actions/layout_manager.py`
+Voice/action-registry support for saving, applying, listing, and deleting named window arrangements. The former settings overlay was removed; the action remains available without maintaining a duplicate panel.
 
 #### `actions/media_control.py`
 Spotify Web API and Spotify Connect controls, including authentication, search, playback, pause, skip, volume, track status, and device status. It avoids falsely claiming playback when no device is available.
 
 #### `actions/open_app.py`
-Cross-platform application launcher with shortcut resolution, existing-window focusing, Roblox-specific second-instance behavior, monitor placement, and verification.
+Cross-platform application launcher with shortcut resolution, existing-window focusing, Roblox-specific discovery/second-instance behavior, monitor placement, and verification. It preserves parameterized Chromium PWA shortcuts, distinguishes installed web apps from ordinary browser-tab title matches, snapshots windows before launch, waits adaptively, and performs one bounded index rebuild/retry when a cached executable or shortcut became stale.
 
 #### `actions/proactive.py`
 Proactive assistant behavior and contextual check-ins.
@@ -880,7 +879,7 @@ CPU, memory, GPU, temperature, and system-health readings with optional dependen
 Web search with provider fallback, quota handling, and structured result behavior.
 
 #### `actions/window_manager.py`
-Action-registry wrapper around `core.window_manager.py` for listing, focusing, minimizing, maximizing, moving, snapping, closing, and monitor operations.
+Action-registry wrapper around `core.window_manager.py` for listing, focusing, minimizing, maximizing, moving, snapping, closing, and monitor operations. It can enumerate every matching window and safely minimize or close all windows of one explicitly named application.
 
 ### 11.3 `core/`
 
@@ -897,6 +896,9 @@ Defines the structured action-result contract. It converts legacy strings to sta
 
 #### `core/action_runtime.py`
 Tracks live action IDs, progress, status, cancellation events, bounded history, and event listeners.
+
+#### `core/app_index.py`
+Builds and validates the cross-platform application index. Index version 2 scans Windows App Paths, Start-menu shortcuts, Store AUMIDs, Roblox protocol/version directories, macOS bundles, and Linux desktop entries. Parameterized Chrome/Edge shortcuts remain `.lnk` entries so `--app-id` and profile arguments are not discarded; generic web apps such as Arena, Twitch, and YouTube therefore open in standalone app mode.
 
 #### `core/audio_devices.py`
 Named audio input/output discovery, selection, reconnect logic, and diagnostics.
@@ -968,7 +970,7 @@ Speech/text-to-mouth-shape mapping used by the avatar lip-sync system.
 Optional wake-word lifecycle, worker isolation, readiness state, and model handling.
 
 #### `core/window_manager.py`
-Native and fallback desktop window/monitor enumeration and manipulation.
+Native and fallback desktop window/monitor enumeration and manipulation. It exposes stable handles, process-aware matching, foreground lookup, all-window matching for a named app, placement verification, monitor geometry, and child-process window discovery.
 
 ### 11.4 `dashboard/`
 
@@ -1016,7 +1018,7 @@ Runtime secret/config files such as `api_keys.json`, Spotify tokens, OAuth crede
 Marks the memory directory as a package.
 
 #### `memory/config_manager.py`
-Validated transactional configuration storage with bounded display names, atomic patches, private files, and sanitized diagnostics.
+Validated transactional configuration storage with bounded display names, atomic patches, private files, sanitized diagnostics, and validated HUD FPS persistence for 30, 60, 120, 240, or unlimited rendering.
 
 #### `memory/memory_manager.py`
 Validated transactional long-term memory with bounded values, prompt-core and index budgets, session-summary save/peek/acknowledge behavior, and safe corruption recovery.
@@ -1033,6 +1035,12 @@ Marks the plugin directory as a package.
 Template and example structure for creating a new plugin.
 
 ### 11.8 `tests/`
+
+#### `tests/test_app_catalog.py`
+Tests bounded app listing, explicit index refresh, immediate window-close policy, and native handle routing from legacy system-control requests.
+
+#### `tests/test_reliable_core_actions.py`
+Tests application status/restart safety, named multi-window operations, `open_with`, every supported HUD FPS value, invalid FPS rejection, and permanent removal of clipboard-change detection.
 
 #### `tests/test_action_policy.py`
 Tests trusted action loading, strict schemas, confirmation expiry and race handling, bounded web-search workers, reminder storage, process cancellation, process-group escalation, and bounded output tails.
@@ -1078,7 +1086,7 @@ Opt-in Windows hardware tests for audio diagnostics, DPI-aware monitor geometry,
 ## 12. Verification and test commands
 
 ```bash
-python test_overall.py              # ten gates, including the unit suite
+python test_overall.py              # project gates, including the unit suite
 python test_overall.py --coverage   # also measure coverage and enforce the floors
 python test_overall.py --windows    # add the Windows hardware checks (Windows only)
 python -m unittest discover -s tests
@@ -1106,24 +1114,15 @@ schedules, lists and cancels a real reminder.
 
 ## 13. Latest verification result
 
-Local default run:
+Latest sandbox default run on 2026-09-25:
 
 ```text
-338 unit tests run, 38 guarded skips
+479 unit tests run, 69 guarded skips
+16 active actions and 16 action records validated
 9 overall checks passed, 0 failed, 3 skipped
 ```
 
-With the optional tooling installed (`coverage`, `PyQt6`, `rapidfuzz`, FastAPI):
-
-```text
-338 unit tests run, 5 guarded skips
-10 overall checks passed, 0 failed, 2 skipped
-15 safety-critical modules at or above their coverage floor
-```
-
-The skips in the default run are the panel tests, which need a Qt platform
-plugin, the dashboard route contract, which needs FastAPI, the coverage gate,
-which needs `coverage`, and the Windows hardware suite.
+The three overall skips are explicit environment limits: FastAPI/uvicorn are not installed for the dashboard route-construction check, `coverage` is not installed for per-module floor measurement, and the physical Windows integration suite cannot run in the Linux sandbox. PyQt panel tests that can construct under the available offscreen platform run normally; deleted Launcher/Layouts panels no longer contribute skips or dead coverage.
 
 ### Continuous integration
 
@@ -1307,18 +1306,21 @@ The major implementation history is:
 - `dabcdfb` — concise CI unit-test annotations and summaries.
 - `0036df4` — Windows persistence portability, descriptor cleanup, overall diagnostics, and final cross-platform fixes.
 - `9fab83e` — complete engineering record synchronized with the hardened implementation.
+- `ce80d5c` — Windows PWA shortcut preservation, Roblox discovery, app catalog, and immediate app-close policy.
+- `2cbf6e1` — reliable launch retries, generic web-app routing, native window controls, and obsolete panel removal.
+- `67a9f48` — app lifecycle diagnostics/restart, multi-window controls, safe `open_with`, HUD FPS control, and clipboard detector removal.
 
 All current work is kept on the fixed branch:
 
 ```text
-arena/01a0d6a6-mark-liv-fixed
+arena/01a0d987-mark-liv-fixed
 ```
 
 ---
 
 ## 17. Remaining work
 
-No known repository implementation blocker remains for pull request #2. Automated Linux/Windows CI, dashboard-aware verification, adversarial persistence/filesystem tests, and the repository-wide hardening pass are complete.
+No known repository implementation blocker remains on the current Arena branch. Automated verification, dashboard-aware checks, adversarial persistence/filesystem tests, reliable-launch regressions, and the repository-wide hardening pass are complete. Physical Windows validation remains explicitly separate below.
 
 ### Optional physical validation
 
@@ -1352,7 +1354,83 @@ These checks may reveal hardware, driver, account, or application-specific behav
 
 ---
 
-## 18. Final project principle
+## 18. 2026-09-25 reliable application and UI pass
+
+This pass followed the rule that a smaller native action is better than a broad hotkey that acts on whichever window happens to have focus. It deliberately did not add user profiles, gaming modes, or duplicate panels.
+
+### 18.1 User-visible behavior completed
+
+- Removed Launcher and Layouts from the local settings drawer, then deleted both obsolete panel modules and their panel-only tests.
+- Preserved `open_app`, named layout actions, and the authenticated dashboard surfaces that still have a real use.
+- Added generic installed Chromium web-app handling. Arena, Twitch, YouTube, and future Chrome/Edge PWAs are detected from shortcut switches rather than a hard-coded site list.
+- Preserved `--app-id`, `--app`, and browser-profile arguments by launching the original parameterized `.lnk` instead of flattening it to `chrome.exe` or `msedge.exe`.
+- Added Roblox discovery through Start-menu entries, the registered `roblox-player` protocol, and the newest valid `%LOCALAPPDATA%\Roblox\Versions\*\RobloxPlayerBeta.exe`.
+- Added one bounded automatic app-index rebuild/retry when a cached executable or shortcut disappears after an update.
+- Added adaptive launch verification using process ownership, matching windows, and a before/after visible-window snapshot.
+- Removed MARK LIV's extra confirmation before closing windows while retaining confirmation for deletion, Wi-Fi changes, restart, and shutdown.
+- Replaced legacy Alt+F4, F11, Win+Arrow, Win+I, Win+E, Task Manager, and Alt+Tab control paths where a native handle, URI, or executable is available. Unnamed Alt+Tab switching is refused rather than guessed.
+- Added `app_catalog` (`list`, `refresh`) and `app_lifecycle` (`status`, `diagnose`, `restart`). Graceful restart waits for closure and never force-kills an app that may contain unsaved work.
+- Extended `window_manager` with `list_app_windows`, `minimize_all`, and `close_all`, all requiring an explicit target application.
+- Added `file_controller.open_with`, which resolves exactly one safe file and passes it to a named indexed application as a real argv item.
+- Added a live HUD frame-rate selector for 30, 60, 120, 240, or unlimited FPS. It changes MARK LIV's HUD only, not game FPS.
+- Made HUD phase, blink cadence, audio decay, smoothing, and fallback interpolation wall-clock based so changing FPS does not speed up or slow down animation.
+- Removed clipboard-change detection, the automatic clipboard popup, signal wiring, resize logic, and implicit clipboard-text handoff. Explicit user-requested copy/paste actions remain.
+
+### 18.2 File-by-file synchronization
+
+| File | Current role/change |
+| --- | --- |
+| `Project.md` | Synchronized engineering record, current branch, features, test totals, limitations, and bug-hunt evidence. |
+| `README.md` | Concise user documentation for PWAs, Roblox, immediate close policy, app lifecycle, HUD FPS, and removed clipboard detection. |
+| `requirements.txt` | Correctly documents parameter-preserving `pylnk3` shortcut behavior. |
+| `ui.py` | Removes Launcher/Layouts/clipboard panels; adds validated live HUD FPS control and frame-rate-independent animation timing. |
+| `ui_panels/launcher.py` | Deleted; no unreachable launcher settings panel remains. |
+| `ui_panels/layouts.py` | Deleted; no unreachable layouts settings panel remains. |
+| `actions/app_catalog.py` | New bounded installed-app list/rescan action. |
+| `actions/app_lifecycle.py` | New status/diagnose/graceful-restart action with no hotkeys or forced termination. |
+| `actions/open_app.py` | Generic PWA routing, Roblox alias/discovery integration, stale-index repair, adaptive verification, and launch diagnostics. |
+| `actions/window_manager.py` | Immediate but verified native close behavior plus strict named multi-window operations. |
+| `actions/computer_settings.py` | Routes window work through `window_manager`; launches system panels natively; removes unsafe duplicate hotkeys. |
+| `actions/file_controller.py` | Adds safe `open_with` and rechecks the final resolved/search result against path policy. |
+| `core/app_index.py` | Cache version 2, PWA shortcut metadata, Roblox sources, source signatures, ranking, and dead-target handling. |
+| `core/window_manager.py` | Adds thresholded all-window matching so destructive batch calls can reject weak fuzzy matches. |
+| `memory/config_manager.py` | Validates and transactionally stores only 30/60/120/240/0 HUD FPS values. |
+| `tests/test_app_catalog.py` | Covers app catalog, immediate-close metadata, and native legacy-action routing. |
+| `tests/test_app_index_internals.py` | Covers Arena/Twitch/YouTube PWAs, ordinary shortcuts, Roblox discovery, and cache-version rebuilds. |
+| `tests/test_app_launcher.py` | Covers stale-target repair, bounded retry, and browser-tab/PWA ambiguity. |
+| `tests/test_launcher_extras.py` | Uses the current app-index cache version in staleness tests. |
+| `tests/test_ui_panels.py` | Removes deleted panel suites while retaining construction/paint coverage for every remaining panel. |
+| `tests/test_reliable_core_actions.py` | Covers lifecycle safety, PWA restart refusal, strict multi-window control, verified close results, safe `open_with`, HUD FPS, and clipboard detector removal. |
+
+### 18.3 Deep bug hunt findings and fixes
+
+The post-implementation hunt used full AST compilation, action-registry loading, the complete unit suite, subprocess-shell scanning, dashboard JavaScript checks, secret hygiene, duplicate literal-dictionary-key detection, targeted adversarial tests, and `git diff --check`.
+
+It found and fixed the following concrete issues:
+
+1. **Weak fuzzy matches were unsafe for batch close.** `find_windows` now accepts a score threshold; destructive and batch actions require a strong exact/substring match instead of accepting a merely similar title.
+2. **Close previously reported success after only posting `WM_CLOSE`.** Single and batch close now wait a bounded period and report windows that remain open, including the likely native save-prompt case.
+3. **A web-app restart could close an ordinary browser tab/window with the same title.** `app_lifecycle.restart` now refuses when Windows exposes an installed PWA only as an ambiguous browser process.
+4. **A searched `open_with` result was not rechecked after the safe root was checked.** The final selected path is now checked again before launch, closing a link/reparse race and policy-bypass gap.
+5. **Changing HUD FPS changed frame-count-based animation timing.** Tick phase, blink, decay, smoothing, and interpolation now derive from elapsed wall-clock time.
+6. **Old cache data could retain pre-PWA shortcut semantics.** App-index cache version 2 forces one clean rebuild after upgrade.
+7. **Shortcut parser compatibility was too narrow.** Both public and internal `pylnk3` argument attributes are recognized while still failing safely to shell shortcut launch.
+
+The Linux sandbox cannot prove native Windows PWA identity, shell behavior, Roblox startup, or physical monitor placement. Those remain manual Windows validation items, not silently claimed successes.
+
+### 18.4 Verification result
+
+The final safe verification command is:
+
+```bash
+python test_overall.py
+```
+
+The latest run compiles all Python, validates 16 action records, finds no `shell=True` subprocess usage, validates dashboard assets and secrets, and passes the complete unit suite. The Windows hardware integration suite remains opt-in with `python test_overall.py --windows`.
+
+---
+
+## 19. Final project principle
 
 MARK LIV should prefer:
 

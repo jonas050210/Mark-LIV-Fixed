@@ -163,6 +163,45 @@ class LaunchHonestyTests(unittest.TestCase):
         launch.assert_not_called()
 
 
+class SelfHealingLaunchTests(unittest.TestCase):
+    def test_stale_executable_is_rescanned_and_retried_once(self) -> None:
+        stale = _entry("Editor", "/old/editor.exe")
+        repaired = _entry("Editor", "/new/editor.exe")
+        with patch.object(open_app, "_launch_resolved", side_effect=[
+                 (False, None, "Editor is no longer installed at its indexed location"),
+                 (True, 77, ""),
+             ]) as launch, \
+             patch.object(open_app, "load_index", return_value=[repaired]) as load:
+            started, pid, failure, entry, refreshed = open_app._launch_with_repair(
+                stale, [], "Editor"
+            )
+        self.assertTrue(started)
+        self.assertEqual(pid, 77)
+        self.assertEqual(failure, "")
+        self.assertEqual(entry, repaired)
+        self.assertTrue(refreshed)
+        load.assert_called_once_with(refresh=True)
+        self.assertEqual(launch.call_count, 2)
+
+    def test_permission_failure_is_not_retried(self) -> None:
+        entry = _entry("Editor")
+        with patch.object(open_app, "_launch_resolved", return_value=(False, None, "AccessDenied")), \
+             patch.object(open_app, "load_index") as load:
+            result = open_app._launch_with_repair(entry, [], "Editor")
+        self.assertFalse(result[0])
+        self.assertFalse(result[4])
+        load.assert_not_called()
+
+    def test_browser_tab_does_not_suppress_installed_web_app_launch(self) -> None:
+        browser = _window(title="Twitch - Google Chrome", process="chrome.exe")
+        web_app = AppEntry("Twitch", "lnk", r"C:\\Twitch.lnk", "webapp")
+        with patch.object(open_app, "_SYSTEM", "Windows"), \
+             patch.object(open_app, "load_index", return_value=[web_app]):
+            self.assertTrue(open_app._browser_title_match_may_be_a_web_app(
+                [browser], "Twitch"
+            ))
+
+
 class PlacementTests(unittest.TestCase):
     """Monitor and window-state requests must be applied and verified."""
 

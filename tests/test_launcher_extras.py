@@ -108,7 +108,8 @@ class UsageStoreTests(unittest.TestCase):
 
 class StalenessTests(unittest.TestCase):
     def test_a_changed_source_folder_invalidates_the_cache(self) -> None:
-        cache = {"system": app_index._OS, "built_at": 9e9, "signature": -12345.0,
+        cache = {"version": app_index.INDEX_VERSION,
+                 "system": app_index._OS, "built_at": 9e9, "signature": -12345.0,
                  "entries": [{"name": "Old", "kind": "exec", "target": "/bin/old", "source": "registry"}]}
         with patch.object(app_index, "_read_cache", return_value=cache), \
              patch.object(app_index, "build_index", return_value=[_entry("New")]) as build:
@@ -118,6 +119,7 @@ class StalenessTests(unittest.TestCase):
 
     def test_a_fresh_matching_cache_is_reused(self) -> None:
         cache = {
+            "version": app_index.INDEX_VERSION,
             "system": app_index._OS,
             "built_at": app_index.time.time(),
             "signature": app_index._source_signature(),

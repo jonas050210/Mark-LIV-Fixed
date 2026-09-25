@@ -1,11 +1,14 @@
 """Named window and multi-monitor control for MARK LIV."""
 from __future__ import annotations
 
+import time
+
 from core.undo import push_undo
 from core.window_manager import (
     describe_monitors,
     describe_windows,
     find_window,
+    find_windows,
     list_monitors,
     list_windows,
     monitor_for,
@@ -45,6 +48,21 @@ def _remember_window(window, label: str, state) -> None:
     push_undo(f"window layout of {label}", lambda: _restore_window_state(window, state))
 
 
+def _wait_for_closed(handles: set[int], timeout: float = 3.0) -> set[int]:
+    """Return handles still visible after a bounded graceful-close wait."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    remaining = set(handles)
+    while remaining and time.monotonic() < deadline:
+        try:
+            visible = {int(window.handle) for window in list_windows()}
+        except Exception:
+            break
+        remaining &= visible
+        if remaining:
+            time.sleep(0.1)
+    return remaining
+
+
 def window_manager(parameters: dict | None = None, player=None) -> str:
     p = parameters if isinstance(parameters, dict) else {}
     action = str(p.get("action") or "list_windows")[:32].strip().casefold().replace(" ", "_")
@@ -54,8 +72,42 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         return describe_windows()
     if action in {"monitors", "list_monitors", "displays", "display_info"}:
         return describe_monitors()
+    if action in {"list_app_windows", "app_windows", "close_all", "minimize_all"}:
+        if not target:
+            return f"A target application is required for {action}."
+        matches = find_windows(target, min_score=80)
+        if not matches:
+            return f"I could not find a visible window matching '{target}'."
+        if action in {"list_app_windows", "app_windows"}:
+            rows = [
+                f"{index}. {window.title} [{window.process}] HWND {window.handle}"
+                for index, window in enumerate(matches[:40], 1)
+            ]
+            return f"Windows matching '{target}':\n" + "\n".join(rows)
+        operation = "close" if action == "close_all" else "minimize"
+        requested = []
+        for item in matches:
+            try:
+                operate(item, operation)
+                requested.append(item)
+            except Exception:
+                continue
+        if operation == "close":
+            remaining = _wait_for_closed({int(item.handle) for item in requested})
+            closed = len(requested) - len(remaining)
+            if remaining:
+                return (
+                    f"Closed {closed} of {len(matches)} window(s) matching '{target}'; "
+                    f"{len(remaining)} still open, possibly because the app is showing a save prompt."
+                )
+            return f"Closed {closed} of {len(matches)} window(s) matching '{target}'."
+        return f"Minimized {len(requested)} of {len(matches)} window(s) matching '{target}'."
 
-    window = find_window(target)
+    if action in {"close", "quit"} and target:
+        strict_matches = find_windows(target, min_score=80)
+        window = strict_matches[0] if strict_matches else None
+    else:
+        window = find_window(target)
     if window is None:
         return f"I could not find a visible window matching '{target or 'the active window'}'."
 
@@ -77,10 +129,15 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         operate(window, "focus")
         return f"Switched to {_target_label(window)}."
     if action in {"close", "quit"}:
-        # The action registry parks this operation behind the shared human
-        # confirmation gate.  Keeping the actual close here makes the policy
-        # impossible to bypass through a second caller.
+        # Closing a named window is deterministic and intentionally immediate.
+        # The application may still show its own native save prompt when it
+        # genuinely owns unsaved work; MARK LIV does not add another prompt.
         operate(window, "close")
+        if _wait_for_closed({int(window.handle)}):
+            return (
+                f"I asked {_target_label(window)} to close, but its window is still open. "
+                "The application may be showing its own save prompt."
+            )
         return f"Closed {_target_label(window)}."
     if action in {"fullscreen", "full_screen", "full"}:
         monitor = monitor_for(p.get("monitor")) if p.get("monitor") else None
@@ -134,7 +191,8 @@ TOOL = {
     "description": (
         "Controls a named desktop window and the user's monitors. Use this instead "
         "of a blind hotkey when the user names an app: list open windows, focus, "
-        "minimize, maximize, fullscreen, restore, close with confirmation, move an app to a "
+        "list all windows of one app, minimize or close one/all, maximize, fullscreen, "
+        "restore, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "
         "If no target is supplied, use the currently active window."
@@ -144,11 +202,12 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["list_windows", "list_monitors", "focus", "minimize", "maximize", "fullscreen", "restore", "close", "move_to_monitor", "snap", "move"],
+                "enum": ["list_windows", "list_monitors", "list_app_windows", "focus", "minimize", "minimize_all", "maximize", "fullscreen", "restore", "close", "close_all", "move_to_monitor", "snap", "move"],
                 "maxLength": 32,
                 "description": (
-                    "list_windows | list_monitors | focus | minimize | maximize | "
-                    "fullscreen | restore | close | move_to_monitor | snap | move"
+                    "list_windows | list_monitors | list_app_windows | focus | minimize | "
+                    "minimize_all | maximize | fullscreen | restore | close | close_all | "
+                    "move_to_monitor | snap | move"
                 ),
             },
             "target": {
@@ -177,6 +236,5 @@ TOOL = {
     },
     "handler": window_manager,
     "risk": "medium",
-    "confirmation_actions": ["close"],
     "undoable": True,
 }

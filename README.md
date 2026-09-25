@@ -38,17 +38,23 @@ The assistant now has named window and monitor control. Examples:
 - `List my open windows and monitors`
 - `Restart MARK LIV`
 
-The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing another application requires confirmation; Windows administrator/UAC operations are never silently bypassed.
+The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing a named application is immediate and does not add a MARK LIV confirmation; the application can still present its own native save prompt when it genuinely has unsaved work. The `app_lifecycle` action reports installation/process/window state and performs graceful app restarts without hotkeys or force-killing unsaved work. Power actions and Windows administrator/UAC operations are never silently bypassed.
 
 The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It is the primary control surface rather than a hotkey collection: press **Ctrl/Cmd-K** for the command palette, use quick cards for windows, monitors, audio, Explorer, Task Manager, and relaunch, and use the per-window FOCUS/MIN/MAX/CLOSE controls. The FILE EXPLORER panel searches Home, Desktop, Downloads, Documents, or Pictures and offers separate OPEN and SELECT actions for each verified result. It shows live action IDs, progress, cancellation, confirmations, named-window occupancy, monitor tiles, audio health, and undo history. It is a control surface, not an unrestricted way around Windows security.
 
 MARK LIV launches applications from a real index of what is installed on the
-machine — Windows `App Paths` registry entries, Start-menu shortcuts and
-`shell:AppsFolder` package ids, macOS application bundles, and Linux desktop
-entries. It never presses the Windows key and types a name into the Start menu,
+machine — Windows `App Paths` and Roblox protocol registry entries, Start-menu
+shortcuts (including generic Chrome/Edge web apps such as Arena, Twitch, and
+YouTube), versioned Roblox installations, `shell:AppsFolder` package ids, macOS
+application bundles, and Linux desktop entries. Web apps keep their original
+profile and app-id switches, so they open as standalone apps instead of ordinary
+browser tabs. It never presses the Windows key and types a name into the Start menu,
 so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming
-success. Say `rescan my apps` after installing something new.
+success. A stale executable or shortcut triggers one automatic index rebuild
+and one bounded retry; slow shortcuts and Store apps are verified with an
+adaptive before/after window check. Say `rescan my apps` after installing
+something new if you want to refresh proactively.
 
 The launcher also remembers what you actually use: the dashboard's **APP
 LAUNCHER** panel shows pinned and recently opened applications as icon buttons,
@@ -93,6 +99,8 @@ and state.
 
 Application and Explorer control are deliberately conservative. `open Chrome` or `open Roblox` focuses an existing window instead of silently creating another one. A second Roblox client is only attempted for an explicit request such as `open another Roblox`; MARK LIV verifies the new window and moves it to the opposite monitor when a second display is available, otherwise it reports the limitation. File searches resolve Windows known folders, search the user's home folder by default, use Everything when installed, and show numbered candidates when more than one file matches. `open` and `select` only act on a unique exact or search result, so MARK LIV does not guess between similarly named files.
 
+The settings drawer includes a live HUD maximum frame-rate selector for 30, 60, 120, 240, or unlimited FPS. This changes MARK LIV's own software-rendered HUD, not game frame rates. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
+
 Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.
 
 On Windows, monitor enumeration opts into per-monitor DPI awareness before reading HWND coordinates and uses the current display mode for refresh rate. This keeps two 1920×1080 displays and high-refresh modes such as 180 Hz visible as physical pixel geometry rather than scaled logical coordinates. The native ctypes fallback still reports geometry when pywin32 is not installed.
@@ -117,7 +125,7 @@ Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow)
 
 All discovered actions now pass through one registry contract. Results have explicit `succeeded`, `failed`, `busy`, `cancelled`, `forbidden`, `confirmation_pending`, `unavailable`, and `timed_out` states; handlers keep their old string API only at the Gemini boundary. The registry also owns per-action deadlines, bounded legacy-worker capacity, trusted/admin checks, confirmation metadata, and the dashboard capability manifest. Packaged action source is size-, ownership-, permission-, link-, and descriptor-checked before execution.
 
-High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface and protects app/PC closing, file deletion, power actions, WiFi changes, and other risky operations. Pending confirmations actively expire after 90 seconds and remain bound to the action ID shown to the user. Reversible settings continue to use the shared undo stack.
+High-impact operations never accept a model-supplied `confirmed` flag. The HUD confirmation token is issued by the interface and protects file deletion, power actions, WiFi changes, and other destructive operations. Named and active-window close requests are immediate because MARK LIV already targets the intended window by handle instead of sending a focus-dependent shortcut. Pending confirmations actively expire after 90 seconds and remain bound to the action ID shown to the user. Reversible settings continue to use the shared undo stack.
 
 The active action surface is intentionally small and PC-focused. Travel, weather, messaging, developer-agent, game-updater, generated-desktop-task, and YouTube-specific actions were removed instead of advertising unrelated or duplicated capabilities. Browser control covers normal HTTP(S) websites; local-file and script protocols are rejected. `media_control` uses Spotify Connect for playback without repeatedly foregrounding Spotify. `shortcut_manager` stores deterministic aliases such as `gd → Geometry Dash` and `roblox → Roblox Player`.
 

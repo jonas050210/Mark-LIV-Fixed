@@ -430,7 +430,7 @@ class HudCanvas(QWidget):
         self._last_t     = time.time()
         self._step_t     = time.time()
         self._blink      = True
-        self._blink_tick = 0
+        self._last_blink_t = time.monotonic()
 
         # Rescaled-face cache: the smooth rescale is expensive, so we keep the
         # last result and only rebuild it when the (quantised) size changes.
@@ -454,8 +454,24 @@ class HudCanvas(QWidget):
         self._base_halo  = 55.0
 
         self._tmr = QTimer(self)
+        self._tmr.setTimerType(Qt.TimerType.PreciseTimer)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        try:
+            from memory.config_manager import get_hud_max_fps
+            initial_fps = get_hud_max_fps()
+        except Exception:
+            initial_fps = 60
+        self.set_max_fps(initial_fps)
+
+    def set_max_fps(self, fps: int) -> None:
+        """Apply the HUD render cap immediately; zero means event-loop unlimited."""
+        allowed = {30, 60, 120, 240, 0}
+        value = int(fps)
+        if value not in allowed:
+            raise ValueError("HUD FPS must be 30, 60, 120, 240, or 0")
+        self._max_fps = value
+        interval = 0 if value == 0 else max(1, round(1000 / value))
+        self._tmr.start(interval)
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
@@ -548,8 +564,11 @@ class HudCanvas(QWidget):
         return pm
 
     def _step(self):
-        self._tick += 1
         now = time.time()
+        dt = min(0.10, max(0.0, now - self._step_t))
+        self._step_t = now
+        # Keep legacy phase expressions frame-rate independent.
+        self._tick += dt * 60.0
 
         # ── Live audio reactivity ────────────────────────────────────────────
         # A viseme schedule, if one is playing, gives both the level and the
@@ -582,14 +601,14 @@ class HudCanvas(QWidget):
 
         # Audio threads push peaks into _live_amp; decay it toward silence so
         # gaps between chunks fade out instead of freezing, then smooth it.
-        self._live_amp *= 0.86
-        self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
+        frame_scale = dt * 60.0
+        self._live_amp *= 0.86 ** frame_scale
+        smooth_alpha = 1.0 - (1.0 - 0.45) ** frame_scale
+        self._amp_disp += (self._live_amp - self._amp_disp) * smooth_alpha
         amp = self._amp_disp
 
         # The avatar animates off the very same smoothed level the waveform
         # uses — one audio source, so the mouth can never drift out of sync.
-        dt = now - self._step_t
-        self._step_t = now
         # Integrated, not derived from absolute time: multiplying wall-clock by
         # a rate that changes with state jumps the rings the instant JARVIS
         # starts talking. Same lesson the head's sway taught.
@@ -625,28 +644,28 @@ class HudCanvas(QWidget):
                 self._tgt_halo  = self._base_halo  + amp * 75.0
 
             sp = 0.38 if self.speaking else (0.30 if amp > 0.02 else 0.15)
-            self._scale += (self._tgt_scale - self._scale) * sp
-            self._halo  += (self._tgt_halo  - self._halo)  * sp
+            lerp_alpha = 1.0 - (1.0 - sp) ** frame_scale
+            self._scale += (self._tgt_scale - self._scale) * lerp_alpha
+            self._halo  += (self._tgt_halo  - self._halo)  * lerp_alpha
 
-        self._blink_tick += 1
-        if self._blink_tick >= 38:
+        # Wall-clock blinking keeps the same cadence at every FPS setting.
+        if time.monotonic() - self._last_blink_t >= 38 / 60:
             self._blink = not self._blink
-            self._blink_tick = 0
+            self._last_blink_t = time.monotonic()
             _blinked = True
         else:
             _blinked = False
 
-        # Repaint throttling — advancing the animation state above is cheap at
-        # 60 Hz, but the paint is heavy. Active (speaking, audio, thinking) runs
-        # at ~30 Hz, which is the frame rate animation has used for talking
-        # characters forever and is indistinguishable here; idle drops to ~20 Hz
-        # so a sleeping HUD stops pinning a CPU core. The visuals stay smooth
-        # either way because the animation state keeps stepping at 60 Hz.
-        self._paint_tick = (self._paint_tick + 1) % 6
+        # The selected FPS is the active render ceiling. Idle rendering remains
+        # capped around 20 fps so an unattended assistant does not waste a CPU
+        # core. Unlimited uses a zero-interval precise timer and paints every
+        # active event-loop turn, exactly as labelled in settings.
+        self._paint_tick += 1
         active = (self.speaking or amp > 0.02
                   or self.state in ("THINKING", "PROCESSING"))
-        if _blinked or (self._paint_tick % 2 == 0 if active
-                        else self._paint_tick % 3 == 0):
+        timer_fps = self._max_fps if self._max_fps > 0 else 240
+        idle_divisor = max(1, round(timer_fps / 20))
+        if _blinked or active or self._paint_tick % idle_divisor == 0:
             # Nothing is on screen when the window is hidden or minimised, so
             # rendering the avatar into it is pure waste — and this app is meant
             # to sit running all day. The animation state above keeps stepping,
@@ -1397,96 +1416,6 @@ class _CameraPreview(QWidget):
 
 
 
-class ClipboardPanel(QWidget):
-    """Floating panel shown when text is copied — offers quick Jarvis actions."""
-
-    action_requested = pyqtSignal(str)
-    _W, _H = 326, 112
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"""
-            ClipboardPanel {{
-                background: rgba(0, 8, 14, 248);
-                border: 1px solid {C.BORDER_B};
-                border-radius: 6px;
-            }}
-        """)
-        self.setFixedWidth(self._W)
-        self._clip_text = ""
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 7)
-        lay.setSpacing(4)
-
-        hdr = QHBoxLayout(); hdr.setSpacing(4)
-        icon_lbl = QLabel("◈  CLIPBOARD DETECTED")
-        icon_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        icon_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
-        hdr.addWidget(icon_lbl); hdr.addStretch()
-        x_btn = QPushButton("✕")
-        x_btn.setFixedSize(16, 16)
-        x_btn.setFont(QFont("Courier New", 8))
-        x_btn.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
-        x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        x_btn.clicked.connect(self.hide)
-        hdr.addWidget(x_btn)
-        lay.addLayout(hdr)
-
-        self._preview = QLabel()
-        self._preview.setFont(QFont("Courier New", 8))
-        self._preview.setStyleSheet(f"""
-            color: {C.TEXT}; background: {C.PANEL2};
-            border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 6px;
-        """)
-        self._preview.setWordWrap(False)
-        self._preview.setFixedHeight(28)
-        lay.addWidget(self._preview)
-
-        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
-        _bs = (f"QPushButton {{ background: {C.PANEL2}; color: {C.TEXT_MED}; "
-               f"border: 1px solid {C.BORDER}; border-radius: 2px; }}"
-               f"QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}")
-        for label, cmd_fmt in [
-            ("TRANSLATE", "Translate this text to English: {text}"),
-            ("SUMMARISE", "Summarise this: {text}"),
-            ("EXPLAIN",   "Explain this: {text}"),
-            ("FIX",       "Fix grammar and spelling: {text}"),
-        ]:
-            b = QPushButton(label)
-            b.setFixedHeight(22)
-            b.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(_bs)
-            b.clicked.connect(lambda _, c=cmd_fmt: self._trigger(c))
-            btn_row.addWidget(b)
-        lay.addLayout(btn_row)
-
-        self._dismiss_timer = QTimer(self)
-        self._dismiss_timer.setSingleShot(True)
-        self._dismiss_timer.timeout.connect(self.hide)
-        self.hide()
-
-    def _trigger(self, cmd_fmt: str):
-        if self._clip_text:
-            self.action_requested.emit(cmd_fmt.format(text=self._clip_text[:800]))
-        self.hide()
-
-    def show_clipboard(self, text: str):
-        self._clip_text = text
-        preview = text[:58].replace('\n', ' ')
-        if len(text) > 58:
-            preview += "…"
-        self._preview.setText(f'"{preview}"')
-        self.show(); self.raise_()
-        self._dismiss_timer.start(8000)
-
-
-
-
-
-
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -1495,7 +1424,6 @@ class MainWindow(QMainWindow):
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
-    _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
@@ -1662,7 +1590,6 @@ class MainWindow(QMainWindow):
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
-        self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
@@ -1671,11 +1598,6 @@ class MainWindow(QMainWindow):
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
-
-        # Clipboard panel (child of central widget, bottom-center)
-        self._clipboard_panel = ClipboardPanel(self.centralWidget())
-        self._clipboard_panel.action_requested.connect(self._on_clipboard_action)
-        QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -2181,9 +2103,6 @@ class MainWindow(QMainWindow):
             cw.height() - ph - 28,
             pw, ph,
         )
-        # Clipboard panel — bottom-center
-        if hasattr(self, '_clipboard_panel') and self._clipboard_panel.isVisible():
-            self._position_clipboard_panel()
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
@@ -2572,6 +2491,30 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._hud_btn)
         self._refresh_hud_btn()
 
+        fps_row = QWidget()
+        fps_lay = QHBoxLayout(fps_row)
+        fps_lay.setContentsMargins(0, 0, 0, 0)
+        fps_lay.setSpacing(6)
+        fps_lbl = QLabel("HUD MAX FPS")
+        fps_lbl.setFont(QFont("Courier New", 7))
+        fps_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        fps_lay.addWidget(fps_lbl)
+        self._fps_combo = QComboBox()
+        self._fps_combo.setFont(QFont("Courier New", 7))
+        for label, value in (("30", 30), ("60", 60), ("120", 120),
+                             ("240", 240), ("UNLIMITED", 0)):
+            self._fps_combo.addItem(label, value)
+        try:
+            from memory.config_manager import get_hud_max_fps
+            current_fps = get_hud_max_fps()
+        except Exception:
+            current_fps = 60
+        selected = self._fps_combo.findData(current_fps)
+        self._fps_combo.setCurrentIndex(max(0, selected))
+        self._fps_combo.currentIndexChanged.connect(self._change_hud_fps)
+        fps_lay.addWidget(self._fps_combo, 1)
+        lay.addWidget(fps_row)
+
         audio_btn = QPushButton("🎧  AUDIO DEVICES")
         audio_btn.setFixedHeight(26)
         audio_btn.setFont(QFont("Courier New", 7))
@@ -2579,22 +2522,6 @@ class MainWindow(QMainWindow):
         audio_btn.setStyleSheet(_BTN_STYLE_DIM)
         audio_btn.clicked.connect(self._open_audio_devices)
         lay.addWidget(audio_btn)
-
-        launch_btn = QPushButton("▸  LAUNCHER")
-        launch_btn.setFixedHeight(26)
-        launch_btn.setFont(QFont("Courier New", 7))
-        launch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        launch_btn.setStyleSheet(_BTN_STYLE_DIM)
-        launch_btn.clicked.connect(self._open_launcher)
-        lay.addWidget(launch_btn)
-
-        layout_btn = QPushButton("▤  LAYOUTS")
-        layout_btn.setFixedHeight(26)
-        layout_btn.setFont(QFont("Courier New", 7))
-        layout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout_btn.setStyleSheet(_BTN_STYLE_DIM)
-        layout_btn.clicked.connect(self._open_layouts)
-        lay.addWidget(layout_btn)
 
         mem_btn = QPushButton("🧠  MEMORY")
         mem_btn.setFixedHeight(26)
@@ -3460,6 +3387,17 @@ class MainWindow(QMainWindow):
             "SYS: HUD switched to the animated face." if want == "face"
             else "SYS: HUD switched to the reactor core.")
 
+    def _change_hud_fps(self, _index: int):
+        value = int(self._fps_combo.currentData())
+        try:
+            from memory.config_manager import save_hud_max_fps
+            save_hud_max_fps(value)
+            self.hud.set_max_fps(value)
+            label = "unlimited" if value == 0 else str(value)
+            self._log.append_log(f"SYS: HUD maximum frame rate set to {label} FPS.")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not set HUD FPS ({type(exc).__name__}).")
+
     def _toggle_ptt(self):
         from memory.config_manager import (get_push_to_talk_enabled,
                                            save_push_to_talk_enabled)
@@ -3719,33 +3657,6 @@ class MainWindow(QMainWindow):
         self._centre_overlay(ov)
         self._memory_overlay = ov
 
-    # ── Launcher and window layouts ──────────────────────────────────────────
-    #
-    # Both panels live in ui_panels/ rather than in this file, and are imported
-    # only when first opened: neither is needed to start the HUD, and a failure
-    # while building one must not take the window down with it.
-
-    def _open_launcher(self):
-        try:
-            from ui_panels.launcher import LauncherOverlay
-        except Exception as e:
-            self._log.append_log(f"ERR: Launcher panel unavailable ({type(e).__name__}).")
-            return
-        ov = LauncherOverlay(parent=self.centralWidget())
-        ov.launched.connect(lambda name: self._log.append_log(f"SYS: Launched {name}."))
-        self._centre_overlay(ov)
-        self._launcher_overlay = ov         # keep a reference so it isn't GC'd
-
-    def _open_layouts(self):
-        try:
-            from ui_panels.layouts import LayoutOverlay
-        except Exception as e:
-            self._log.append_log(f"ERR: Layout panel unavailable ({type(e).__name__}).")
-            return
-        ov = LayoutOverlay(parent=self.centralWidget())
-        self._centre_overlay(ov)
-        self._layout_overlay = ov           # keep a reference so it isn't GC'd
-
     # ── Irreversible-action confirmation ─────────────────────────────────────
 
     def _show_confirm_banner(self, title: str, detail: str):
@@ -3801,33 +3712,6 @@ class MainWindow(QMainWindow):
         ov.show()
         ov.raise_()
         self._plugin_settings_overlay = ov   # keep a reference so it isn't GC'd
-
-    # ── Clipboard intelligence ───────────────────────────────────────────────────
-
-    def _on_clipboard_changed(self):
-        try:
-            text = QApplication.clipboard().text().strip()
-            if len(text) >= 10:
-                self._clipboard_sig.emit(text)
-        except Exception:
-            pass
-
-    def _show_clipboard_panel(self, text: str):
-        self._clipboard_panel.show_clipboard(text)
-        self._position_clipboard_panel()
-
-    def _position_clipboard_panel(self):
-        cw = self.centralWidget()
-        pw = ClipboardPanel._W
-        ph = self._clipboard_panel.sizeHint().height() or ClipboardPanel._H
-        x = (cw.width() - pw) // 2
-        y = cw.height() - ph - 6
-        self._clipboard_panel.setGeometry(x, y, pw, ph)
-        self._clipboard_panel.raise_()
-
-    def _on_clipboard_action(self, cmd: str):
-        if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(cmd,), daemon=True).start()
 
     # ────────────────────────────────────────────────────────────────────────────
 

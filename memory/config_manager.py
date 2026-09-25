@@ -158,6 +158,28 @@ def save_hud_style(style: str) -> None:
     patch_config(hud_style=normalized if normalized in HUD_STYLES else "face")
 
 
+HUD_FPS_OPTIONS = (30, 60, 120, 240, 0)  # 0 = unlimited
+
+
+def get_hud_max_fps() -> int:
+    value = load_api_keys().get("hud_max_fps", 60)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 60
+    return parsed if parsed in HUD_FPS_OPTIONS else 60
+
+
+def save_hud_max_fps(fps: int) -> None:
+    try:
+        parsed = int(fps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HUD FPS must be 30, 60, 120, 240, or 0 for unlimited") from exc
+    if parsed not in HUD_FPS_OPTIONS:
+        raise ValueError("HUD FPS must be 30, 60, 120, 240, or 0 for unlimited")
+    patch_config(hud_max_fps=parsed)
+
+
 def get_thinking_enabled() -> bool:
     return _stored_bool(load_api_keys().get("thinking_enabled"), False)
 
