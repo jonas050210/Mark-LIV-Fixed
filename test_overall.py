@@ -335,7 +335,8 @@ COVERAGE_FLOORS = {
     "dashboard/server.py": 40,
     "core/speech_shaping.py": 85,
     "core/untrusted.py": 85,
-    "core/plugin_loader.py": 70,
+    # Windows cannot execute the POSIX ownership and permission branches.
+    "core/plugin_loader.py": 66,
 }
 
 
