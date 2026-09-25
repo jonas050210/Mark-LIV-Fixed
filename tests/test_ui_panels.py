@@ -248,6 +248,26 @@ class ExtractedOverlayTests(unittest.TestCase):
                 self.assertGreater(widget.width(), 0)
                 widget.deleteLater()
 
+    def test_every_extracted_panel_paints(self) -> None:
+        """Building a widget is not the same as drawing it.
+
+        A name that a panel used to reach as a global in ui.py — qcol() was one
+        — is missing only inside paintEvent, which runs when the pixels are
+        drawn and not when the object is constructed. Rendering each panel into
+        a pixmap is the only way that shows up in a test.
+        """
+        from PyQt6.QtGui import QPixmap
+
+        for widget_class, args in self._cases():
+            with self.subTest(panel=widget_class.__name__):
+                widget = widget_class(*args)
+                widget.resize(max(widget.width(), 200), max(widget.height(), 200))
+                pixmap = QPixmap(widget.size())
+                pixmap.fill()
+                widget.render(pixmap)      # raises if paintEvent is broken
+                self.assertFalse(pixmap.isNull())
+                widget.deleteLater()
+
     def test_the_confirmation_banner_still_reports_both_answers(self) -> None:
         from ui_panels.confirm import ConfirmBanner
 

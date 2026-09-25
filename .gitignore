@@ -80,4 +80,8 @@ logs/
 downloads/
 screenshots/
 test-results/
+overall-report.json
 *.overall-report.json
+.coverage
+.coverage.*
+htmlcov/

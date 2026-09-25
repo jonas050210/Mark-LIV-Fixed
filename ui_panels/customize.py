@@ -9,7 +9,7 @@ import math
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QConicalGradient, QFont, QPainter, QPen
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
-from ui_panels.base import C, HudPanel
+from ui_panels.base import C, HudPanel, qcol
 from ui_panels.base import default_accent as _default_accent
 
 

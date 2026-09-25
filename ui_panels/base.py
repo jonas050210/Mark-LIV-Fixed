@@ -12,7 +12,7 @@ is picked up the next time a panel is built.
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
 
 # Used only when the panel is built without the host application present, which
@@ -31,6 +31,20 @@ _FALLBACK = {
     "TEXT_MED": "#5ab8cc",
     "WHITE": "#d8f8ff",
 }
+
+
+def qcol(value: str, alpha: int = 255) -> QColor:
+    """A QColor from a palette hex string, with an optional alpha.
+
+    This lived in ui.py, where every panel could reach it as a global. A panel
+    in its own module cannot, and the omission would not have shown up until
+    someone actually looked at the widget: a missing name inside paintEvent
+    raises when the pixels are drawn, not when the object is built.
+    """
+    colour_value = QColor(str(value))
+    if alpha != 255:
+        colour_value.setAlpha(max(0, min(255, int(alpha))))
+    return colour_value
 
 
 class _Palette:
