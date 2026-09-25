@@ -234,11 +234,19 @@ class CrossDeviceMoveTests(unittest.TestCase):
             def cross_device(_src, _dst):
                 raise OSError(errno.EXDEV, "Invalid cross-device link")
 
-            # send2trash is not installed in this environment, so _safe_trash
-            # genuinely fails here -- this exercises the real rollback path,
-            # not a simulated one.
-            self.assertFalse(file_controller._SEND2TRASH)
-            with patch.object(file_controller, "move_no_replace", side_effect=cross_device):
+            # Whether send2trash happens to be installed on the machine
+            # running this suite is not something a test should depend on --
+            # a passing test must not start failing just because someone
+            # `pip install`s an unrelated package. `_safe_trash` is forced to
+            # report unavailability directly, which exercises the same
+            # rollback branch in `_move_across_devices` deterministically.
+            unavailable = (
+                "send2trash is not installed. "
+                "Run: pip install send2trash — "
+                "Permanent deletion is disabled for safety."
+            )
+            with patch.object(file_controller, "move_no_replace", side_effect=cross_device), \
+                 patch.object(file_controller, "_safe_trash", return_value=unavailable):
                 result = file_controller.move_file(str(source), destination=str(destination))
 
             self.assertIn("could not move it across drives", result)

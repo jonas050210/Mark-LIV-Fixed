@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from core import audio_devices
+from core import system_audio
 from core import undo as undo_stack
 from memory.config_manager import (
     get_input_device,
@@ -34,7 +35,37 @@ def audio_manager(parameters: dict | None = None, player=None) -> str:
                     + "\n\nSpeakers:\n- " + "\n- ".join(outputs or ['No tested speakers']))
         except Exception as exc:
             return f"Could not list audio devices: {type(exc).__name__}"
+
+    if action in {"list_system_outputs", "system_devices", "list_system_devices"}:
+        devices = system_audio.list_playback_devices()
+        current = system_audio.get_default_playback_device()
+        if not devices:
+            return (
+                "No system playback devices could be listed on this platform. "
+                "On Windows this needs pycaw and comtypes; on Linux it needs "
+                "pactl; on macOS it needs SwitchAudioSource."
+            )
+        header = f"System default output: {current or 'unknown'}"
+        return header + "\n\nAll playback devices:\n- " + "\n- ".join(devices)
+
+    if action in {"set_system_output", "system_output", "output_device", "set_output_device"}:
+        if not value:
+            return "Tell me the speaker or headset name, or say list system outputs."
+        previous_system_output = system_audio.get_default_playback_device()
+        ok, message = system_audio.set_default_playback_device(value)
+        if not ok:
+            return message or f"Could not switch the system output to '{value}'."
+        if previous_system_output:
+            def _undo_system_output(previous=previous_system_output):
+                restored, detail = system_audio.set_default_playback_device(previous)
+                return detail if restored else (
+                    f"Could not restore the previous output device ({detail})."
+                )
+            undo_stack.push_undo("changed the system audio output device", _undo_system_output)
+        return message
+
     if action in {"input", "microphone", "set_input", "set_microphone"}:
+
         if not value:
             return "Tell me the microphone name, or say list audio devices."
         save_input_device(value)
@@ -50,7 +81,7 @@ def audio_manager(parameters: dict | None = None, player=None) -> str:
         selected = "audio devices"
         value = "System default"
     else:
-        return "Use list, set_input, set_output, or default."
+        return "Use list, set_input, set_output, default, list_system_outputs, or set_system_output."
 
     def undo_audio_selection():
         save_input_device(previous_input)
@@ -76,15 +107,23 @@ def audio_manager(parameters: dict | None = None, player=None) -> str:
 TOOL = {
     "name": "audio_manager",
     "description": (
-        "Lists and selects the microphone and speakers JARVIS uses. Use this for "
-        "headsets such as JBL Quantum 400: list devices first, then set_input or "
-        "set_output by the exact displayed name. The audio session reconnects "
-        "without losing the conversation."
+        "Lists and selects the microphone and speakers JARVIS uses, and can "
+        "also switch the whole system's default playback device. Use "
+        "set_input/set_output for JARVIS's own microphone and speakers (e.g. "
+        "a headset such as JBL Quantum 400); use set_system_output when the "
+        "user means 'switch what my whole PC plays sound through', which "
+        "affects every application, not just JARVIS. list_system_outputs "
+        "shows the exact device names set_system_output accepts."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "enum": ["list", "set_input", "set_output", "default"], "maxLength": 16, "description": "list | set_input | set_output | default"},
+            "action": {
+                "type": "STRING",
+                "enum": ["list", "set_input", "set_output", "default", "list_system_outputs", "set_system_output"],
+                "maxLength": 24,
+                "description": "list | set_input | set_output | default | list_system_outputs | set_system_output",
+            },
             "device": {"type": "STRING", "maxLength": 300, "description": "Exact device name from the list."},
         },
         "required": ["action"],
