@@ -50,7 +50,7 @@ jobs:
         run: python -m compileall -q .
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        run: python .github/scripts/run_tests.py
 
       - name: Run overall verification
         run: python test_overall.py
