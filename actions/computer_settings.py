@@ -981,10 +981,13 @@ TOOL = {
                 "description": "Optional named application/window for minimize, maximize, focus, close, snap, or move actions. Prefer window_manager for named windows."
             },
             "monitor": {
-                "type": "INTEGER",
-                "minimum": 1,
-                "maximum": 32,
-                "description": "Optional 1-based monitor number when moving or snapping a named window."
+                "type": "STRING",
+                "maxLength": 40,
+                "description": (
+                    "Optional monitor when moving or snapping a named window: a "
+                    "1-based number ('1', '2'), 'primary'/'main', 'secondary'/'second', "
+                    "'left'/'right', or 'monitor 2'."
+                )
             },
             "press_enter": {
                 "type": "BOOLEAN",

@@ -317,6 +317,64 @@ class WindowsLaunchTests(unittest.TestCase):
         self.assertEqual(startfile_calls, ["ms-settings:display"])
 
 
+class DirectPathLaunchTests(unittest.TestCase):
+    """A personal shortcut the installed-app index never scanned must still launch."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.exe = make_exe(self.root, "app.exe")
+        self.link = self.root / "YouTube.lnk"
+        self.link.write_bytes(b"L fake shortcut")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_a_desktop_lnk_is_recognised_as_a_direct_target(self) -> None:
+        from core import app_index
+        self.assertTrue(app_index.is_direct_launch_target(str(self.link)))
+
+    def test_a_document_path_is_not_treated_as_a_direct_target(self) -> None:
+        from core import app_index
+        document = self.root / "notes.txt"
+        document.write_text("hello")
+        self.assertFalse(app_index.is_direct_launch_target(str(document)))
+
+    def test_a_missing_path_is_not_a_direct_target(self) -> None:
+        from core import app_index
+        self.assertFalse(app_index.is_direct_launch_target(str(self.root / "Ghost.lnk")))
+
+    def test_a_url_is_never_treated_as_a_filesystem_path(self) -> None:
+        from core import app_index
+        self.assertFalse(app_index.is_direct_launch_target("https://youtube.com"))
+
+    def test_a_desktop_lnk_launches_through_the_shell_on_windows(self) -> None:
+        from core import app_index
+        startfile_calls = []
+        with patch.object(app_index, "_OS", "Windows"), \
+             patch.object(app_index.os, "startfile", startfile_calls.append, create=True):
+            self.assertIsNone(app_index.launch_path(str(self.link)))
+        self.assertEqual(startfile_calls, [str(self.link)])
+
+    def test_an_exe_is_spawned_directly(self) -> None:
+        from core import app_index
+        with patch.object(app_index, "_OS", "Windows"), \
+             patch.object(app_index, "_spawn", return_value=4242) as spawn:
+            self.assertEqual(app_index.launch_path(str(self.exe)), 4242)
+        self.assertEqual(spawn.call_args[0][0][0], str(self.exe))
+
+    def test_a_missing_target_raises_a_clear_error(self) -> None:
+        from core import app_index
+        with self.assertRaises(app_index.LaunchError):
+            app_index.launch_path(str(self.root / "Ghost.lnk"))
+
+    def test_arguments_to_a_shortcut_are_refused(self) -> None:
+        from core import app_index
+        with patch.object(app_index, "_OS", "Windows"):
+            with self.assertRaises(app_index.LaunchError):
+                app_index.launch_path(str(self.link), ["some-doc.txt"])
+
+
 class WindowsReminderTests(unittest.TestCase):
     """Scheduling through schtasks, without a Task Scheduler to talk to."""
 

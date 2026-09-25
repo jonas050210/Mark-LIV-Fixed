@@ -1120,7 +1120,9 @@ class DashboardServer:
                 if not 1 <= monitor_index <= 32:
                     return JSONResponse({"ok": False, "error": "monitor must be between 1 and 32."},
                                         status_code=400)
-                parameters["monitor"] = monitor_index
+                # open_app's schema accepts semantic monitor names as well as
+                # numbers, so its "monitor" parameter is a string.
+                parameters["monitor"] = str(monitor_index)
 
             state = body.get("state")
             if state not in (None, ""):

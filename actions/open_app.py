@@ -1,12 +1,15 @@
 import platform
 import time
+from pathlib import Path
 
 from core.app_index import (
     LaunchError,
     record_launch,
     sanitise_arguments,
+    is_direct_launch_target,
     is_uri,
     launch as launch_app,
+    launch_path,
     launch_uri,
     load_index,
     meaningful_terms,
@@ -222,6 +225,55 @@ def _launch_with_repair(entry, arguments, *queries: str):
 
     started, pid, retry_failure = _launch_resolved(replacement, arguments)
     return started, pid, retry_failure, replacement, True
+
+
+def _open_direct_path(app_name: str, path: str, arguments: list,
+                      monitor_ref, state: str, foreground: bool) -> str:
+    """Launch a personal shortcut/executable the installed-app index cannot see.
+
+    Follows the same wait-for-window, verify, and place pipeline as an
+    indexed launch, so a saved Desktop shortcut behaves identically to any
+    other application once it is running.
+    """
+    label = Path(path).stem or app_name
+    print(f"[open_app] Launching direct path '{path}' for '{app_name}'.")
+    existing_keys = _visible_window_keys()
+    try:
+        pid = launch_path(path, arguments)
+    except LaunchError as exc:
+        return f"I could not open '{app_name}' from its saved shortcut: {exc}."
+    except Exception as exc:
+        return f"I could not open '{app_name}' from its saved shortcut ({type(exc).__name__})."
+
+    record_launch(label)
+    _note_opened_pages(arguments)
+    window = _await_launched_window(app_name, label, pid, existing_keys, timeout=30.0)
+    if window is None:
+        return (
+            f"I started '{app_name}' from its saved shortcut, but no window appeared "
+            "within the wait window. It may still be loading or it may have failed to start."
+        )
+    _remember_launch(label, window)
+
+    resolved_index = None
+    if monitor_ref is not None or state:
+        ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
+        if not ok:
+            return f"Opened '{app_name}' from its saved shortcut, but {detail}."
+
+    if not foreground:
+        try:
+            from core.window_manager import operate
+            if state != "minimized":
+                operate(window, "minimize")
+        except Exception:
+            pass
+        return (
+            f"Opened '{app_name}' from its saved shortcut in the background"
+            f"{_placement_summary(resolved_index, state)}."
+        )
+
+    return f"Opened '{app_name}' from its saved shortcut{_placement_summary(resolved_index, state)}."
 
 
 def _normalised_window_text(value: str) -> str:
@@ -469,48 +521,59 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
     return None
 
 
-def _placement_request(parameters: dict) -> tuple[int | None, str]:
+def _placement_request(parameters: dict) -> tuple[int | str | None, str]:
+    """Read the requested monitor and state, without resolving the monitor yet.
+
+    The monitor may be a plain number or a semantic name ("primary",
+    "secondary", "left", "right", "monitor 2"); resolution against the
+    monitors actually connected happens in _apply_placement, where a bad
+    reference can be reported instead of silently discarded.
+    """
     monitor = parameters.get("monitor")
-    if monitor in ("", None):
-        monitor_index = None
+    if monitor in ("", None) or isinstance(monitor, bool):
+        monitor_ref = None
+    elif isinstance(monitor, (int, str)):
+        monitor_ref = monitor
     else:
-        try:
-            monitor_index = int(monitor)
-        except (TypeError, ValueError):
-            monitor_index = None
+        monitor_ref = None
     state = str(parameters.get("state") or "").casefold().strip()
-    return monitor_index, state
+    return monitor_ref, state
 
 
-def _apply_placement(window, monitor_index: int | None, state: str,
-                     *, focus: bool) -> tuple[bool, str]:
-    """Move a window to the requested monitor/state and verify the outcome."""
-    if monitor_index is None and not state:
-        return True, ""
+def _apply_placement(window, monitor_ref: int | str | None, state: str,
+                     *, focus: bool) -> tuple[bool, str, int | None]:
+    """Move a window to the requested monitor/state and verify the outcome.
+
+    Returns (ok, detail, resolved_monitor_index). The resolved index is
+    reported even on failure when available, so a caller building a status
+    message never has to fall back to an unresolved token like "primary".
+    """
+    if monitor_ref is None and not state:
+        return True, "", None
     try:
         from core.window_manager import monitor_for, place_window, window_on_monitor
     except Exception as exc:
-        return False, f"window placement is unavailable ({type(exc).__name__})"
+        return False, f"window placement is unavailable ({type(exc).__name__})", None
 
     monitor = None
-    if monitor_index is not None:
+    if monitor_ref is not None:
         try:
-            monitor = monitor_for(monitor_index)
+            monitor = monitor_for(monitor_ref)
         except ValueError as exc:
-            return False, str(exc)
+            return False, str(exc), None
         except Exception as exc:
-            return False, f"monitor lookup failed ({type(exc).__name__})"
+            return False, f"monitor lookup failed ({type(exc).__name__})", None
 
     try:
         placed = place_window(window, monitor, state or "normal", focus=focus)
     except ValueError as exc:
-        return False, str(exc)
+        return False, str(exc), (monitor.index if monitor else None)
     except Exception as exc:
-        return False, f"placement failed ({type(exc).__name__})"
+        return False, f"placement failed ({type(exc).__name__})", (monitor.index if monitor else None)
 
     if monitor is not None and not window_on_monitor(placed, monitor):
-        return False, f"I could not verify the move to monitor {monitor.index}"
-    return True, ""
+        return False, f"I could not verify the move to monitor {monitor.index}", monitor.index
+    return True, "", (monitor.index if monitor else None)
 
 
 def _placement_summary(monitor_index: int | None, state: str) -> str:
@@ -548,7 +611,7 @@ def open_app(
         )
     except ValueError as exc:
         return f"I cannot pass that to the application: {exc}."
-    monitor_index, state = _placement_request(parameters)
+    monitor_ref, state = _placement_request(parameters)
     if state and state not in _ALLOWED_STATES:
         return f"state must be one of: {', '.join(sorted(_ALLOWED_STATES))}."
 
@@ -581,16 +644,28 @@ def open_app(
     # Roblox client just because the launcher was called a second time.
     if existing and not explicit_second:
         window = existing[0]
-        if monitor_index is not None or state:
-            ok, detail = _apply_placement(window, monitor_index, state, focus=foreground)
+        if monitor_ref is not None or state:
+            ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
             if not ok:
                 return f"{app_name} is already open, but {detail}."
-            return f"{app_name} was already open; moved it{_placement_summary(monitor_index, state)}."
+            return f"{app_name} was already open; moved it{_placement_summary(resolved_index, state)}."
         if not foreground:
             return f"{app_name} is already open; left it in the background."
         if _focus_window(window):
             return f"{app_name} is already open; switched to it."
         return f"{app_name} is already open, but I could not focus its window."
+
+    # A saved shortcut (or the spoken name itself) may point straight at a
+    # file the installed-app index never scans, such as a personal .lnk on
+    # the Desktop. Launch it directly instead of reporting "not installed".
+    direct_target = next(
+        (candidate for candidate in (shortcut_target, app_name) if is_direct_launch_target(candidate)),
+        None,
+    )
+    if direct_target:
+        return _open_direct_path(
+            app_name, direct_target, arguments, monitor_ref, state, foreground
+        )
 
     candidates, refreshed = _resolve_candidates(normalized, shortcut_target, app_name)
     if not candidates:
@@ -663,8 +738,9 @@ def open_app(
 
         _remember_launch(entry.name, window)
 
-        if monitor_index is not None or state:
-            ok, detail = _apply_placement(window, monitor_index, state, focus=foreground)
+        resolved_index = None
+        if monitor_ref is not None or state:
+            ok, detail, resolved_index = _apply_placement(window, monitor_ref, state, focus=foreground)
             if not ok:
                 return f"Opened {entry.name}, but {detail}."
 
@@ -677,9 +753,9 @@ def open_app(
                     operate(window, "minimize")
             except Exception:
                 pass
-            return f"Opened {entry.name} in the background{_placement_summary(monitor_index, state)}."
+            return f"Opened {entry.name} in the background{_placement_summary(resolved_index, state)}."
 
-        return f"Opened {entry.name}{_placement_summary(monitor_index, state)}."
+        return f"Opened {entry.name}{_placement_summary(resolved_index, state)}."
     except Exception as exc:
         print(f"[open_app] Launch failed ({type(exc).__name__}).")
         return f"Failed to open {app_name} ({type(exc).__name__})."
@@ -782,9 +858,12 @@ TOOL = {
         "installed applications. Never simulates the Start menu or keyboard input. Ordinary "
         "opens focus an existing app instead of duplicating it. Set foreground false to start "
         "or leave an app in the background. Use monitor and state to place the window, for "
-        "example monitor 2 with state fullscreen. Set new_instance true only when the user "
-        "explicitly asks for another instance. Pass arguments to open a URL or document with "
-        "the application, for example Chrome with https://youtube.com. For a web page the "
+        "example monitor 'primary' with state fullscreen, or monitor '2' with state left. "
+        "To open and place several applications in one command, use app_sequence instead so "
+        "each one is opened, waited for, and verified before the next one starts. Set "
+        "new_instance true only when the user explicitly asks for another instance. Pass "
+        "arguments to open a URL or document with the application, for example Chrome with "
+        "https://youtube.com. For a web page the "
         "user wants to look at or work on, prefer browser_control: it opens the same real "
         "browser and can then click, type and read on the page. For Roblox new_instance "
         "attempts a second window, moves it to the opposite monitor when possible, and "
@@ -803,8 +882,14 @@ TOOL = {
                 "description": "Default true. Set false when the user says to open it in the background or without stealing focus."
             },
             "monitor": {
-                "type": "INTEGER",
-                "description": "1-based monitor number to place the window on, when the user names one."
+                "type": "STRING",
+                "maxLength": 40,
+                "description": (
+                    "Which monitor to place the window on, when the user names one: a "
+                    "1-based number ('1', '2'), 'primary'/'main' (the Windows primary "
+                    "display), 'secondary'/'second' (the other display), 'left'/'right' "
+                    "(by physical position), or 'monitor 2'/'display 2'."
+                )
             },
             "state": {
                 "type": "STRING",

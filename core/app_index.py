@@ -776,6 +776,74 @@ def launch(entry: AppEntry, arguments=None) -> int | None:
     raise LaunchError(f"unsupported launch kind: {entry.kind}")
 
 
+_DIRECT_LAUNCH_SUFFIXES = {".lnk", ".exe", ".app", ".desktop", ".url"}
+
+
+def is_direct_launch_target(value: str) -> bool:
+    """True when a spoken name or saved shortcut is itself a launchable path.
+
+    Installed-application discovery only scans Start-menu, registry, and
+    well-known program locations. A personal shortcut such as
+    ``C:\\Users\\jonas\\OneDrive\\Desktop\\YouTube.lnk`` — remembered verbatim by
+    ``shortcut_manager`` — lives on the Desktop, which is never scanned, so it
+    would otherwise be reported as "not an installed application" even though
+    it plainly exists. This is a narrow, explicit check: the text must resolve
+    to an existing file or app bundle with a launchable suffix, not merely any
+    path, so an ordinary document is still handled as an argument rather than
+    as the application itself.
+    """
+    text = str(value or "").strip().strip('"').strip("'")
+    if not text or is_uri(text):
+        return False
+    try:
+        path = Path(text).expanduser()
+    except (OSError, ValueError):
+        return False
+    if path.suffix.casefold() not in _DIRECT_LAUNCH_SUFFIXES:
+        return False
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def launch_path(path: str, arguments=None) -> int | None:
+    """Start a shortcut, executable, or app bundle directly from its path.
+
+    Uses the same shell verb a double-click would use, so a ``.lnk``'s icon,
+    working directory, and real target — all defined inside the shortcut
+    itself — are respected instead of re-derived. Returns the child pid when
+    one is known, the same contract as ``launch()``.
+    """
+    target = Path(str(path or "")).expanduser()
+    if not target.exists():
+        raise LaunchError(f"the shortcut target no longer exists: {target}")
+    argv_extra = sanitise_arguments(arguments)
+    suffix = target.suffix.casefold()
+
+    if suffix == ".exe" and target.is_file():
+        return _spawn([str(target), *argv_extra])
+
+    if argv_extra:
+        raise LaunchError(
+            "this shortcut cannot receive extra arguments; ask me to open the "
+            "document directly instead"
+        )
+
+    if _OS == "Windows":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return None
+    if _OS == "Darwin":
+        completed = subprocess.run(["open", str(target)], capture_output=True, timeout=15)
+        if completed.returncode != 0:
+            raise LaunchError(f"macOS refused to open {target.name}")
+        return None
+    opener = "xdg-open" if shutil.which("xdg-open") else None
+    if opener is None:
+        raise LaunchError("no file opener is available on this system")
+    return _spawn([opener, str(target)])
+
+
 def launch_uri(target: str) -> int | None:
     """Open a URI that is not part of the index (http://, ms-settings:, …)."""
     return launch(AppEntry(name=target, kind=_KIND_URI, target=target, source="direct"))

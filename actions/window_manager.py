@@ -216,10 +216,13 @@ TOOL = {
                 "description": "Application name or part of the window title, such as Chrome or Discord.",
             },
             "monitor": {
-                "type": "INTEGER",
-                "minimum": 1,
-                "maximum": 32,
-                "description": "1-based monitor number.",
+                "type": "STRING",
+                "maxLength": 40,
+                "description": (
+                    "Which monitor: a 1-based number ('1', '2'), 'primary'/'main' "
+                    "(the Windows primary display), 'secondary'/'second' (the other "
+                    "display), 'left'/'right' (by physical position), or 'monitor 2'."
+                ),
             },
             "side": {
                 "type": "STRING",
