@@ -141,6 +141,7 @@ from core.action_loader        import (
     validate_parameters,
 )
 from core.action_runtime       import runtime as action_runtime
+from core.action_batch         import partition_tool_batch
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -1286,6 +1287,50 @@ class JarvisLive:
 
         return out
 
+    def _is_parallel_read_only_tool_call(self, fc) -> bool:
+        """Whether a call can share one provider tool batch without reordering work.
+
+        Only explicitly read-only calls qualify. Desktop/file/browser mutations
+        are still performed in their original order; the action registry also
+        enforces resource leases for requests arriving concurrently from the
+        dashboard or another channel.
+        """
+        name = str(getattr(fc, "name", "") or "")
+        args = getattr(fc, "args", {}) or {}
+        if not isinstance(args, dict):
+            return False
+        if self._action_registry.is_parallel_safe(name, args):
+            return True
+        if name == "system_status":
+            return True
+        if name == "manage_monitor":
+            return str(args.get("action") or "").strip().casefold() == "list"
+        return False
+
+    async def _execute_tool_batch(self, function_calls) -> list[types.FunctionResponse]:
+        """Run adjacent independent read-only calls together, preserving all writes.
+
+        The provider can return several calls in one message. Running every one
+        in parallel would let an open/move/close sequence race itself. We only
+        batch consecutive calls whose fixed resource policy is shared/read-only,
+        and wait for that batch before every mutation, preserving response order.
+        """
+        responses: list[types.FunctionResponse] = []
+        groups = partition_tool_batch(
+            function_calls or (), self._is_parallel_read_only_tool_call
+        )
+        for read_only, calls in groups:
+            if read_only and len(calls) > 1:
+                responses.extend(await asyncio.gather(
+                    *(self._execute_tool(call) for call in calls)
+                ))
+            else:
+                # A read-only group of one and every mutating group retain the
+                # old simple await path, which keeps exceptions/cancellation
+                # behavior identical to the former sequential dispatcher.
+                responses.append(await self._execute_tool(calls[0]))
+        return responses
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         """Track every inline, discovered, and plugin tool call uniformly."""
         if self._readonly_turns_pending > 0:
@@ -1686,7 +1731,10 @@ class JarvisLive:
             traceback.print_tb(e.__traceback__)
             self.speak_error(name, kind)
 
-        if not self.ui.muted:
+        # Parallel read-only calls share a provider batch. Keep THINKING visible
+        # until the last tracked call returns instead of flickering to LISTENING
+        # as soon as the first diagnostic finishes.
+        if not self.ui.muted and len(self._active_action_ids) <= 1:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} completed ({len(str(result))} result characters)")
@@ -2054,11 +2102,10 @@ class JarvisLive:
                                 self._spawn_background(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
+                        function_calls = list(response.tool_call.function_calls or ())
+                        for fc in function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
+                        fn_responses = await self._execute_tool_batch(function_calls)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )

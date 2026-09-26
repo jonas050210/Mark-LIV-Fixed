@@ -46,6 +46,7 @@ from typing import Any, Callable, Optional
 
 from core.action_result import ActionResult
 from core.action_runtime import runtime as action_runtime
+from core.action_scheduler import ActionResourceScheduler
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
@@ -58,6 +59,126 @@ _DEFAULT_STRING_LENGTH = 20_000
 _MAX_ARRAY_LENGTH = 1_000
 _MAX_PARAMETER_BYTES = 1_000_000
 _MAX_SCHEMA_BYTES = 250_000
+
+# The worker pool limits how many Python handlers exist; this scheduler protects
+# the *things* those handlers touch. Claims are deliberately central rather than
+# model-provided metadata, so an LLM can never ask to bypass a desktop/file lock.
+_ACTION_RESOURCES = ActionResourceScheduler()
+_SHARED = "shared"
+_EXCLUSIVE = "exclusive"
+
+
+def _action_verb(parameters: dict | None) -> str:
+    value = (parameters or {}).get("action") if isinstance(parameters, dict) else ""
+    return str(value or "").strip().casefold().replace(" ", "_")
+
+
+def _resource_claims(name: str, parameters: dict | None) -> dict[str, str]:
+    """Return a conservative resource claim for one validated action request.
+
+    Desktop mutations are intentionally serialized. Independent diagnostics and
+    filesystem reads can still overlap, so asking for a lag check while a web
+    search runs does not make either wait. New/unclassified actions fail closed
+    as exclusive desktop work until reviewed here.
+    """
+    action = _action_verb(parameters)
+
+    if name == "pc_status":
+        return {"diagnostics": _SHARED}
+    if name == "desktop_health":
+        return {"desktop": _SHARED, "app_index": _SHARED, "configuration": _SHARED}
+    if name == "web_search":
+        return {"network": _SHARED}
+
+    if name == "app_catalog":
+        return {"app_index": _EXCLUSIVE if action == "refresh" else _SHARED}
+    if name == "app_lifecycle":
+        return {
+            "app_index": _SHARED,
+            "desktop": _EXCLUSIVE if action in {"restart", "relaunch"} else _SHARED,
+        }
+    if name == "open_app" or name == "app_sequence":
+        return {"desktop": _EXCLUSIVE, "app_index": _SHARED}
+    if name == "workspace_manager":
+        if action in {"run", "open", "start"}:
+            return {"desktop": _EXCLUSIVE, "app_index": _SHARED, "workspaces": _EXCLUSIVE}
+        return {"workspaces": _EXCLUSIVE if action in {"save", "create", "update", "delete", "remove", "forget"} else _SHARED}
+
+    if name == "window_manager":
+        read_actions = {"list_windows", "list_monitors", "list_app_windows"}
+        return {"desktop": _SHARED if action in read_actions else _EXCLUSIVE}
+    if name in {"computer_control", "system_control"}:
+        return {"desktop": _EXCLUSIVE, "system": _EXCLUSIVE}
+    if name == "layout_manager":
+        if action in {"list", "show"}:
+            return {"layouts": _SHARED}
+        claims = {"layouts": _EXCLUSIVE}
+        claims["desktop"] = _EXCLUSIVE if action in {"restore", "apply", "load"} else _SHARED
+        return claims
+
+    if name == "audio_manager":
+        read_actions = {"list", "default", "list_system_outputs"}
+        return {"audio": _SHARED if action in read_actions else _EXCLUSIVE}
+    if name == "media_control":
+        return {"media": _EXCLUSIVE}
+    if name == "browser_control":
+        # Browser automation holds process/session state. Even a read call can
+        # race a click/navigation in another request, so one browser lane wins.
+        return {"browser": _EXCLUSIVE}
+    if name == "camera_manager":
+        return {"camera": _SHARED if action in {"status", "get", "show"} else _EXCLUSIVE}
+
+    if name == "file_controller":
+        read_actions = {
+            "list", "read", "find", "recent", "download_status", "largest",
+            "disk_usage", "info",
+        }
+        desktop_actions = {"open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "reveal_recent"}
+        claims = {"filesystem": _SHARED if action in read_actions | desktop_actions else _EXCLUSIVE}
+        if action in desktop_actions:
+            claims["desktop"] = _EXCLUSIVE
+        return claims
+    if name == "file_processor":
+        return {"filesystem": _EXCLUSIVE}
+
+    if name == "session_manager":
+        return {"sessions": _SHARED if action == "list" else _EXCLUSIVE}
+    if name == "shortcut_manager":
+        return {"shortcuts": _SHARED if action in {"list", "resolve"} else _EXCLUSIVE}
+    if name == "reminder":
+        return {"reminders": _SHARED if action == "list" else _EXCLUSIVE}
+
+    # Unknown future actions must not accidentally race desktop input/window
+    # state simply because nobody has assigned their resource policy yet.
+    return {"desktop": _EXCLUSIVE}
+
+
+def _claims_are_read_only(name: str, parameters: dict | None) -> bool:
+    claims = _resource_claims(name, parameters)
+    return bool(claims) and all(mode == _SHARED for mode in claims.values())
+
+
+def _resource_wait_message(claims: dict[str, str]) -> str:
+    labels = {
+        "desktop": "desktop",
+        "filesystem": "file operation",
+        "browser": "browser operation",
+        "audio": "audio-device operation",
+        "camera": "camera operation",
+        "media": "media operation",
+        "system": "system operation",
+        "app_index": "app-index operation",
+        "workspaces": "workspace operation",
+        "layouts": "layout operation",
+        "sessions": "session operation",
+        "shortcuts": "shortcut operation",
+        "reminders": "reminder operation",
+        "configuration": "configuration operation",
+        "network": "network operation",
+        "diagnostics": "diagnostic operation",
+    }
+    resource = next(iter(sorted(claims)), "action")
+    return f"Waiting for another {labels.get(resource, 'computer')} action to finish"
 
 
 class ParameterValidationError(ValueError):
@@ -351,6 +472,14 @@ class ActionRegistry:
         rec = self._actions.get(name)
         return bool(rec and callable(rec.handler))
 
+    def resource_claims(self, name: str, parameters: dict | None = None) -> dict[str, str]:
+        """Expose the fixed scheduler policy for trusted orchestration code."""
+        return dict(_resource_claims(name, parameters)) if self.has(name) else {}
+
+    def is_parallel_safe(self, name: str, parameters: dict | None = None) -> bool:
+        """True only for independent read-only work that may share a tool batch."""
+        return self.has(name) and _claims_are_read_only(name, parameters)
+
     def _ensure_handler(self, rec: ActionRecord) -> str:
         """Load exactly one registered action from its checked startup snapshot.
 
@@ -492,8 +621,41 @@ class ActionRegistry:
                 f"Action '{rec.name}' is unavailable: {load_error}",
                 status="unavailable",
             )
+
+        claims = _resource_claims(rec.name, parameters)
+        deadline = time.monotonic() + rec.timeout_seconds
+        action_id = str(call_ctx.get("action_id") or "")
+
+        def _queued() -> None:
+            if action_id:
+                action_runtime.update(
+                    action_id, status="queued", progress=12,
+                    message=_resource_wait_message(claims),
+                )
+
+        lease = _ACTION_RESOURCES.acquire(
+            claims,
+            cancel_event=cancel,
+            timeout_seconds=max(0.0, deadline - time.monotonic()),
+            on_wait=_queued,
+        )
+        if lease is None:
+            if cancel.is_set():
+                return ActionResult.failure(
+                    rec.name, f"Action '{rec.name}' was cancelled.", status="cancelled"
+                )
+            return ActionResult.failure(
+                rec.name,
+                f"Action '{rec.name}' exceeded its {rec.timeout_seconds:.0f}-second time limit while waiting for a safe execution slot.",
+                status="timed_out",
+            )
+        if action_id:
+            action_runtime.update(action_id, status="running", progress=15,
+                                  message=f"Running {rec.name}")
+
         worker_slots = _ACTION_WORKER_SLOTS
         if not worker_slots.acquire(blocking=False):
+            lease.release()
             return ActionResult.failure(
                 rec.name,
                 "Action worker capacity is busy; wait for existing actions to finish.",
@@ -511,6 +673,10 @@ class ActionRegistry:
             except Exception as exc:  # keep the action worker from escaping
                 box["error"] = exc
             finally:
+                # A timed-out legacy worker can outlive its caller. Keep its
+                # resource lease until it actually exits, rather than letting a
+                # later window/file action race the still-running operation.
+                lease.release()
                 done.set()
                 worker_slots.release()
 
@@ -519,9 +685,9 @@ class ActionRegistry:
                 target=_worker, daemon=True, name=f"action-{rec.name}"
             ).start()
         except Exception:
+            lease.release()
             worker_slots.release()
             raise
-        deadline = time.monotonic() + rec.timeout_seconds
         while not done.wait(0.1):
             if cancel.is_set():
                 return ActionResult.failure(

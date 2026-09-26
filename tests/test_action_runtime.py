@@ -322,22 +322,22 @@ class ActionRuntimeTests(unittest.TestCase):
                 "gate = threading.Event()\n"
                 "entered = threading.Event()\n"
                 "def handler(parameters): entered.set(); gate.wait(5); return 'done'\n"
-                "TOOL = {'name': 'blocked', 'description': 'blocked', 'handler': handler, 'timeout_seconds': 2}\n",
+                "TOOL = {'name': 'pc_status', 'description': 'blocked', 'handler': handler, 'timeout_seconds': 2}\n",
                 encoding="utf-8",
             )
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
-            record = registry.record("blocked")
+            record = registry.record("pc_status")
             original = action_loader._ACTION_WORKER_SLOTS
             action_loader._ACTION_WORKER_SLOTS = threading.BoundedSemaphore(1)
             results = []
             worker = threading.Thread(
-                target=lambda: results.append(registry.execute("blocked", {}))
+                target=lambda: results.append(registry.execute("pc_status", {}))
             )
             try:
                 worker.start()
                 self.assertTrue(record.handler.__globals__["entered"].wait(1))
                 started = time.monotonic()
-                busy = registry.execute("blocked", {})
+                busy = registry.execute("pc_status", {})
                 self.assertEqual(busy.status, "busy")
                 self.assertLess(time.monotonic() - started, 0.2)
             finally:
@@ -346,6 +346,58 @@ class ActionRuntimeTests(unittest.TestCase):
                 action_loader._ACTION_WORKER_SLOTS = original
             self.assertTrue(results)
             self.assertEqual(results[0].status, "succeeded")
+
+    def test_resource_scheduler_serializes_conflicting_desktop_actions(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "desktop_writer.py"
+            path.write_text(
+                "import threading\n"
+                "gate = threading.Event()\n"
+                "first_entered = threading.Event()\n"
+                "calls = []\n"
+                "def handler(parameters):\n"
+                "    calls.append(parameters.get('action'))\n"
+                "    first_entered.set()\n"
+                "    gate.wait(2)\n"
+                "    return 'done'\n"
+                "TOOL = {'name': 'window_manager', 'description': 'writer', "
+                "'parameters': {'type': 'OBJECT', 'properties': {'action': {'type': 'STRING'}}}, "
+                "'handler': handler, 'timeout_seconds': 5}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            results = []
+            first = threading.Thread(
+                target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
+            )
+            first.start()
+            deadline = time.monotonic() + 1
+            record = registry.record("window_manager")
+            while time.monotonic() < deadline:
+                handler = record.handler
+                if handler and handler.__globals__["first_entered"].wait(0.02):
+                    break
+            self.assertTrue(record.handler.__globals__["first_entered"].is_set())
+
+            second = threading.Thread(
+                target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
+            )
+            second.start()
+            time.sleep(0.08)
+            self.assertEqual(record.handler.__globals__["calls"], ["move"])
+            record.handler.__globals__["gate"].set()
+            first.join(2)
+            second.join(2)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result.ok for result in results))
+            self.assertEqual(record.handler.__globals__["calls"], ["move", "move"])
+
+    def test_resource_policy_marks_diagnostics_read_only_and_window_moves_exclusive(self) -> None:
+        from core.action_loader import _resource_claims
+
+        self.assertEqual(_resource_claims("pc_status", {"action": "lag_check"}), {"diagnostics": "shared"})
+        self.assertEqual(_resource_claims("window_manager", {"action": "list_windows"}), {"desktop": "shared"})
+        self.assertEqual(_resource_claims("window_manager", {"action": "move"}), {"desktop": "exclusive"})
 
     def test_legacy_handler_gets_a_deadline(self) -> None:
         with TemporaryDirectory() as temp:

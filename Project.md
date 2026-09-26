@@ -162,9 +162,15 @@ The `core/action_runtime.py` registry stores bounded in-memory run records. It e
 - timestamps;
 - cancellation state.
 
-The dashboard receives action lifecycle events from `main.py` and can show or cancel actions.
+The dashboard receives action lifecycle events from `main.py` and can show or cancel actions. A `queued` action is not abandoned: it is waiting for a conflicting desktop, browser, file, audio, camera, or saved-state operation to release its resource lease.
 
-### 4.4 Confirmation lifecycle
+### 4.4 Safe multitasking
+
+`core/action_scheduler.py` gives registry actions fixed shared/exclusive resource claims. Read-only diagnostics, searches, app-index reads, and safe file reads can overlap. Actions that mutate the same desktop, browser automation session, media session, filesystem, audio device, camera, or saved state wait in a bounded queue instead of racing each other. A cancellation request is observed while queued; a timed-out legacy worker retains its lease until it actually exits, so its delayed side effect cannot collide with the next request.
+
+When Gemini returns multiple calls in one message, `main.py` runs only adjacent, explicitly read-only calls concurrently. It waits for that group before every mutating call and preserves all mutation order. This makes independent checks faster without turning commands such as open, move, maximize, close, write, or delete into unsafe parallel work.
+
+### 4.5 Confirmation lifecycle
 
 High-impact operations cannot rely on a model-provided `confirmed=true` field. The actual process is:
 
@@ -177,17 +183,17 @@ High-impact operations cannot rely on a model-provided `confirmed=true` field. T
 
 A headless process refuses a destructive operation when it cannot display a confirmation interface.
 
-### 4.5 Undo
+### 4.6 Undo
 
 `core/undo.py` stores reversible operations. File and window actions use this shared mechanism where appropriate. Destructive operations are not made safe merely by claiming they are undoable; they also pass through confirmation rules.
 
-### 4.6 Persistence and filesystem boundaries
+### 4.7 Persistence and filesystem boundaries
 
 `core/json_store.py` provides bounded, validated, transactionally locked JSON state with atomic replacement, recovery backups, corruption quarantine, private permissions where supported, and Windows/POSIX advisory locking. Configuration, long-term memory, saved sessions, shortcuts, monitors, and Spotify tokens use this shared primitive rather than independent read/modify/write sequences.
 
 `core/path_policy.py` provides the shared user-folder boundary, protected credential/browser paths, link and Windows reparse-point screening, bounded names and paths, fingerprints, no-replace publication, and race-aware atomic write helpers. File actions, processors, reminder scripts, dashboard uploads, and Explorer operations reuse that policy.
 
-### 4.7 Bounded execution and trusted code
+### 4.8 Bounded execution and trusted code
 
 Action and plugin discovery validates schemas, source locations, file types, permissions, and links before loading trusted local Python. Execution has bounded worker capacity, deadlines, cancellation, bounded results, and sanitized diagnostics. Model-produced Python is not executed: `core/sandbox.py` rejects generated-code execution rather than presenting an AST filter as a security boundary.
 
@@ -891,9 +897,15 @@ Action-registry wrapper around `core.window_manager.py` for listing, focusing, m
 Marks the core directory as a Python package.
 
 #### `core/action_loader.py`
-Discovers action modules, validates strict `TOOL` schemas and trusted source files, exposes capability manifests, applies confirmation/admin/deadline/cancellation policy, bounds worker capacity, and normalizes bounded action results.
+Discovers declarative action manifests without importing every implementation, validates strict `TOOL` schemas and trusted source snapshots, exposes capability manifests, applies confirmation/admin/deadline/cancellation policy, assigns fixed resource claims, bounds worker capacity, and normalizes bounded action results.
 
-It also avoids stale module reuse when separate directories contain files with the same module stem, screens symbolic links/reparse points and unsafe permissions, and reports sanitized load failures.
+It initializes an implementation only on its first real call, verifies that its loaded policy matches the startup manifest, initializes direct bundled-action dependencies from their snapshots, screens symbolic links/reparse points and unsafe permissions, and reports sanitized load failures.
+
+#### `core/action_scheduler.py`
+Shared/exclusive, cancellation-aware resource leases for action handlers. It permits independent read-only work in parallel while serializing conflicting desktop, filesystem, browser, media, audio, camera, and local-state operations. Leases survive caller timeouts until legacy worker threads actually stop.
+
+#### `core/action_batch.py`
+Pure provider-tool batch partitioning: contiguous explicitly read-only calls can share a parallel group; each mutating call remains a one-call ordered group.
 
 #### `core/action_result.py`
 Defines the structured action-result contract. It converts legacy strings to statuses such as succeeded, failed, unavailable, cancelled, and confirmation-pending.
