@@ -428,6 +428,13 @@ class StructuredResultTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("already open", message)
 
+    def test_existing_app_focus_that_cannot_be_verified_is_not_a_success(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[_window()]), \
+             patch.object(open_app, "_focus_window", return_value=False):
+            ok, message = open_app.open_app_result({"app_name": "Chrome"})
+        self.assertFalse(ok)
+        self.assertIn("could not focus", message)
+
     def test_open_app_and_open_app_result_agree_on_the_message(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[]), \
              patch.object(open_app, "_resolve_candidates", return_value=([], True)), \

@@ -342,9 +342,8 @@ def _browser_title_match_may_be_a_web_app(existing, *queries: str) -> bool:
 
 def _focus_window(window) -> bool:
     try:
-        from core.window_manager import operate
-        operate(window, "focus")
-        return True
+        from core.window_manager import focus_window
+        return focus_window(window)
     except Exception as exc:
         print(f"[open_app] could not focus existing window ({type(exc).__name__}).")
         return False

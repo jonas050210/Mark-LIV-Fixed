@@ -9,6 +9,7 @@ from core.window_manager import (
     describe_windows,
     find_window,
     find_windows,
+    focus_window,
     list_windows,
     monitor_for,
     move_to_monitor,
@@ -195,7 +196,10 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         _remember_window(window, label, before)
         return f"Restored {label}."
     if action in {"focus", "switch", "activate"}:
-        operate(window, "focus")
+        if not focus_window(window):
+            return (
+                f"Could not verify focus for {_target_label(window)} after asking it to switch."
+            )
         return f"Switched to {_target_label(window)}."
     if action in {"close", "quit"}:
         # Closing a named window is deterministic and intentionally immediate.

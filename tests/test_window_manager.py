@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from core.window_manager import MonitorInfo, WindowInfo, find_window, place_window, snap_window
+from core.window_manager import MonitorInfo, WindowInfo, find_window, focus_window, place_window, snap_window
 from core import undo as undo_stack
 from actions import window_manager as window_manager_module
 from actions.window_manager import window_manager
@@ -18,6 +18,28 @@ class WindowManagerTests(unittest.TestCase):
         with patch("core.window_manager.list_windows", return_value=windows):
             self.assertEqual(find_window("Discord").handle, 2)
             self.assertEqual(find_window("chrome").handle, 1)
+
+    def test_windows_focus_is_verified_against_the_real_foreground_window(self) -> None:
+        target = WindowInfo(1, "Editor", "editor.exe", 1, 0, 0, 800, 600)
+        other = WindowInfo(2, "Browser", "browser.exe", 2, 0, 0, 800, 600)
+        with patch("core.window_manager._OS", "Windows"), \
+             patch("core.window_manager.operate") as operate, \
+             patch("core.window_manager.foreground_window", return_value=target):
+            self.assertTrue(focus_window(target, timeout=0))
+        operate.assert_called_once_with(target, "focus")
+
+        with patch("core.window_manager._OS", "Windows"), \
+             patch("core.window_manager.operate"), \
+             patch("core.window_manager.foreground_window", return_value=other):
+            self.assertFalse(focus_window(target, timeout=0))
+
+    def test_focus_action_does_not_claim_success_when_focus_cannot_be_verified(self) -> None:
+        window = WindowInfo(1, "Editor", "editor.exe", 1, 0, 0, 800, 600)
+        with patch("actions.window_manager.find_window", return_value=window), \
+             patch("actions.window_manager.focus_window", return_value=False):
+            result = window_manager({"action": "focus", "target": "Editor"})
+        self.assertIn("could not verify", result.casefold())
+        self.assertNotIn("Switched to", result)
 
     def test_window_move_registers_an_undo_snapshot(self) -> None:
         window = WindowInfo(1, "Test", "test.exe", 1, 50, 60, 850, 660)

@@ -12,6 +12,7 @@ import hashlib
 import platform
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -579,13 +580,36 @@ def foreground_window() -> WindowInfo | None:
     return None
 
 
+def focus_window(window: WindowInfo, *, timeout: float = 0.75) -> bool:
+    """Focus a known window and verify it owns input on Windows.
+
+    ``SetForegroundWindow`` may be refused by Windows' foreground-lock rules
+    without raising an exception. Returning a successful call as "switched"
+    in that situation tells the user the wrong thing. Native Windows can report
+    the actual foreground HWND, so poll it briefly after the request. Other
+    desktop backends do not expose equivalent reliable focus state; there a
+    successful backend call remains the strongest honest result available.
+    """
+    operate(window, "focus")
+    if _OS != "Windows":
+        return True
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        current = foreground_window()
+        if current is not None and int(current.handle) == int(window.handle):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def restore_foreground(window: WindowInfo | None) -> bool:
     """Give focus back to a window that was in front before a launch."""
     if window is None:
         return False
     try:
-        operate(window, "focus")
-        return True
+        return focus_window(window)
     except Exception:
         return False
 
