@@ -1,0 +1,21 @@
+# Browser automation, vision, file formats, media, and OS integrations.
+playwright>=1.40,<2
+pillow>=10,<13
+opencv-python>=4.8,<5
+mss>=9,<11
+python-pptx
+openpyxl
+ddgs>=9,<10
+pdfplumber
+pypdf>=6,<7
+python-docx
+defusedxml>=0.7,<1
+nvidia-ml-py>=12,<14
+# MARK LIV is Windows-only; these are unconditional runtime dependencies.
+pylnk3>=0.4,<1
+comtypes
+pycaw
+win10toast
+pywinauto
+pywin32
+wmi

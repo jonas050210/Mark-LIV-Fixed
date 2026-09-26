@@ -148,7 +148,6 @@ class SetDefaultPlaybackDeviceTests(unittest.TestCase):
     def test_a_fuzzy_match_is_applied_through_the_platform_setter(self) -> None:
         devices = [("JBL Quantum 400", "id-1"), ("Realtek Speakers", "id-2")]
         with patch.object(system_audio, "_list_playback_endpoints", return_value=devices), \
-             patch.object(system_audio, "_OS", "Windows"), \
              patch.object(system_audio, "_set_windows_default", return_value=(True, "")) as setter:
             ok, message = system_audio.set_default_playback_device("jbl quantum")
         self.assertTrue(ok)
@@ -158,50 +157,10 @@ class SetDefaultPlaybackDeviceTests(unittest.TestCase):
     def test_a_platform_refusal_is_reported_not_hidden(self) -> None:
         devices = [("JBL Quantum 400", "id-1")]
         with patch.object(system_audio, "_list_playback_endpoints", return_value=devices), \
-             patch.object(system_audio, "_OS", "Windows"), \
              patch.object(system_audio, "_set_windows_default", return_value=(False, "Access denied")):
             ok, message = system_audio.set_default_playback_device("jbl")
         self.assertFalse(ok)
         self.assertEqual(message, "Access denied")
-
-    def test_linux_setter_is_used_on_linux(self) -> None:
-        devices = [("alsa_output.pci-0000_00_1f.3.analog-stereo", "sink-1")]
-        with patch.object(system_audio, "_list_playback_endpoints", return_value=devices), \
-             patch.object(system_audio, "_OS", "Linux"), \
-             patch.object(system_audio, "_set_linux_default", return_value=(True, "")) as setter:
-            ok, _message = system_audio.set_default_playback_device("analog-stereo")
-        self.assertTrue(ok)
-        setter.assert_called_once_with("sink-1")
-
-    def test_macos_setter_is_used_on_macos(self) -> None:
-        devices = [("MacBook Pro Speakers", "MacBook Pro Speakers")]
-        with patch.object(system_audio, "_list_playback_endpoints", return_value=devices), \
-             patch.object(system_audio, "_OS", "Darwin"), \
-             patch.object(system_audio, "_set_macos_default", return_value=(True, "")) as setter:
-            ok, _message = system_audio.set_default_playback_device("macbook")
-        self.assertTrue(ok)
-        setter.assert_called_once_with("MacBook Pro Speakers")
-
-
-class LinuxAndMacosSubprocessTests(unittest.TestCase):
-    """pactl/SwitchAudioSource failures must not be reported as success."""
-
-    def test_pactl_missing_gives_an_empty_list_not_an_exception(self) -> None:
-        with patch.object(system_audio.subprocess, "run", side_effect=FileNotFoundError):
-            self.assertEqual(system_audio._list_linux_playback_devices(), [])
-
-    def test_pactl_set_default_sink_failure_is_reported(self) -> None:
-        import subprocess as real_subprocess
-        bad = real_subprocess.CompletedProcess(["pactl"], 1, "", "no such sink")
-        with patch.object(system_audio.subprocess, "run", return_value=bad):
-            ok, message = system_audio._set_linux_default("nonexistent-sink")
-        self.assertFalse(ok)
-        self.assertTrue(message)
-
-    def test_switchaudiosource_missing_gives_an_empty_list_not_an_exception(self) -> None:
-        with patch.object(system_audio.subprocess, "run", side_effect=FileNotFoundError):
-            self.assertEqual(system_audio._list_macos_playback_devices(), [])
-
 
 if __name__ == "__main__":
     unittest.main()

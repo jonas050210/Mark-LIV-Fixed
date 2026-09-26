@@ -2,6 +2,12 @@ import faulthandler as _faulthandler
 import platform as _platform
 import subprocess as _subprocess
 
+# Fail before importing GUI/audio/provider packages when launched directly on
+# an unsupported host. Importing remains available for mock-based validation.
+if __name__ == "__main__" and _platform.system() != "Windows":
+    print("MARK LIV supports Windows 10 and Windows 11 only.", file=__import__("sys").stderr)
+    raise SystemExit(1)
+
 # Native audio/wake-word libraries can fail below Python's exception machinery.
 # Keep a traceback in stderr so a child-process or dependency problem is
 # diagnosable instead of looking like a random silent exit.
@@ -120,10 +126,19 @@ except Exception as _system_exc:
         return {"available": False, "error": f"System metrics are unavailable: {_SYSTEM_IMPORT_ERROR}"}
 from actions.proactive         import ProactiveEngine
 from core.background_scheduler  import BackgroundScheduler
+from core.diagnostics import record as record_diagnostic
+from core.restart import launch_replacement
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
+
+def _component_log(subsystem: str, message: object) -> None:
+    """Mirror component status to the console and bounded diagnostic buffer."""
+    print(f"[{subsystem.capitalize()}] {message}")
+    record_diagnostic(subsystem, message, level="info")
+
+
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
@@ -605,7 +620,7 @@ class JarvisLive:
         self._action_registry = discover_actions(
             actions_dir=_base_dir / "actions",
             reserved_names=_inline_names,
-            logger=lambda msg: print(f"[Actions] {msg}"),
+            logger=lambda msg: _component_log("actions", msg),
         )
 
         # Plugins must not collide with either an inline tool or a discovered action.
@@ -616,7 +631,7 @@ class JarvisLive:
             # Console gets the full boot transcript; the activity log gets only
             # what the user has to know about. Every plugin loading correctly is
             # the expected case and does not belong in their conversation.
-            logger=lambda msg: print(f"[Plugins] {msg}"),
+            logger=lambda msg: _component_log("plugins", msg),
             notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
@@ -1558,6 +1573,7 @@ class JarvisLive:
                         if self._ptt is not None and hasattr(self._ptt, "stop"):
                             self._ptt.stop()
                     except Exception as exc:
+                        record_diagnostic("restart", "worker cleanup failed", exception=exc)
                         print(f"[JARVIS] Restart cleanup warning ({type(exc).__name__}).")
                     try:
                         if self.session is not None and hasattr(self.session, "close"):
@@ -1565,27 +1581,17 @@ class JarvisLive:
                             if hasattr(result, "__await__"):
                                 await result
                     except Exception as exc:
+                        record_diagnostic("restart", "session close failed", exception=exc)
                         print(f"[JARVIS] Session close warning ({type(exc).__name__}).")
 
-                    import os as _os
-                    env = _os.environ.copy()
-                    env["JARVIS_RESTARTED"] = "1"
-                    if getattr(sys, "frozen", False):
-                        command = [sys.executable]
-                    else:
-                        command = [sys.executable, str(Path(__file__).resolve())]
                     try:
-                        if _platform.system() == "Windows":
-                            flags = getattr(_subprocess, "DETACHED_PROCESS", 0)
-                            flags |= getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                            _subprocess.Popen(command, cwd=str(BASE_DIR), env=env,
-                                              creationflags=flags,
-                                              close_fds=True)
-                        else:
-                            _subprocess.Popen(command, cwd=str(BASE_DIR), env=env,
-                                              start_new_session=True,
-                                              close_fds=True)
+                        launch_replacement(
+                            BASE_DIR,
+                            Path(__file__),
+                            popen=_subprocess.Popen,
+                        )
                     except Exception as exc:
+                        record_diagnostic("restart", "replacement launch failed", level="error", exception=exc)
                         self.ui.write_log(
                             f"ERR: Could not restart MARK LIV ({type(exc).__name__})."
                         )
@@ -2629,12 +2635,17 @@ class JarvisLive:
                 try:
                     error = completed.exception()
                     if error is not None:
+                        record_diagnostic(
+                            "background-task", "auxiliary task failed", level="error", exception=error
+                        )
                         print(
                             f"[JARVIS] Background task failed "
                             f"({type(error).__name__})."
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    record_diagnostic(
+                        "background-task", "task result inspection failed", exception=exc
+                    )
 
         task.add_done_callback(_finished)
         return task
@@ -2926,6 +2937,10 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    if _platform.system() != "Windows":
+        print("MARK LIV supports Windows 10 and Windows 11 only.", file=sys.stderr)
+        raise SystemExit(1)
+
     # A graceful restart lets the old dashboard release its socket before the
     # replacement instance starts binding ports.
     import os

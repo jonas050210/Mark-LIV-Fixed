@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from actions import file_controller, file_processor
+from actions.file_handlers.data import _process_xml
 from core import path_policy, undo
 from core.path_policy import PathPolicyError, resolve_user_path
 
@@ -402,6 +403,24 @@ class FailureReasonTests(unittest.TestCase):
 
         self.assertIn("RuntimeError", _why(RuntimeError()))
         self.assertIn("RuntimeError", _why(RuntimeError("x" * 500)))
+
+    def test_xml_entities_are_rejected_by_the_parser(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            source = Path(directory) / "hostile.xml"
+            source.write_text(
+                '<!DOCTYPE x [<!ENTITY payload "expanded">]><x>&payload;</x>',
+                encoding="utf-8",
+            )
+            result = _process_xml(source, "validate", {})
+        self.assertIn("Invalid XML", result)
+
+    def test_normal_xml_remains_supported(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            source = Path(directory) / "safe.xml"
+            source.write_text("<root><item>value</item></root>", encoding="utf-8")
+            result = _process_xml(source, "validate", {})
+        self.assertIn("Valid XML", result)
+        self.assertIn("root", result)
 
     def test_a_rejected_rename_explains_itself(self) -> None:
         import tempfile

@@ -1,6 +1,6 @@
 # Mark-LIV
 
-MARK LIV is a cross-platform JARVIS-style assistant with an optional local **Hey Jarvis** wake word.
+MARK LIV is a **Windows 10/11** JARVIS-style assistant with an optional local **Hey Jarvis** wake word. Other operating systems may run checkout validation and mocked tests, but they are not supported runtimes.
 
 ## Run
 
@@ -8,6 +8,13 @@ MARK LIV is a cross-platform JARVIS-style assistant with an optional local **Hey
 python setup.py
 python main.py
 ```
+
+`requirements.txt` remains the complete installation used by setup. For focused
+packaging or development, dependencies are also grouped into
+`requirements-core.txt`, `requirements-dashboard.txt`,
+`requirements-desktop.txt`, `requirements-plugins.txt`, and
+`requirements-dev.txt`. The Windows-only CI matrix audits installed dependencies
+on Python 3.11 and 3.13.
 
 Before installing anything, validate the checkout and shipped assets without changing the environment:
 
@@ -46,8 +53,8 @@ MARK LIV launches applications from a real index of what is installed on the
 machine — Windows `App Paths` and Roblox protocol registry entries, Start-menu
 shortcuts, personal Desktop shortcuts (including a OneDrive-redirected Desktop),
 generic Chrome/Edge web apps such as Arena, Twitch, and YouTube, versioned Roblox
-installations, `shell:AppsFolder` package ids, macOS application bundles, and Linux
-desktop entries. Web apps keep their original profile and app-id switches, so they
+installations, and `shell:AppsFolder` package ids. Web apps keep their original
+profile and app-id switches, so they
 open as standalone apps instead of ordinary browser tabs. It never presses the Windows key and types a name into the Start menu,
 so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming

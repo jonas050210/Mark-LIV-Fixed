@@ -1190,7 +1190,7 @@ def _metadata_without_import(
             if isinstance(node, ast.Dict):
                 if any(key is None for key in node.keys):
                     raise _StaticManifestError("dictionary unpacking is not static metadata")
-                return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values)}
+                return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values, strict=False)}
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
                 value = evaluate(node.operand)
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1229,7 +1229,7 @@ def _metadata_without_import(
             return None
         value: dict = {}
         has_handler = False
-        for key_node, value_node in zip(tool_node.keys, tool_node.values):
+        for key_node, value_node in zip(tool_node.keys, tool_node.values, strict=False):
             key = evaluate(key_node)
             if not isinstance(key, str):
                 raise _StaticManifestError("TOOL keys must be strings")

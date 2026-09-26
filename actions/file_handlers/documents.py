@@ -34,9 +34,9 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
                         break
         except ImportError:
             try:
-                import PyPDF2
+                import pypdf
                 with open(path, "rb") as handle:
-                    reader = PyPDF2.PdfReader(handle)
+                    reader = pypdf.PdfReader(handle)
                     for page in islice(reader.pages, max_pages):
                         chunk = (page.extract_text() or "") + "\n"
                         chunks.append(chunk)

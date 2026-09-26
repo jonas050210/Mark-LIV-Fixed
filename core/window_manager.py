@@ -354,6 +354,31 @@ def _windows_refresh_native(device: str) -> int | None:
     return None
 
 
+def _windows_display_is_virtual(device: str) -> bool:
+    """Exclude software-only displays that should never receive desktop windows."""
+    try:
+        user32 = ctypes.windll.user32
+
+        class DISPLAY_DEVICEW(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("DeviceName", ctypes.c_wchar * 32),
+                ("DeviceString", ctypes.c_wchar * 128),
+                ("StateFlags", ctypes.c_ulong),
+                ("DeviceID", ctypes.c_wchar * 128),
+                ("DeviceKey", ctypes.c_wchar * 128),
+            ]
+
+        details = DISPLAY_DEVICEW()
+        details.cb = ctypes.sizeof(details)
+        if user32.EnumDisplayDevicesW(device, 0, ctypes.byref(details), 0):
+            label = f"{details.DeviceString} {details.DeviceID}".casefold()
+            return "meta virtual monitor" in label
+    except Exception:
+        pass
+    return False
+
+
 def _windows_monitors_native() -> list[MonitorInfo]:
     """ctypes monitor fallback when pywin32 is not installed."""
     out: list[MonitorInfo] = []
@@ -375,6 +400,8 @@ def _windows_monitors_native() -> list[MonitorInfo]:
             info = MONITORINFOEX()
             info.cbSize = ctypes.sizeof(info)
             if not user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+                return True
+            if _windows_display_is_virtual(info.szDevice):
                 return True
             m = info.rcMonitor; w = info.rcWork
             out.append(MonitorInfo(
@@ -399,6 +426,8 @@ def _windows_monitors() -> list[MonitorInfo]:
         for handle, _dc, rect in win32api.EnumDisplayMonitors():
             info = win32api.GetMonitorInfo(handle)
             device = info.get("Device", f"DISPLAY{len(out) + 1}")
+            if _windows_display_is_virtual(device):
+                continue
             work = info.get("Work", rect)
             hz = None
             try:

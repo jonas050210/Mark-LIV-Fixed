@@ -8,17 +8,14 @@ or changes files and never interpolates user text into a shell command.
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from core.path_policy import PathPolicyError, resolve_user_path
-from core.user_paths import KNOWN_FOLDER_GUIDS as _KNOWN_FOLDER_GUIDS
 from core.user_paths import locations as _user_locations
 
-_OS = platform.system()
 _LOCATION_ALIASES = {
     "desktop": "desktop", "downloads": "downloads", "download": "downloads",
     "documents": "documents", "document": "documents", "docs": "documents",
@@ -211,22 +208,11 @@ def _windows_flags() -> int:
 def open_in_explorer(path: str | Path, *, select: bool = False) -> str:
     target = resolve_location(path)
     if select and target.exists() and target.is_file():
-        folder = target.parent
-        if _OS == "Windows":
-            subprocess.Popen(["explorer.exe", f"/select,{target}"], creationflags=_windows_flags())
-        elif _OS == "Darwin":
-            subprocess.Popen(["open", "-R", str(target)])
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
+        subprocess.Popen(["explorer.exe", f"/select,{target}"], creationflags=_windows_flags())
         return f"Opened Explorer and selected {target.name}."
     if not target.exists():
         return f"I could not find {target}."
-    if _OS == "Windows":
-        subprocess.Popen(["explorer.exe", str(target)], creationflags=_windows_flags())
-    elif _OS == "Darwin":
-        subprocess.Popen(["open", str(target)])
-    else:
-        subprocess.Popen(["xdg-open", str(target)])
+    subprocess.Popen(["explorer.exe", str(target)], creationflags=_windows_flags())
     return f"Opened {target}."
 
 

@@ -9,7 +9,7 @@ import math
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QConicalGradient, QFont, QPainter, QPen
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
-from ui_panels.base import C, HudPanel, qcol
+from ui_panels.base import C, qcol
 from ui_panels.base import default_accent as _default_accent
 
 
@@ -114,8 +114,10 @@ class CustomizeOverlay(QWidget):
     _OW, _OH = 400, 588
 
     def __init__(self, assistant_name="JARVIS", user_name="",
-                 ui_color=_default_accent(), voice="", parent=None):
+                 ui_color=None, voice="", parent=None):
         super().__init__(parent)
+        if ui_color is None:
+            ui_color = _default_accent()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             CustomizeOverlay {{

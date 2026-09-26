@@ -69,7 +69,7 @@ class SetSystemOutputTests(unittest.TestCase):
         with patch.object(audio_manager.system_audio, "get_default_playback_device",
                            return_value="Realtek Speakers"), \
              patch.object(audio_manager.system_audio, "set_default_playback_device",
-                           return_value=(True, "System audio output switched to JBL Quantum 400.")) as setter:
+                           return_value=(True, "System audio output switched to JBL Quantum 400.")):
             audio_manager.audio_manager({"action": "set_system_output", "device": "jbl"})
 
         with patch.object(audio_manager.system_audio, "set_default_playback_device",

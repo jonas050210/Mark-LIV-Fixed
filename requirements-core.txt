@@ -1,0 +1,14 @@
+# Core HUD, voice session, networking, and desktop interaction.
+PyQt6>=6.6,<7
+sounddevice>=0.4,<1
+numpy>=1.24,<3
+google-genai>=2.8.0,<3
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+pyautogui
+pyperclip
+pywinctl>=0.3,<1
+pygetwindow
+rapidfuzz>=3,<4
+psutil>=5.9,<8
+send2trash

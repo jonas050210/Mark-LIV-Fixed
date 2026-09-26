@@ -3,7 +3,7 @@
 A reminder is handed to the operating system's own scheduler so that it fires
 whether or not MARK LIV is running. Until now that also meant the assistant had
 no record of it: a reminder could only be removed through Task Scheduler,
-launchctl or atrm by hand. These tests cover the registry that closes that gap,
+Windows Task Scheduler by hand. These tests cover the registry that closes that gap,
 and in particular the case that matters most — a cancellation the scheduler
 refuses must be reported as a failure, because the reminder will still fire.
 """
@@ -30,11 +30,10 @@ class ReminderRegistryTests(unittest.TestCase):
         reminder_module.REMINDER_FILE = self.previous
         self.directory.cleanup()
 
-    def _set(self, message: str, *, hours: int = 2, backend=("job-1", "systemd")) -> str:
+    def _set(self, message: str, *, hours: int = 2, backend=("job-1", "schtasks")) -> str:
         when = datetime.now() + timedelta(hours=hours)
-        with patch.object(reminder_module, "_get_os", return_value="linux"), \
-             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
-             patch.object(reminder_module, "_schedule_linux", return_value=backend):
+        with patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_windows", return_value=backend):
             return reminder_module.reminder({
                 "action": "set",
                 "date": when.strftime("%Y-%m-%d"),
@@ -96,26 +95,20 @@ class ReminderRegistryTests(unittest.TestCase):
     def test_a_reminder_whose_time_has_passed_is_pruned(self) -> None:
         reminder_module._write_registry([{
             "id": "old", "when": "2020-01-01 09:00", "message": "ancient",
-            "backend": "systemd", "handle": "old", "script": "",
+            "backend": "schtasks", "handle": "old", "script": "",
         }])
         self.assertIn("no reminders", reminder_module.reminder({"action": "list"}))
 
     def test_the_default_action_still_sets_a_reminder(self) -> None:
         when = datetime.now() + timedelta(hours=3)
-        with patch.object(reminder_module, "_get_os", return_value="linux"), \
-             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
-             patch.object(reminder_module, "_schedule_linux", return_value=("j", "systemd")):
+        with patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_windows", return_value=("j", "schtasks")):
             result = reminder_module.reminder({
                 "date": when.strftime("%Y-%m-%d"),
                 "time": when.strftime("%H:%M"),
                 "message": "no action given",
             })
         self.assertIn("Reminder set", result)
-
-    def test_an_at_job_without_a_number_is_flagged_as_uncancellable(self) -> None:
-        result = self._set("fuzzy", backend=("", "at"))
-        self.assertIn("Reminder set", result)
-        self.assertIn("not be able to cancel", result)
 
     def test_the_tool_declares_the_three_actions(self) -> None:
         enum = reminder_module.TOOL["parameters"]["properties"]["action"]["enum"]
@@ -133,18 +126,13 @@ class ScheduledJobCancellationTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(run.call_args[0][0][:3], ["schtasks", "/Delete", "/TN"])
 
-    def test_at_uses_atrm_with_the_job_number(self) -> None:
-        with patch.object(reminder_module, "_run", return_value=(True, "")) as run:
-            reminder_module._cancel_job({"backend": "at", "handle": "42"})
-        self.assertEqual(run.call_args[0][0], ["atrm", "42"])
-
     def test_an_unknown_backend_fails_loudly(self) -> None:
         ok, detail = reminder_module._cancel_job({"backend": "cron", "handle": "x"})
         self.assertFalse(ok)
         self.assertIn("cron", detail)
 
     def test_a_reminder_without_a_handle_cannot_be_cancelled(self) -> None:
-        ok, detail = reminder_module._cancel_job({"backend": "at", "handle": ""})
+        ok, detail = reminder_module._cancel_job({"backend": "schtasks", "handle": ""})
         self.assertFalse(ok)
         self.assertIn("handle", detail)
 
@@ -180,9 +168,8 @@ class ReminderUndoTests(unittest.TestCase):
         self.directory.cleanup()
 
     def _set(self, message: str = "dentist") -> str:
-        with patch.object(reminder_module, "_get_os", return_value="linux"), \
-             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
-             patch.object(reminder_module, "_schedule_linux", return_value=("77", "systemd")):
+        with patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_windows", return_value=("77", "schtasks")):
             return reminder_module.reminder({
                 "action": "set",
                 "date": self.when.strftime("%Y-%m-%d"),
@@ -196,9 +183,8 @@ class ReminderUndoTests(unittest.TestCase):
             reminder_module.reminder({"action": "cancel", "index": 1})
         self.assertIn("no reminders", reminder_module.reminder({"action": "list"}))
 
-        with patch.object(reminder_module, "_get_os", return_value="linux"), \
-             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
-             patch.object(reminder_module, "_schedule_linux", return_value=("78", "systemd")):
+        with patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_windows", return_value=("78", "schtasks")):
             message = self.undo.undo_last()
         self.assertIn("Restored", message)
         self.assertIn("dentist", reminder_module.reminder({"action": "list"}))
@@ -223,9 +209,8 @@ class ReminderUndoTests(unittest.TestCase):
         self.assertIn("already passed", result)
 
     def test_a_failed_schedule_registers_no_undo(self) -> None:
-        with patch.object(reminder_module, "_get_os", return_value="linux"), \
-             patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
-             patch.object(reminder_module, "_schedule_linux", return_value=("", "")):
+        with patch.object(reminder_module, "_write_notify_script", return_value=self.script), \
+             patch.object(reminder_module, "_schedule_windows", return_value=("", "")):
             reminder_module.reminder({
                 "action": "set",
                 "date": self.when.strftime("%Y-%m-%d"),

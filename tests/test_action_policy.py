@@ -201,7 +201,7 @@ class ReminderSafetyTests(unittest.TestCase):
             home = Path(directory)
             with patch("actions.reminder.Path.home", return_value=home):
                 script = reminder_action._write_notify_script(
-                    "JARVISReminder_test", "quote ' and newline removed", "linux"
+                    "JARVISReminder_test", "quote ' and newline removed"
                 )
             self.assertTrue(script.is_file())
             self.assertEqual(script.parent, home / ".jarvis" / "reminders")

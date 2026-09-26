@@ -1,0 +1,5 @@
+# Optional bundled plugin integrations.
+google-api-python-client
+google-auth-oauthlib
+tinytuya
+paho-mqtt

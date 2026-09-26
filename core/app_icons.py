@@ -11,8 +11,6 @@ path produces a new icon instead of a stale one.
 from __future__ import annotations
 
 import hashlib
-import os
-import platform
 import re
 import shutil
 import subprocess
@@ -20,7 +18,6 @@ from pathlib import Path
 
 from core.app_index import AppEntry
 
-_OS = platform.system()
 BASE_DIR = Path(__file__).resolve().parent.parent
 ICON_DIR = BASE_DIR / "config" / "app_icons"
 ICON_SIZE = 64
@@ -72,81 +69,6 @@ def _from_image_file(path: Path) -> bytes | None:
         return None
 
 
-# ── Linux: XDG icon themes ───────────────────────────────────────────────────
-
-def _linux_icon_file(name: str) -> Path | None:
-    candidate = Path(name)
-    if candidate.is_absolute():
-        return candidate if candidate.is_file() else None
-    roots = [
-        Path.home() / ".local" / "share" / "icons",
-        Path("/usr/share/icons"),
-        Path("/usr/share/pixmaps"),
-        Path("/usr/local/share/icons"),
-    ]
-    wanted = {f"{name}.png", f"{name}.xpm"}
-    for root in roots:
-        if not root.is_dir():
-            continue
-        try:
-            # Prefer a large, explicitly sized directory over the first hit.
-            matches = [
-                path for path in root.rglob("*")
-                if path.name in wanted and path.is_file()
-            ][:200]
-        except OSError:
-            continue
-        if matches:
-            matches.sort(key=lambda path: ("512" in str(path), "256" in str(path),
-                                           "128" in str(path), "64" in str(path)),
-                         reverse=True)
-            return matches[0]
-    return None
-
-
-def _linux_icon_name(desktop_target: str) -> str:
-    """Find the Icon= key for a binary we indexed from a desktop entry."""
-    stem = Path(desktop_target).stem
-    data_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/share:/usr/local/share").split(":")
-    roots = [Path(item) / "applications" for item in data_dirs if item]
-    roots.append(Path.home() / ".local" / "share" / "applications")
-    for root in roots:
-        if not root.is_dir():
-            continue
-        try:
-            entries = sorted(root.glob("*.desktop"))[:2_000]
-        except OSError:
-            continue
-        for path in entries:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")[:64_000]
-            except OSError:
-                continue
-            if f"Exec={stem}" not in text and f"/{stem}" not in text:
-                continue
-            for line in text.splitlines():
-                if line.startswith("Icon="):
-                    return line.split("=", 1)[1].strip()
-    return ""
-
-
-# ── macOS: .icns inside the bundle ───────────────────────────────────────────
-
-def _macos_icon(bundle: Path) -> bytes | None:
-    resources = bundle / "Contents" / "Resources"
-    if not resources.is_dir():
-        return None
-    try:
-        icons = sorted(resources.glob("*.icns"))[:10]
-    except OSError:
-        return None
-    for path in icons:
-        data = _from_image_file(path)
-        if data:
-            return data
-    return None
-
-
 # ── Windows: extract the associated icon via .NET ────────────────────────────
 
 def _windows_icon(target: str, destination: Path) -> bytes | None:
@@ -177,20 +99,9 @@ def _windows_icon(target: str, destination: Path) -> bytes | None:
 
 
 def _extract(entry: AppEntry, destination: Path) -> bytes | None:
-    if entry.kind == "bundle":
-        return _macos_icon(Path(entry.target))
-    if _OS == "Windows":
-        target = entry.target
-        if entry.kind == "lnk":
-            # ExtractAssociatedIcon resolves a shortcut to its target itself.
-            return _windows_icon(target, destination)
-        if entry.kind == "exec":
-            return _windows_icon(target, destination)
-        return None
-    if _OS == "Linux" and entry.kind == "exec":
-        name = _linux_icon_name(entry.target) or Path(entry.target).stem
-        path = _linux_icon_file(name)
-        return _from_image_file(path) if path else None
+    if entry.kind in {"lnk", "exec"}:
+        # ExtractAssociatedIcon resolves Windows shortcuts to their targets.
+        return _windows_icon(entry.target, destination)
     return None
 
 

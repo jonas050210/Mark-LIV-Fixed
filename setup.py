@@ -5,10 +5,10 @@ Use ``python setup.py --check`` for an offline, non-destructive validation of
 Python compatibility, requirements, and shipped assets. Without ``--check``
 the script installs dependencies and optionally downloads Playwright browsers.
 
-Installs the Python dependencies for THIS operating system only: the OS-specific
-packages in requirements.txt carry `sys_platform` markers, so a macOS or Linux
-user never pulls Windows-only libraries (and vice-versa). Then it fetches the
-Playwright browsers needed for web automation (current-OS builds only).
+MARK LIV supports Windows only. Check mode remains portable so contributors and
+CI can validate a checkout without installing or launching the application.
+Normal setup refuses non-Windows hosts before invoking pip. It then installs the
+Windows dependency set and Playwright browsers used for web automation.
 
 Two things it deliberately does NOT install:
   * the optional local wake word ("Hey Jarvis") — one-click, opt-in, from
@@ -94,9 +94,8 @@ def _check_python() -> None:
     if v < MIN_PY:
         print(f"\n❌ Python {v[0]}.{v[1]} detected — MARK LIV needs at "
               f"least Python {MIN_PY[0]}.{MIN_PY[1]}.")
-        print("   Install a supported version and run setup with it, e.g.:")
-        print(f"     py -{MIN_PY[0]}.{MIN_PY[1]} setup.py        (Windows)")
-        print(f"     python{MIN_PY[0]}.{MIN_PY[1]} setup.py      (macOS / Linux)")
+        print("   Install a supported Windows Python version and run setup with it:")
+        print(f"     py -{MIN_PY[0]}.{MIN_PY[1]} setup.py")
         sys.exit(1)
 
 
@@ -121,14 +120,29 @@ def _check_install_inputs() -> None:
     requirements = HERE / "requirements.txt"
     if not requirements.is_file():
         raise FileNotFoundError(f"Missing {requirements}")
-    entries = [
-        line.strip() for line in requirements.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    entries: list[str] = []
+    pending = [requirements]
+    seen: set[Path] = set()
+    while pending:
+        source = pending.pop().resolve()
+        if source in seen:
+            continue
+        seen.add(source)
+        if not source.is_file() or source.parent != HERE:
+            raise FileNotFoundError(f"Missing or unsafe requirements include: {source}")
+        for raw in source.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(("-r ", "--requirement ")):
+                included = line.split(maxsplit=1)[1].strip()
+                pending.append(HERE / included)
+            else:
+                entries.append(line)
     if not entries:
-        raise ValueError("requirements.txt has no dependency entries")
+        raise ValueError("requirements files have no dependency entries")
     _check_assets()
-    print(f"   requirements.txt: {len(entries)} dependency entries")
+    print(f"   requirements: {len(entries)} dependency entries across {len(seen)} files")
     print("   setup inputs and shipped assets are present")
 
 
@@ -138,17 +152,23 @@ def main() -> None:
     _check_python()
     if CHECK_ONLY:
         print("\n🔎 Check-only mode — no packages or browsers will be installed.")
+        if OS != "Windows":
+            print("   Validation-only host: MARK LIV runtime support is Windows-only.")
         _check_install_inputs()
         print("\n✅ Setup check complete!")
         return
 
-    # requirements.txt filters OS-specific extras by itself via pip markers.
+    if OS != "Windows":
+        print("\n❌ MARK LIV supports Windows 10 and Windows 11 only.")
+        print("   This host may run setup.py --check and the mock test suite, but not install or launch MARK LIV.")
+        raise SystemExit(1)
+
+    # requirements.txt aggregates the complete Windows dependency set.
     _run("Installing Python dependencies (OS-specific extras auto-filtered)…",
-         [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+         [sys.executable, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")])
     _replace_deprecated_pynvml()
 
     # Chromium covers Chrome/Edge/Opera/Brave/Vivaldi; Firefox for Firefox.
-    # (Safari automation additionally needs: python -m playwright install webkit)
     # Not fatal: these are a few hundred megabytes from a CDN that a corporate
     # network or a flaky connection can refuse, and everything except browser
     # automation works without them. Failing the whole install there would send
@@ -163,32 +183,15 @@ def main() -> None:
 
     _check_assets()
 
-    # ── OS-specific post-install notes ────────────────────────────────────────
-    if OS == "Windows":
-        try:
-            import win32com.client  # noqa: F401
-        except ImportError:
-            postinstall = Path(sys.executable).parent / "Scripts" / "pywin32_postinstall.py"
-            print(
-                "\n⚠️  pywin32 did not register correctly — desktop-shortcut "
-                "creation will use a slower fallback. To fix it, run:\n"
-                f'    "{sys.executable}" -m pip install --force-reinstall pywin32\n'
-                f'    "{sys.executable}" "{postinstall}" -install'
-            )
-    elif OS == "Linux":
+    try:
+        import win32com.client  # noqa: F401
+    except ImportError:
+        postinstall = Path(sys.executable).parent / "Scripts" / "pywin32_postinstall.py"
         print(
-            "\nℹ️  Linux note — a few voice-controlled OS actions shell out to "
-            "native tools. Install the ones you'll use via your package manager:\n"
-            "    • volume      → pulseaudio-utils   (pactl)\n"
-            "    • brightness  → brightnessctl\n"
-            "    • reminders   → systemd (systemd-run) or 'at'\n"
-            "    • open URLs   → xdg-utils          (xdg-open)"
-        )
-    elif OS == "Darwin":
-        print(
-            "\nℹ️  macOS note — volume, brightness and reminders use the built-in "
-            "'osascript' / LaunchAgents, so no extra tools are required.\n"
-            "    For Safari automation only: python -m playwright install webkit"
+            "\n⚠️  pywin32 did not register correctly — desktop-shortcut "
+            "creation will use a slower fallback. To fix it, run:\n"
+            f'    "{sys.executable}" -m pip install --force-reinstall pywin32\n'
+            f'    "{sys.executable}" "{postinstall}" -install'
         )
 
     print("\n✅ Setup complete!")

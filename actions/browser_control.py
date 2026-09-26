@@ -54,7 +54,7 @@ def _normalize_url(url: str) -> str:
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("Only HTTP and HTTPS web addresses can be opened.")
     try:
-        parsed.port
+        _ = parsed.port
     except ValueError as exc:
         raise ValueError("The web address contains an invalid port.") from exc
     if not parsed.hostname:

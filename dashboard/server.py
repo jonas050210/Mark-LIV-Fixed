@@ -22,6 +22,8 @@ import string
 import time
 from pathlib import Path
 
+from core.diagnostics import record as record_diagnostic
+
 from core.action_runtime import runtime as action_runtime
 from core import app_index
 from core import app_icons
@@ -600,9 +602,12 @@ class DashboardServer:
             self._background_tasks.discard(completed)
             if not completed.cancelled():
                 try:
-                    completed.exception()
-                except Exception:
-                    pass
+                    error = completed.exception()
+                except Exception as exc:
+                    record_diagnostic("dashboard", "background task inspection failed", exception=exc)
+                else:
+                    if error is not None:
+                        record_diagnostic("dashboard", "background task failed", level="error", exception=error)
 
         task.add_done_callback(_finished)
 

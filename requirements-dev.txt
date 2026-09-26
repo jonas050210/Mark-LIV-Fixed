@@ -1,0 +1,7 @@
+# Development-only verification tools. Runtime dependencies remain in requirements.txt.
+-r requirements.txt
+coverage>=7,<8
+httpx2<1                    # FastAPI/Starlette TestClient backend
+ruff>=0.13,<1
+bandit>=1.8,<2
+pip-audit>=2.9,<3
