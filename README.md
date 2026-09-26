@@ -95,6 +95,8 @@ Placement is part of the same request:
 - `Open Chrome on monitor 2 in fullscreen` (also accepts the common voice-transcript spelling `fulscreen`; uses the normal Windows maximize button; taskbar stays visible, never F11)
 - `Open Spotify in the background` (focus stays where it is)
 - `Open Discord snapped left on monitor 1`
+- `Keep Roblox open and minimize the other windows` (one reversible tidy action; say `undo` to put the other windows back)
+- `Show my latest downloads` (lists recent files safely without opening them)
 
 Closing, minimising and switching are always done by window handle. Focus-
 dependent key combinations — `alt+f4`, `command+q`, `ctrl+w`, `alt+tab`, and the

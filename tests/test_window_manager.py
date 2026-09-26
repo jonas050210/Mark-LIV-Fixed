@@ -62,6 +62,40 @@ class WindowManagerTests(unittest.TestCase):
         self.assertIn("taskbar", result)
         undo_stack.clear()
 
+    def test_minimize_others_keeps_named_app_and_registers_one_safe_undo(self) -> None:
+        keep = WindowInfo(1, "Roblox", "roblox.exe", 1, 0, 0, 800, 600)
+        other = WindowInfo(2, "Discord", "discord.exe", 2, 20, 20, 900, 700)
+        already_minimized = WindowInfo(
+            3, "Spotify", "spotify.exe", 3, 40, 40, 840, 640, minimized=True
+        )
+        registered = []
+        with patch("actions.window_manager.find_windows", return_value=[keep]), \
+             patch("actions.window_manager.list_windows", return_value=[keep, other, already_minimized]), \
+             patch("actions.window_manager.push_undo", lambda label, undo: registered.append((label, undo))), \
+             patch("actions.window_manager.operate") as operate:
+            result = window_manager({"action": "minimize_others", "target": "Roblox"})
+
+        calls = [call.args for call in operate.call_args_list]
+        self.assertIn((other, "minimize"), calls)
+        self.assertNotIn((keep, "minimize"), calls)
+        self.assertNotIn((already_minimized, "minimize"), calls)
+        self.assertIn((keep, "focus"), calls)
+        self.assertIn("Say undo", result)
+        self.assertEqual(len(registered), 1)
+
+        live_other = WindowInfo(2, "Discord", "discord.exe", 2, 20, 20, 900, 700, minimized=True)
+        with patch("actions.window_manager.refresh_window", return_value=live_other), \
+             patch("actions.window_manager.operate") as undo_operate:
+            detail = registered[0][1]()
+        undo_calls = [call.args for call in undo_operate.call_args_list]
+        self.assertIn((live_other, "restore"), undo_calls)
+        self.assertIn((live_other, "move", 20, 20, 880, 680), undo_calls)
+        self.assertIn("Restored 1", detail)
+
+    def test_minimize_others_requires_a_named_window_to_keep(self) -> None:
+        result = window_manager({"action": "minimize_others"})
+        self.assertIn("Name the application", result)
+
 
 if __name__ == "__main__":
     unittest.main()
