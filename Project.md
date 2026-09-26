@@ -907,6 +907,9 @@ Shared/exclusive, cancellation-aware resource leases for action handlers. It per
 #### `core/action_batch.py`
 Pure provider-tool batch partitioning: contiguous explicitly read-only calls can share a parallel group; each mutating call remains a one-call ordered group.
 
+#### `core/action_dispatch.py`
+Authenticated dashboard dispatch wrapper. It creates the same live action record used by voice actions, safely supplies trusted local-control context, and leaves confirmation-pending operations open until the user decides.
+
 #### `core/action_result.py`
 Defines the structured action-result contract. It converts legacy strings to statuses such as succeeded, failed, unavailable, cancelled, and confirmation-pending.
 

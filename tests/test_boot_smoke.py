@@ -41,7 +41,7 @@ class ImportSmokeTests(unittest.TestCase):
         import importlib
 
         for name in (
-            "action_batch", "action_loader", "action_runtime", "action_scheduler", "app_index", "app_icons",
+            "action_batch", "action_dispatch", "action_loader", "action_runtime", "action_scheduler", "app_index", "app_icons",
             "background_scheduler", "browser_handoff", "confirm", "json_store",
             "path_policy", "sandbox", "text_match", "undo", "window_manager",
         ):

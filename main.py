@@ -141,6 +141,7 @@ from core.action_loader        import (
     validate_parameters,
 )
 from core.action_runtime       import runtime as action_runtime
+from core.action_dispatch      import run_dashboard_action
 from core.action_batch         import partition_tool_batch
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
@@ -951,21 +952,24 @@ class JarvisLive:
         return inline + self._action_registry.admin_manifest()
 
     def _run_dashboard_action(self, name: str, parameters: dict) -> str:
-        """Run one registered action for a dashboard panel button.
+        """Run one authenticated dashboard action through the live registry.
 
-        Panels go through the same registry as the voice layer, so schema
-        validation, the confirmation gate, the live run list, and undo all
-        apply exactly as they do for a spoken command.  Only actions that are
-        actually registered can be reached.
+        Dashboard routes authenticate before this callback is reachable.  The
+        shared dispatcher records a cancellable dashboard run and supplies the
+        trusted-control context without accepting any model/user confirmation
+        flag as authority.
         """
         if not self._action_registry.has(name):
             return f"'{name}' is not an available action."
-        ctx = {
-            "player": self.ui,
-            "speak": self.speak,
-            "session_memory": None,
-        }
-        return self._action_registry.run(name, parameters, ctx)
+        _action_id, result = run_dashboard_action(
+            self._action_registry,
+            name,
+            parameters,
+            player=self.ui,
+            speak=self.speak,
+            session_memory=None,
+        )
+        return result.as_text()
 
     def _admin_desktop(self) -> dict:
         """Read-only snapshot used by the admin panel; never executes a command."""
