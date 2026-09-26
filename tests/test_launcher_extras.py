@@ -233,6 +233,36 @@ class LayoutManagerTests(unittest.TestCase):
         self.assertIn("Applied layout 'work' to 1 windows", result)
         self.assertIn("Not open", result)
 
+    def test_a_window_whose_saved_monitor_is_gone_is_recentred_not_stale(self) -> None:
+        """If a monitor was unplugged since a layout was saved, a window whose
+        saved monitor index no longer exists must not be moved to its stale
+        absolute coordinates -- which could land it off the one remaining
+        monitor entirely -- but re-centred on monitor 1 instead."""
+        with self._desktop():
+            layout_manager.layout_manager({"action": "save", "name": "work"})
+        recentred = []
+        with patch.multiple(
+            layout_manager,
+            list_windows=lambda: self._windows,
+            list_monitors=lambda: _MONITORS[:1],  # the second monitor is gone
+            monitor_of=lambda window: _MONITORS[0],
+        ), patch.object(layout_manager, "operate"), \
+             patch.object(layout_manager, "monitor_for", return_value=_MONITORS[0]), \
+             patch.object(
+                 layout_manager, "move_to_monitor",
+                 side_effect=lambda window, monitor: recentred.append(window.handle),
+             ), \
+             patch.object(layout_manager, "_match_window",
+                          side_effect=[self._windows[0], self._windows[1]]):
+            result = layout_manager.layout_manager({"action": "apply", "name": "work"})
+        self.assertEqual(
+            recentred, [2],
+            "the window saved on the now-missing second monitor should be "
+            "re-centred on monitor 1, and the other window (saved on the "
+            "still-present monitor 1) should not be touched by that fallback",
+        )
+        self.assertIn("Applied layout 'work' to 2 windows", result)
+
     def test_delete_is_undoable(self) -> None:
         with self._desktop():
             layout_manager.layout_manager({"action": "save", "name": "work"})

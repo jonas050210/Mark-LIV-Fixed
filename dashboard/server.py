@@ -442,10 +442,19 @@ class DashboardServer:
         return True
 
     def _reset_login_attempts(self, identity: str) -> None:
-        if identity in self._login_attempts:
-            self._login_attempts.pop(identity, None)
-        else:
-            self._login_attempts.pop("__overflow__", None)
+        """Clear one identity's failed-attempt history after it authenticates.
+
+        Only ever touches that identity's own bucket. The previous version
+        fell back to clearing the shared "__overflow__" bucket whenever the
+        caller's identity had no bucket of its own — which is the ordinary
+        case for any client succeeding on its first try, not just one that
+        had actually been folded into the overflow bucket. That let an
+        unrelated, freshly-seen client wipe out the rate-limit history the
+        overflow bucket was tracking for every other identity sharing it,
+        once the 255-identity cardinality budget had been reached.
+        """
+        self._login_attempts.pop(identity, None)
+
 
     @staticmethod
     def _ssl_enabled() -> bool:

@@ -74,6 +74,38 @@ class DashboardAuthTests(unittest.TestCase):
         ]
         self.assertIn(429, codes, "brute force was never throttled")
 
+    def test_a_successful_login_never_resets_the_shared_overflow_bucket(self) -> None:
+        """A fresh client's successful login must not reset other clients' limits.
+
+        Once the 255-distinct-identity budget is full, new identities share one
+        "__overflow__" rate-limit bucket. A previous version of
+        _reset_login_attempts cleared that shared bucket whenever the calling
+        identity had no bucket of its own -- which is the ordinary case for
+        any client succeeding on its very first try, not just one that had
+        actually been folded into the overflow bucket. That let one unrelated,
+        freshly-seen client wipe out the throttling protecting every other
+        identity sharing the overflow bucket.
+        """
+        # Fill the identity budget so the next never-before-seen identity is
+        # folded into the shared "__overflow__" bucket.
+        for index in range(255):
+            self.server._login_attempts[f"peer-{index}"] = [time.time()]
+        # Push the overflow bucket itself right up to its own limit.
+        self.server._login_attempts["__overflow__"] = [time.time()] * 9
+        self.assertTrue(self.server._allow_login_attempt("brand-new-peer"))
+        self.assertFalse(
+            self.server._allow_login_attempt("another-new-peer"),
+            "the shared overflow bucket should now be exhausted",
+        )
+        # A successful login from yet another never-before-seen identity must
+        # not touch the shared bucket it was never actually assigned to.
+        self.server._reset_login_attempts("yet-another-new-peer")
+        self.assertFalse(
+            self.server._allow_login_attempt("a-fourth-new-peer"),
+            "a successful login from an unrelated identity reset the shared "
+            "rate limit protecting every other overflow-bucketed identity",
+        )
+
     def test_a_tampered_token_is_rejected(self) -> None:
         headers = self._session("GOOD")
         token = headers["authorization"].removeprefix("Bearer ")
