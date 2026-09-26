@@ -1081,7 +1081,7 @@ def open_explorer(
     try:
         return explorer.open_in_explorer(target, select=select)
     except FileNotFoundError:
-        return f"Explorer is not available on this operating system."
+        return "Explorer is not available on this operating system."
     except Exception as exc:
         return f"Could not open Explorer: {type(exc).__name__}"
 

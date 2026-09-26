@@ -73,7 +73,7 @@ def ensure_ollama_running(timeout: int = 15) -> bool:
             return ok
         except Exception as e:
             print(
-                "[LLM] Cannot reach the configured OpenAI-compatible server.\n"
+                f"[LLM] Cannot reach the configured OpenAI-compatible server ({type(e).__name__}).\n"
                 "      Make sure LM Studio / LocalAI / Jan is running and the server is started."
             )
             return False
@@ -333,7 +333,7 @@ def call_llm(
             "tool_calls": msg.get("tool_calls") or [],
         }
     except requests.exceptions.ConnectionError as e:
-        print("[LLM] Connection error; trying to restart Ollama.")
+        print(f"[LLM] Connection error ({e}); trying to restart Ollama.")
         if ensure_ollama_running():
             try:
                 resp = requests.post(endpoint, json=payload, timeout=timeout)
@@ -603,7 +603,7 @@ def call_llm_stream(
     try:
         yield from _do_stream()
     except requests.exceptions.ConnectionError as e:
-        print("[LLM] Stream connection error; trying to restart Ollama.")
+        print(f"[LLM] Stream connection error ({e}); trying to restart Ollama.")
         if ensure_ollama_running():
             yield from _do_stream()
             return

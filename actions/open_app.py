@@ -15,17 +15,10 @@ from core.app_index import (
     meaningful_terms,
     normalize_key,
     resolve as resolve_app,
-    sanitise_arguments as _sanitise_arguments,
     score_entry,
 )
 from core.shortcut_store import resolve as resolve_shortcut
 from core.text_match import ratio as _text_ratio
-
-try:
-    import psutil
-    _PSUTIL = True
-except ImportError:
-    _PSUTIL = False
 
 _SYSTEM = platform.system()
 

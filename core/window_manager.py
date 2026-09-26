@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import os
 import platform
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from core.text_match import partial_ratio
 

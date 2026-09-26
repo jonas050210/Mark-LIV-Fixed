@@ -8,7 +8,7 @@
 
 > **Note:** §1–§19 below are the unedited record of the session that produced them. §20 documents a later, separate session's three rounds of work (sequential multi-app launching hardening, system-wide audio output switching, and a second deep bug hunt) and is the most current source for test/coverage numbers and known limitations.
 
-`README.md` is the concise user-facing setup guide. `readme.md` contains extended product and visual-design notes. This file is the engineering and project-history reference.
+`README.md` is the concise user-facing setup guide (its accurate, license-relevant content — the avatar, third-party asset attribution, and license section — was merged in from `readme.md`, which was then removed to fix the same Windows/macOS case-collision risk described in §19; see §19.9). This file is the engineering and project-history reference.
 
 ---
 
@@ -773,7 +773,7 @@ This engineering record: current architecture, security decisions, complete trac
 Canonical concise project guide. It covers installation, setup check mode, overall verification, dashboard behavior, Roblox behavior, Explorer behavior, optional capabilities, Spotify notes, and safety rules.
 
 #### `readme.md`
-Extended product and visual-design notes inherited from the broader MARK LIV product documentation. It now points readers to `README.md` for current supported behavior.
+Removed (see §19.9): it was upstream-template marketing copy describing features this fork does not have (WhatsApp/Telegram messaging, a flight finder, a game updater, YouTube playback control) alongside content that was accurate and not yet duplicated elsewhere (the avatar/lip-sync description, the `face_model.obj` third-party attribution, the license statement). The accurate parts were merged into `README.md`; the rest was dropped rather than carried forward inaccurately.
 
 #### `requirements.txt`
 Python dependency specification, grouped by core, optional, OS-specific, dashboard, document, browser, and plugin capabilities. Its `pylnk3` documentation now reflects the split between argument-free executable resolution and parameter-preserving PWA shortcuts.
@@ -1584,21 +1584,21 @@ failure rather than silently doing nothing.
   cross-device move/rollback path, `open_app`'s launch-type diagnosis,
   `resolve_monitor_token`, `desktop_health`, `config_manager`) found no
   further functional defects.
-- **A pre-existing, unrelated finding worth recording even though it was
-  out of scope to fix here**: this repository already ships both
-  `README.md` and `readme.md`, and — after this session's own §19.6 below
-  was drafted — both `Project.md` and a would-be `project.md`. On a
-  case-sensitive filesystem (Linux, and GitHub's own storage) these coexist
-  without issue; on a case-insensitive one (Windows' default NTFS
-  configuration, and macOS' default APFS) two files differing only by case
-  in the same directory collide. Since this project's own stated priority
-  is Windows first, that is a real defect for anyone checking this repository
-  out there, not merely a style issue. It was **not** fixed as part of this
-  bug hunt: `README.md`/`readme.md` predate both agent sessions entirely and
-  are outside the explicit scope given for this pass, and resolving it means
-  deciding which of two differently-authored documents to keep, rename, or
-  merge — a product decision, not a bug fix, and one left for the project
-  owner.
+- **A pre-existing, unrelated finding, reported to the project owner and
+  since resolved (§19.9)**: this repository already shipped both
+  `README.md` and `readme.md`, and — before this section was folded in here
+  — both `Project.md` and a would-be `project.md`. On a case-sensitive
+  filesystem (Linux, and GitHub's own storage) these coexist without issue;
+  on a case-insensitive one (Windows' default NTFS configuration, and
+  macOS' default APFS) two files differing only by case in the same
+  directory collide. Since this project's own stated priority is Windows
+  first, that was a real defect for anyone checking this repository out
+  there, not merely a style issue. Both collisions predated either agent
+  session and were outside the scope of this bug hunt to resolve
+  unilaterally, since resolving them meant deciding which of two
+  differently-authored documents to keep, rename, or merge — a product
+  decision, not a bug fix. The project owner was asked and chose to merge
+  both pairs; see §19.9 for what was actually kept from each.
 
 ### 19.6 File-by-file summary (this session's three rounds)
 
@@ -1655,16 +1655,47 @@ With every `requirements.txt` dependency actually installed in the sandbox:
   lack of the system `libGL.so.1` library; this is a sandbox limitation, not
   a code defect, and the same paths are expected to run normally wherever
   PyQt6 already ships working OpenGL bindings.
-- The `README.md`/`readme.md` case-collision noted in §19.5 remains
-  unresolved, pending a decision from the project owner.
+- The `README.md`/`readme.md` case-collision noted in §19.5 was resolved
+  the same session it was reported; see §19.9.
 - Everything else stated in §17 ("Remaining work") and the "What cannot be
   verified here" / "What is still unverified" passages in §12–§13 still
   applies unchanged: no physical Windows desktop, no real audio hardware,
   no Roblox, and no wake-word model were available to either session.
 
+### 19.9 Resolving both same-name-different-case collisions
+
+Reported in §19.5 as found-but-out-of-scope, both collisions were resolved
+once the project owner confirmed a direction, using the same approach for
+each: keep one canonical, correctly-cased file; fold in whatever content
+from the other one was still accurate and not yet covered; discard the
+rest rather than carry it forward inaccurately.
+
+- **`Project.md` / `project.md`**: this section (§19, all of it) is exactly
+  that merge — a standalone `project.md` summarizing this session's three
+  rounds was folded into the pre-existing `Project.md` as §19, and the
+  standalone file was deleted. Nothing was lost; see §19.6 for the
+  file-by-file mapping.
+- **`README.md` / `readme.md`**: `readme.md` turned out to be the upstream
+  fork template's marketing copy, describing features this codebase does
+  not have — WhatsApp/Telegram messaging, a flight finder, a YouTube voice-
+  control action, a Steam/Epic game updater, an incorrect `git clone` URL
+  pointing at the upstream template repository rather than this fork, and a
+  "Connect with the Creator" section naming the upstream author, none of
+  which apply here. Copying that over would have made `README.md` actively
+  misleading, which conflicts with the project's own "never claim what it
+  cannot do" principle (§20 below). What `readme.md` also contained, and
+  what genuinely was missing from `README.md`, was kept: a factual (not
+  marketing-toned) description of the software-rendered avatar and its
+  lip-sync, the `core/face_model.obj` third-party attribution (MediaPipe,
+  Apache License 2.0 — a real attribution obligation for a file this
+  repository actually ships, not optional content), and a license section
+  matching this repository's actual `LICENSE` file (CC BY-NC 4.0). `readme.md`
+  was then deleted.
+
 ---
 
 ## 20. Final project principle
+
 
 MARK LIV should prefer:
 

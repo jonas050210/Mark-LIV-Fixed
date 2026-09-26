@@ -140,3 +140,30 @@ Configuration, memory, shortcuts, and Spotify tokens use locked atomic JSON tran
 Plugins are executable Python and must be treated as trusted local code. Discovery isolates import failures so one broken plugin cannot stop startup, rejects symbolic links and group/world-writable plugin files, validates schemas, and applies deadlines plus structured result handling.
 
 Your API keys and runtime memory are intentionally ignored by Git. Never commit `config/api_keys.json`, Spotify tokens, certificates/private keys, or personal data from `memory/`.
+
+## Avatar
+
+The HUD's centrepiece is a small animated head, rendered entirely in software with `QPainter` — no GPU, no OpenGL, no extra dependency beyond the PyQt6/NumPy the app already needs. The face geometry itself is a single 25 KB asset (see Third-party assets below); the skull, rig, and lighting are generated at startup. Mouth shapes are derived from both the audio (formants, so it works the same regardless of language) and the transcript (needed to distinguish sounds like /m/, /b/, /p/ that look identical in a spectrum but not on a face). The avatar also functions as a status indicator — it looks away while thinking, meets your eyes while listening, and its lids fall while asleep. `⚙ → HUD` can swap it for a simpler reactor-core centrepiece instead, for anyone who would rather not have a face looking back.
+
+## Third-party assets
+
+| Asset | Source | Licence |
+| --- | --- | --- |
+| `core/face_model.obj` | [MediaPipe](https://github.com/google-ai-edge/mediapipe) canonical face model — 468 vertices of measured human face geometry | Apache License 2.0 |
+
+## Your data
+
+Everything stays on the local machine — there is no MARK LIV server, telemetry, or account.
+
+| What | Where | Notes |
+|---|---|---|
+| Gemini API key, plugin credentials | `config/api_keys.json` | Plaintext; anyone with the user account can read it. Treat it like a password file. |
+| Dashboard TLS certificate and private key | `config/certs/` | Generated locally, self-signed, never leaves the machine. |
+| What the assistant remembers | `memory/long_term.json` | Delete the file to make it forget everything. |
+
+All three are listed in `.gitignore`. If `config/api_keys.json` was ever committed to a public remote, revoke that key at [aistudio.google.com](https://aistudio.google.com/app/apikey) and issue a new one — removing the file in a later commit does not remove it from history. Voice audio is streamed to the configured Gemini/LLM backend while a session is open; that is the one thing that leaves the machine, and it stops when the app is muted or closed.
+
+## License
+
+Personal and non-commercial use only, under [Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — see `LICENSE` for the full text.
+

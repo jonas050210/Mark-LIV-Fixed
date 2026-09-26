@@ -482,9 +482,9 @@ class DashboardServer:
         A socket that was accepted with a token now revoked would otherwise
         keep receiving broadcasts for as long as it stayed connected.
         """
-        for socket in list(self._clients) + list(self._phone_clients):
+        for client_ws in list(self._clients) + list(self._phone_clients):
             try:
-                await socket.close(code=1008)
+                await client_ws.close(code=1008)
             except Exception:
                 pass
         self._clients.clear()

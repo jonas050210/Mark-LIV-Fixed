@@ -9,7 +9,6 @@ from core.window_manager import (
     describe_windows,
     find_window,
     find_windows,
-    list_monitors,
     list_windows,
     monitor_for,
     move_to_monitor,

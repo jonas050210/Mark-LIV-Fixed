@@ -4,7 +4,7 @@ import platform
 import time
 from pathlib import Path
 
-from core.path_policy import PathPolicyError, atomic_create_bytes, resolve_user_path
+from core.path_policy import atomic_create_bytes, resolve_user_path
 
 try:
     import pyautogui
