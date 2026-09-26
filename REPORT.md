@@ -1,6 +1,6 @@
 # MARK LIV — Fix- & Verbesserungsreport (Kurzformat)
 
-**Datum:** 26.09.2026 · **Branch:** `arena/01a0dd3a-mark-liv-fixed` · **Status:** ✅ fertig, 693 Tests grün, Linter sauber
+**Datum:** 26.09.2026 · **Branch:** `arena/01a0dd3a-mark-liv-fixed` · **Status:** ✅ Runde 1 + Runde 2 fertig · 713 Tests grün, Linter sauber
 
 ---
 
@@ -52,13 +52,33 @@ Dein Mitschnitt (YouTube geöffnet → „Mache es Fullscreen auf meinen ersten 
 | 12 | 📖 Doku | `README.md` | Abschnitt „Desktop control" erweitert | Verhalten dokumentiert |
 | 13 | ✅ Tests | `tests/test_window_discovery.py` (neu), `test_boot_smoke.py`, `test_ui_panels.py` | **20 neue Tests** für alle Fixes | Regressionsschutz |
 
-**Testergebnis:** 693 Tests, alle grün (3 vorbestehende Umgebungsfehler: `defusedxml` fehlt ×2, `core/explorer._OS` ×1 — identisch auf `main`, nicht durch diese Änderung). `ruff check .` sauber.
+**Testergebnis (Runde 1):** 693 Tests, alle grün (3 vorbestehende Umgebungsfehler: `defusedxml` fehlt ×2, `core/explorer._OS` ×1 — identisch auf `main`, nicht durch diese Änderung). `ruff check .` sauber.
 
-## 5) Nächste Verbesserungsvorschläge (noch nicht umgesetzt)
+## 5) Runde 2 — umgesetzte Verbesserungen
 
-1. **Fenster-Events statt Polling** (WinEventHook): JARVIS reagiert sofort auf Öffnen/Schließen/Titelwechsel — kein Warten mehr, kein Retry nötig.
-2. **Tab-Bewusstsein:** Browser via CDP/Playwright auslesen, damit „der YouTube-Tab" unter 20 offenen Tabs gezielt ansprechbar ist (nicht nur das Fenster).
-3. **Suchfeld im Einstellungen-Drawer:** Die Schalterliste wächst — ein Filter würde die Navigation beschleunigen.
-4. **Confirm-Banner mit Tastatur** (J/N) — für die verbleibenden Bestätigungen (PC-Aus, WLAN).
-5. **Deutsches Wake-Word-Modell** (openWakeWord custom), damit „Jarvis" zuverlässiger reagiert.
-6. **Pro-App-Lautstärke** (Windows Volume-Mixer): „Mach Spotify leiser, aber YouTube lauter" — ohne Systemlautstärke.
+| # | Typ | Datei(en) | Änderung | Nutzen |
+|---|-----|-----------|----------|--------|
+| 14 | ⚡ Perf | `core/window_events.py` (neu) | **WinEvent-Pumpe:** abonniert die OS-Fenster-Events (Öffnen/Schließen/Titel/Move/Fokus) | Kein Polling mehr — Reaktionen sofort |
+| 15 | ⚡ Perf | `core/window_manager.py`, `actions/`, `main.py` | Alle Warteschleifen wachen per Event auf (statt fixer Sleep); Fensterliste wird zwischen Events gecacht | „Fullscreen" kommt Sekundenbruchteile früher; Enumeration wird gratis |
+| 16 | ✨ Feature | `actions/audio_manager.py` | **Pro-App-Lautstärke** über den Windows-Mixer: `list app volumes`, `Spotify 50`, `Discord leiser`, `mute Chrome` — mit Undo | Eine App lauter/leiser ohne alles andere zu ändern |
+| 17 | 🎨 GUI | `ui_panels/confirm.py` | Confirm-Banner per **[Y]/[N]**-Taste beantwortbar (Fokus-sicher: klaut keine Tasten aus dem Eingabefeld) | PC-Aus/WLAN schneller bestätigen |
+| 18 | 🎨 GUI | `ui.py` | **Suchfeld im Einstellungen-Drawer** (Filter „wa" → Wake Word, „au" → Audio…) | 15 Buttons in 2 Tasten gefunden |
+| 19 | 🎨 GUI | `ui_panels/windows.py` | OPEN-WINDOWS-Panel aktualisiert sich live (2 s, nur bei echten Änderungen — kein Flackern) | Liste bleibt aktuell, solange offen |
+
+**Details:**
+- **WinEventHook:** Ein Daemon-Thread installiert `SetWinEventHook` (OUTOFCONTEXT, eigene Prozesse ausgeschlossen) und betreibt eine Message-Loop. Der Callback ist minimal (Zähler + Event), enumeriert nie selbst. Läuft der Hook nicht (Linux/Fehler), verhält sich alles exakt wie vorher (Schlafen statt Warten, kein Cache). Der eigene Fenster-Cache wird bei eigenen Aktionen synchron geleert — die Verifikation nach einem Move liest nie alte Geometrie.
+- **Pro-App-Lautstärke:** pycaw (bereits Abhängigkeit). Matching per Prozessname (exakt → Teilstring → scharfes Fuzzy ≥ 0,75). Mehrere Sessions einer App (z. B. Chrome) werden alle angepasst. `None` (pycaw fehlt) wird von `[]` (nichts spielt) unterschieden — ehrliche Meldungen. Undo stellt alte Werte wieder her; tote Sessions werden übersprungen, nicht behauptet.
+
+## 6) Testergebnis Runde 2
+
+- **713 Tests, alle grün** (3 vorbestehende Umgebungsfehler wie auf `main`: `defusedxml` ×2, `core/explorer._OS` ×1 — nicht durch diese Änderungen).
+- Neu: `tests/test_window_events.py` (8 Tests: Fallback-Sleep, Revision, Cache-Gültigkeit/-Invalidierung, Bypass ohne Hook) und 12 Per-App-Volume-Tests in `tests/test_audio_manager.py` (fake pycaw-Modul, Setzen/Clamp/Mute/Undo/Mehrdeutigkeit/ehrliche Fehler).
+- `ruff check .` sauber.
+
+## 7) Weitere Verbesserungsvorschläge (offen)
+
+1. **Tab-Bewusstsein:** Browser via CDP auslesen, damit „der YouTube-Tab" unter 20 offenen Tabs gezielt ansprechbar ist (nicht nur das Fenster).
+2. **Deutsches Wake-Word-Modell** (openWakeWord custom), damit „Jarvis" zuverlässiger reagiert.
+3. **Dashboard-Fernsteuerung:** OPEN-WINDOWS-Panel auch ins Phone-Dashboard legen (per-window Fokus/Close existiert dort schon; die Backend-Diagnosezeile fehlt).
+4. **Mikrofon-Routing pro Befehl** (z. B. Kommunikation vs. Standard) — erweiterbar über `audio_manager`.
+

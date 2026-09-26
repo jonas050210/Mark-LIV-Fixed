@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import window_events
 from core.text_match import partial_ratio
 
 _OS = platform.system()
@@ -311,9 +312,41 @@ def _windows_wmctrl() -> list[WindowInfo]:
     return out
 
 
+# Cache for list_windows when desktop events are flowing: (revision, stamp,
+# windows). The TTL is belt-and-braces — an event we do not hook should not
+# be able to keep a stale list alive for a whole session.
+_WINDOW_CACHE: tuple[int, float, list[WindowInfo]] | None = None
+_WINDOW_CACHE_TTL = 5.0
+
+
 def list_windows() -> list[WindowInfo]:
-    """Return visible titled windows, ordered as the desktop reports them."""
+    """Return visible titled windows, ordered as the desktop reports them.
+
+    When the WinEvent pump is running, the list is cached between desktop
+    events: nothing changed, so re-enumerating and re-resolving every process
+    name would buy nothing. Geometry events invalidate the cache too, and
+    ``operate`` clears it synchronously — the OS event for our own move can
+    arrive after a caller has already re-read the window to verify it.
+    """
+    global _WINDOW_CACHE
+    if window_events.active():
+        cached = _WINDOW_CACHE
+        now = time.monotonic()
+        if (
+            cached is not None
+            and cached[0] == window_events.revision()
+            and now - cached[1] < _WINDOW_CACHE_TTL
+        ):
+            return list(cached[2])
+        windows = _windows()
+        _WINDOW_CACHE = (window_events.revision(), now, windows)
+        return list(windows)
     return _windows()
+
+
+def _invalidate_window_cache() -> None:
+    global _WINDOW_CACHE
+    _WINDOW_CACHE = None
 
 
 def _parse_xrandr_monitors() -> list[MonitorInfo]:
@@ -664,7 +697,9 @@ def watch_launched_window(label: str, timeout: float = 6.0) -> None:
             deadline = time.monotonic() + max(1.0, float(timeout))
             settled_since: float | None = None
             while time.monotonic() < deadline:
-                time.sleep(0.25)
+                # Wake the instant the desktop reports a new or re-titled
+                # window rather than after the full poll interval.
+                window_events.wait_for_change(0.25)
                 windows = list_windows()
                 new = [w for w in windows if _window_key(w) not in before]
                 browser_new = [w for w in new if _is_browser_process(w.process)]
@@ -742,6 +777,9 @@ def _desktop_window_for(info: WindowInfo):
 
 
 def operate(window: WindowInfo, operation: str, *args) -> None:
+    # Our own change: the OS event for it can arrive after a caller has
+    # already re-read the window to verify the result, so drop the cache now.
+    _invalidate_window_cache()
     if _OS == "Windows":
         _native_window(window.handle, operation, *args)
         return

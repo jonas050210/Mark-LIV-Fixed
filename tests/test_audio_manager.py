@@ -146,8 +146,186 @@ class UnknownActionTests(unittest.TestCase):
     def test_an_unrecognised_action_lists_every_valid_one(self) -> None:
         result = audio_manager.audio_manager({"action": "does_not_exist"})
         for action in ("list", "set_input", "set_output", "default",
-                       "list_system_outputs", "set_system_output"):
+                       "list_system_outputs", "set_system_output",
+                       "list_app_volumes", "set_app_volume"):
             self.assertIn(action, result)
+
+
+# ── Per-app volume (Windows volume mixer) ────────────────────────────────────
+
+class _FakeVolume:
+    def __init__(self, level: float = 0.8, muted: bool = False):
+        self.level = float(level)
+        self.muted = bool(muted)
+        self.calls: list[tuple] = []
+
+    def GetMasterVolume(self) -> float:
+        return self.level
+
+    def SetMasterVolume(self, level, ctx=None) -> None:
+        self.level = float(level)
+        self.calls.append(("set", float(level)))
+
+    def GetMute(self) -> bool:
+        return self.muted
+
+    def SetMute(self, muted, ctx=None) -> None:
+        self.muted = bool(muted)
+        self.calls.append(("mute", bool(muted)))
+
+
+class _FakeProcess:
+    def __init__(self, name: str, pid: int):
+        self._name = name
+        self.pid = pid
+
+    def name(self) -> str:
+        return self._name
+
+
+class _FakeSession:
+    def __init__(self, name: str, pid: int, level: float = 0.8, muted: bool = False):
+        self.Process = _FakeProcess(name, pid)
+        self.SimpleAudioVolume = _FakeVolume(level, muted)
+
+
+def _session_dict(session: _FakeSession) -> dict:
+    """The dict audio_manager builds from a raw pycaw session, for tests that
+    patch _app_sessions directly instead of going through the fake module."""
+    control = session.SimpleAudioVolume
+    name = session.Process._name
+    return {
+        "name": name,
+        "stem": audio_manager._norm_name(name.rsplit(".", 1)[0]),
+        "pid": session.Process.pid,
+        "level": control.level,
+        "muted": control.muted,
+        "control": control,
+    }
+
+
+class SessionReadingTests(unittest.TestCase):
+    def test_sessions_are_read_with_name_level_and_mute(self) -> None:
+        import sys
+        import types
+
+        raw = [
+            _FakeSession("spotify.exe", 101, level=0.8),
+            _FakeSession("chrome.exe", 102, level=0.4, muted=True),
+        ]
+        utilities = types.SimpleNamespace(GetAllSessions=lambda: raw)
+        fake_inner = types.ModuleType("pycaw.pycaw")
+        fake_inner.AudioUtilities = utilities
+        fake_outer = types.ModuleType("pycaw")
+        fake_outer.pycaw = fake_inner
+
+        with patch.dict(sys.modules, {"pycaw": fake_outer, "pycaw.pycaw": fake_inner}):
+            sessions = audio_manager._app_sessions()
+
+        self.assertIsNotNone(sessions)
+        self.assertEqual([s["stem"] for s in sessions], ["spotify", "chrome"])
+        self.assertEqual(sessions[0]["level"], 0.8)
+        self.assertTrue(sessions[1]["muted"])
+        self.assertEqual(sessions[0]["control"].level, 0.8)
+
+    def test_missing_pycaw_reports_unavailable_not_empty(self) -> None:
+        import sys
+
+        with patch.dict(sys.modules, {"pycaw": None, "pycaw.pycaw": None}):
+            self.assertIsNone(audio_manager._app_sessions())
+        result = audio_manager.audio_manager({"action": "list_app_volumes"})
+        self.assertIn("unavailable", result)
+        self.assertIn("pycaw", result)
+
+
+class SetAppVolumeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        undo.clear()
+        self.spotify = _FakeSession("spotify.exe", 101, level=0.8)
+
+    def tearDown(self) -> None:
+        undo.clear()
+
+    def _run(self, parameters: dict, sessions=None):
+        with patch.object(audio_manager, "_app_sessions",
+                          return_value=sessions if sessions is not None
+                          else [_session_dict(self.spotify)]):
+            return audio_manager.audio_manager(parameters)
+
+    def test_a_percentage_sets_that_level_and_registers_undo(self) -> None:
+        result = self._run({"action": "set_app_volume", "app": "Spotify", "value": "50"})
+        self.assertIn("50%", result)
+        self.assertAlmostEqual(self.spotify.SimpleAudioVolume.level, 0.5)
+        self.assertEqual(undo.history(), ["changed Spotify's volume"])
+
+    def test_undo_restores_the_previous_level(self) -> None:
+        self._run({"action": "set_app_volume", "app": "Spotify", "value": "20"})
+        self.assertAlmostEqual(self.spotify.SimpleAudioVolume.level, 0.2)
+        with patch.object(audio_manager, "_app_sessions",
+                          return_value=[_session_dict(self.spotify)]):
+            undo.undo_last()
+        self.assertAlmostEqual(self.spotify.SimpleAudioVolume.level, 0.8)
+
+    def test_up_and_down_clamp_at_the_ends(self) -> None:
+        loud = _FakeSession("spotify.exe", 101, level=0.95)
+        self._run({"action": "set_app_volume", "app": "Spotify", "value": "up"},
+                  sessions=[_session_dict(loud)])
+        self.assertAlmostEqual(loud.SimpleAudioVolume.level, 1.0)
+
+        quiet = _FakeSession("spotify.exe", 102, level=0.05)
+        self._run({"action": "set_app_volume", "app": "Spotify", "value": "down"},
+                  sessions=[_session_dict(quiet)])
+        self.assertAlmostEqual(quiet.SimpleAudioVolume.level, 0.0)
+
+    def test_mute_and_unmute(self) -> None:
+        result = self._run({"action": "set_app_volume", "app": "Spotify", "value": "mute"})
+        self.assertIn("Muted Spotify", result)
+        self.assertTrue(self.spotify.SimpleAudioVolume.muted)
+        result = self._run({"action": "set_app_volume", "app": "Spotify", "value": "unmute"})
+        self.assertIn("Unmuted Spotify", result)
+        self.assertFalse(self.spotify.SimpleAudioVolume.muted)
+
+    def test_every_session_of_one_app_is_adjusted(self) -> None:
+        first = _FakeSession("chrome.exe", 201, level=0.3)
+        second = _FakeSession("chrome.exe", 202, level=0.6)
+        result = self._run(
+            {"action": "set_app_volume", "app": "Chrome", "value": "40"},
+            sessions=[_session_dict(first), _session_dict(second)],
+        )
+        self.assertIn("2 sessions", result)
+        self.assertAlmostEqual(first.SimpleAudioVolume.level, 0.4)
+        self.assertAlmostEqual(second.SimpleAudioVolume.level, 0.4)
+
+    def test_unknown_app_lists_what_is_playing(self) -> None:
+        result = self._run({"action": "set_app_volume", "app": "Discord", "value": "50"})
+        self.assertIn("No audio session matches 'Discord'", result)
+        self.assertIn("spotify", result)
+
+    def test_vague_directive_is_rejected_without_touching_anything(self) -> None:
+        result = self._run({"action": "set_app_volume", "app": "Spotify", "value": "banana"})
+        self.assertIn("Tell me the volume", result)
+        self.assertAlmostEqual(self.spotify.SimpleAudioVolume.level, 0.8)
+        self.assertEqual(undo.history(), [])
+
+    def test_no_app_named_is_rejected(self) -> None:
+        result = self._run({"action": "set_app_volume", "value": "50"})
+        self.assertIn("Tell me which application", result)
+
+    def test_nothing_playing_is_distinguished_from_unavailable(self) -> None:
+        result = self._run({"action": "set_app_volume", "app": "Spotify", "value": "50"},
+                           sessions=[])
+        self.assertIn("No applications currently have an audio session", result)
+
+    def test_list_groups_repeated_stems(self) -> None:
+        first = _FakeSession("chrome.exe", 201, level=0.3)
+        second = _FakeSession("chrome.exe", 202, level=0.6, muted=True)
+        result = self._run(
+            {"action": "list_app_volumes"},
+            sessions=[_session_dict(first), _session_dict(second)],
+        )
+        self.assertIn("chrome (x2)", result)
+        self.assertIn("30%", result)
+        self.assertIn("muted", result)
 
 
 if __name__ == "__main__":

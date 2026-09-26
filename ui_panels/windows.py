@@ -34,6 +34,8 @@ class WindowsOverlay(HudPanel):
         super().__init__(parent)
         self._log_cb = log
         self._windows: list = []
+        self._last_keys: tuple = ()
+        self._last_backend: str = ""
         self.setStyleSheet(f"""
             WindowsOverlay {{
                 background: rgba(0, 6, 10, 246);
@@ -46,6 +48,17 @@ class WindowsOverlay(HudPanel):
         self._lay.setContentsMargins(20, 16, 20, 16)
         self._lay.setSpacing(5)
         self._refresh_sig.connect(self._apply_snapshot)
+        # A gentle live refresh while the panel is open: the desktop changes,
+        # and a window list that goes stale behind the user's back is exactly
+        # the confusion this panel exists to clear up. The rebuild is skipped
+        # when nothing changed, so an idle desktop costs nothing and nothing
+        # flickers.
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(2000)
+        self._auto_timer.timeout.connect(
+            lambda: self.refresh() if self.isVisible() else None
+        )
+        self._auto_timer.start()
         self._rebuild()
 
     # ── layout plumbing (same dance as the memory panel) ─────────────────────
@@ -125,7 +138,17 @@ class WindowsOverlay(HudPanel):
         threading.Thread(target=_work, daemon=True, name="windows-panel-refresh").start()
 
     def _apply_snapshot(self, rows, backend: str):
+        keys = tuple(
+            (int(w.handle or 0), int(w.pid or 0), str(w.title), bool(w.minimized),
+             bool(w.maximized), int(w.left), int(w.top), int(w.right), int(w.bottom))
+            for w, _monitor in rows
+        )
+        unchanged = keys == self._last_keys and getattr(self, "_last_backend", None) == backend
         self._windows = [w for w, _m in rows]
+        if unchanged and self._lay.count() > 1:
+            return   # nothing moved, nothing re-titled: leave the pixels alone
+        self._last_keys = keys
+        self._last_backend = backend
         self._rebuild(rows=rows, backend=backend)
 
     def _rebuild(self, rows=None, backend: str = ""):

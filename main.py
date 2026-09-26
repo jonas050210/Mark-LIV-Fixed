@@ -2739,6 +2739,18 @@ class JarvisLive:
         # for host-API enumeration on the Qt thread.
         audio_devices.prefetch()
 
+        # Desktop window events: every window wait in the actions layer can
+        # wake the instant a window appears, is re-titled, or moves, instead
+        # of polling; and the window list can be cached between events. Where
+        # the hook cannot be installed this is a no-op and the polling
+        # behaviour from before continues unchanged.
+        try:
+            from core import window_events
+
+            window_events.start()
+        except Exception as exc:
+            record_diagnostic("window-events", "hook not installed", exception=exc)
+
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer

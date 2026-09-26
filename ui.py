@@ -2414,6 +2414,24 @@ class MainWindow(QMainWindow):
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
         lay.addWidget(hdr)
 
+        # The drawer keeps growing; a two-letter filter finds the control the
+        # user is looking for faster than scanning fifteen labels.
+        self._drawer_search = QLineEdit()
+        self._drawer_search.setPlaceholderText("Search controls…")
+        self._drawer_search.setFont(QFont("Courier New", 8))
+        self._drawer_search.setFixedHeight(24)
+        self._drawer_search.setClearButtonEnabled(True)
+        self._drawer_search.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C.BG}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 0 6px;
+            }}
+            QLineEdit:focus {{ border-color: {C.PRI_DIM}; }}
+        """)
+        self._drawer_search.textChanged.connect(self._filter_drawer_buttons)
+        lay.addWidget(self._drawer_search)
+
         remote_btn = QPushButton("◉  REMOTE CONTROL")
         remote_btn.setFixedHeight(30)
         remote_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
@@ -2553,6 +2571,9 @@ class MainWindow(QMainWindow):
         # boundary defensive for future settings controls.
         try:
             self._refresh_wake_btns()   # resolve wake state on open (lazy)
+            # A fresh open shows every control; the last search should not
+            # hide half the drawer from someone who forgot it was typed.
+            self._drawer_search.clear()
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
@@ -2571,6 +2592,21 @@ class MainWindow(QMainWindow):
         self._quick_drawer.setFixedWidth(_W)
         self._quick_drawer.adjustSize()
         self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
+
+    def _filter_drawer_buttons(self, text: str) -> None:
+        """Show only drawer controls whose label matches the typed filter.
+
+        Resolved through findChildren rather than a hand-kept list so the
+        buttons whose labels change at runtime (wake word, autostart, brief)
+        are filtered by what they currently say, not what they said at build
+        time.
+        """
+        query = " ".join(str(text or "").casefold().split())
+        for button in self._quick_drawer.findChildren(QPushButton):
+            label = " ".join(button.text().casefold().split())
+            button.setVisible(not query or query in label)
+        self._quick_drawer.adjustSize()
+        self._position_quick_drawer()
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)

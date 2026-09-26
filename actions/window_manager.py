@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 
+from core import window_events
 from core.text_match import partial_ratio
 from core.undo import push_undo, refuse
 from core.window_manager import (
@@ -43,7 +44,9 @@ def _strict_matches(target: str, *, timeout: float | None = None) -> list:
         matches = find_windows(target, min_score=80)
         if matches or time.monotonic() >= deadline:
             return matches
-        time.sleep(_SETTLE_POLL_SECONDS)
+        # Wake as soon as the desktop says a window changed (a title landing
+        # is exactly such an event) instead of sleeping the whole interval.
+        window_events.wait_for_change(_SETTLE_POLL_SECONDS)
 
 
 def _normalised(value: str) -> str:

@@ -416,6 +416,22 @@ def _visible_window_keys() -> set[tuple]:
         return set()
 
 
+def _wait_desktop_change(poll: float) -> None:
+    """Sleep until the desktop reports a window change, or the poll interval.
+
+    A launch's window typically triggers show and title events, so waiting on
+    them wakes the launch verification the moment the window is real instead
+    of up to a full poll interval later. Falls back to a plain sleep wherever
+    the event hook is not running.
+    """
+    try:
+        from core import window_events
+
+        window_events.wait_for_change(poll)
+    except Exception:
+        time.sleep(poll)
+
+
 def _wait_for_windows(requested: str, normalized: str, minimum: int,
                       existing_keys: set[tuple] | None = None, timeout: float = 8.0,
                       cancel_event=None):
@@ -430,7 +446,7 @@ def _wait_for_windows(requested: str, normalized: str, minimum: int,
         new_windows = [window for window in latest if _window_key(window) not in existing_keys]
         if len(latest) >= minimum and (not existing_keys or new_windows):
             return latest, new_windows
-        time.sleep(0.25)
+        _wait_desktop_change(0.25)
     latest = _matching_windows(requested, normalized)
     return latest, [window for window in latest if _window_key(window) not in existing_keys]
 
@@ -497,7 +513,7 @@ def _wait_for_pid_window(pid: int | None, timeout: float = 12.0, cancel_event=No
             return []
         if found:
             return found
-        time.sleep(0.2)
+        _wait_desktop_change(0.2)
     return []
 
 
@@ -588,7 +604,7 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
                 return new_windows[0]
         else:
             single_new_since = None
-        time.sleep(0.2)
+        _wait_desktop_change(0.2)
     return None
 
 

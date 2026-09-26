@@ -5,7 +5,7 @@ Extracted from ui.py, which was 5600 lines; see ui_panels/__init__.py.
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 from ui_panels.base import C, HudPanel
 
@@ -83,6 +83,23 @@ class ConfirmBanner(HudPanel):
         no.clicked.connect(lambda: self.answered.emit(False))
         row.addWidget(no)
         lay.addLayout(row)
+
+        # Keyboard answers. Scoped to this banner and its children — CANCEL
+        # holds the focus when the banner appears, so Y/N answer immediately,
+        # but the keys are NOT stolen from the command input once the user
+        # clicks away into it. Escape is deliberately left alone: the main
+        # window already binds it to interrupt.
+        for key, answer in (("Y", True), ("N", False)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(
+                lambda a=answer: self.answered.emit(a)
+            )
+
+        hint = QLabel("[Y] confirm   ·   [N] cancel")
+        hint.setFont(QFont("Courier New", 7))
+        hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(hint)
 
         # Default focus on CANCEL: if someone hits Enter without reading, the
         # safe answer wins.
