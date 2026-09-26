@@ -2,9 +2,11 @@
 
 **Repository:** `jonas050210/Mark-LIV-fixed`
 
-**Working branch:** `arena/01a0d987-mark-liv-fixed`
+**Working branch:** `arena/01a0d9fa-mark-liv-fixed` (branched from the merge of `arena/01a0d987-mark-liv-fixed`, the session that wrote most of this document through §19; see §20 for what changed since)
 
 **Purpose of this document:** This is the complete project record for the current implementation. It explains the project’s purpose, architecture, files, decisions, safety rules, implemented features, tests, limitations, and the work completed during this development session. It is intentionally more detailed than `README.md`.
+
+> **Note:** §1–§19 below are the unedited record of the session that produced them. §20 documents a later, separate session's three rounds of work (sequential multi-app launching hardening, system-wide audio output switching, and a second deep bug hunt) and is the most current source for test/coverage numbers and known limitations.
 
 `README.md` is the concise user-facing setup guide. `readme.md` contains extended product and visual-design notes. This file is the engineering and project-history reference.
 
@@ -1430,7 +1432,239 @@ The latest run compiles all Python, validates 16 action records, finds no `shell
 
 ---
 
-## 19. Final project principle
+## 19. Sequential launcher hardening, system-wide audio output, and a second deep bug hunt
+
+This section documents three further rounds of work carried out in a separate
+session (`arena/01a0d9fa-mark-liv-fixed`), branched from the merge of the
+session that wrote §1–§18. It follows the same principle stated in §20 below:
+prefer a smaller, verified, honest action surface over a larger one that
+sometimes guesses.
+
+### 19.1 Round 1 — sequential multi-app commands, semantic monitors, desktop health
+
+- A multi-step request ("open Roblox fullscreen on my main monitor, Arena AI
+  on the left of monitor 2, and YouTube on the right") is executed one
+  application at a time, each step verified before the next starts, with the
+  plan shown on the dashboard before execution rather than run silently.
+  This became the dedicated `app_sequence` action (see §19.2 for the media-
+  step extension added the following round).
+- `core/window_manager.py` gained `resolve_monitor_token()`: monitor
+  references are accepted as a bare 1-based number, an explicit phrase
+  ("monitor 2", "display 2"), or a semantic name — `primary`/`main` (the
+  Windows primary display), `secondary`/`second`/`other`, `left`/`right`
+  (by physical position), or an ordinal word ("second monitor"). Every
+  unresolvable reference raises a clear, user-facing `ValueError` instead of
+  silently defaulting to monitor 1.
+- `.lnk` shortcuts are launched directly (not merely revealed in Explorer),
+  and saved aliases resolve to their exact configured path
+  (`YouTube.lnk`, `Arena AI.lnk`, etc.) without re-guessing.
+- New read-only `desktop_health` action: a diagnostic snapshot (detected
+  monitors and which is primary, the window backend in use, visible window
+  count, indexed-application count, saved-shortcut count) that never moves,
+  opens, or closes anything, meant to be called before another blind retry
+  when a multi-step command keeps failing.
+
+### 19.2 Round 2 — `open_app`, `file_controller`, and `app_sequence` hardening
+
+- `actions/open_app.py` and `actions/file_controller.py` were substantially
+  rewritten: launch-type diagnosis, fullscreen/left/right/monitor placement
+  on open, stale-process detection, cross-device move implemented as a
+  verified copy followed by a trash of the original (never a permanent
+  delete) with automatic rollback if the trash step fails, and directory-
+  mutation safety checks (protected data, symlinks, unreadable entries, too
+  many items) before any recursive operation.
+- `app_sequence.py` gained media-control steps, so one ordered plan can mix
+  opening applications and controlling Spotify playback (play/pause/skip/
+  volume) through the same shared retry-then-continue helper used for app
+  steps.
+- Explicitly **not** built, after being asked for repeatedly and refused
+  each time: preset workspace "profiles" (fixed Gaming/Work/Music/Streaming
+  configurations). The user's own judgment was that presets add an action
+  surface without matching real, verified use, which conflicts with this
+  project's stated preference (see §20).
+
+### 19.3 Round 3 — system-wide default audio output device
+
+`actions/audio_manager.py` could already switch which microphone/speaker
+*JARVIS's own* speech session uses (`core/audio_devices.py`, a PortAudio/
+`sounddevice` concept), but had no way to change what the *whole operating
+system* plays sound through — the more common meaning of "switch my audio
+output," and a gap identified by the user directly after the round 2 work
+above was reviewed.
+
+New module `core/system_audio.py`:
+
+- `list_playback_devices()`, `get_default_playback_device()`, and
+  `set_default_playback_device(name)`, implemented per platform:
+  - **Windows**: devices are enumerated through
+    `pycaw.pycaw.AudioUtilities.GetAllDevices()` (filtered to active
+    endpoints), and the system default is switched through the same
+    **undocumented `IPolicyConfig` COM interface** the Settings app and the
+    classic Sound Control Panel themselves use internally — there is no
+    public Win32 API for this. Because it is undocumented, community
+    reverse-engineering shows its exact vtable layout has drifted across
+    Windows releases, so two known-working `(interface GUID, CLSID,
+    preceding-method count)` layouts are tried in order (the common
+    Windows 7+ layout, then the older Vista-era layout as a fallback), and
+    `SetDefaultEndpoint` is called for all three roles — console,
+    multimedia, communications — so every application picks up the change
+    consistently, not just the one Windows associates with "default
+    playback."
+  - **Linux**: `pactl list short sinks` / `pactl set-default-sink`
+    (PulseAudio/PipeWire).
+  - **macOS**: the `SwitchAudioSource` CLI (there is no built-in
+    command-line equivalent either).
+  - A spoken/typed device name (e.g. "jbl") is matched against the real
+    device list with `core.text_match.partial_ratio` — the same tool
+    `window_manager.py` and `layout_manager.py` already use for "short
+    fragment vs. long real name" matching — never guessed outright; a
+    failed OS/COM call is always reported as a failure, never assumed to
+    have worked.
+- Wired into `audio_manager.py` as two new actions, `list_system_outputs`
+  and `set_system_output`, whose tool description explicitly distinguishes
+  them from the pre-existing `set_input`/`set_output` (JARVIS's own
+  session). A successful switch registers an undo entry that restores the
+  previous system default, consistent with every other reversible action.
+- **Honesty about what could actually be verified**: this Windows COM path
+  cannot be executed on the Linux sandbox that did this work — only unit-
+  tested by injecting fake `pycaw`/`comtypes` modules
+  (`tests/test_system_audio.py`, 18 tests) that prove the *Python-level
+  control flow* is correct (which functions are called, with what
+  arguments, in what order, and that any exception becomes an honest
+  failure). They cannot prove the real Windows COM call behaves exactly as
+  the reverse-engineered documentation claims — the same limitation every
+  other Windows-only path in this project already has (§12's "Windows code
+  executed off Windows").
+
+### 19.4 A pre-existing coverage gap closed along the way
+
+While implementing §19.3, a grep across `tests/*.py` for `pycaw` and
+`AudioUtilities` returned zero matches: `computer_settings.py`'s Windows
+`volume_get()`/`volume_set()` path (added before either of these sessions)
+had **no test coverage at all**. Six regression tests were added to
+`tests/test_windows_paths_simulated.py::WindowsSettingsTests`, covering the
+decibel↔percentage conversion in both directions, the −65.25 dB silence
+floor (not `log10(0)`), and that a missing `pycaw` install is reported as a
+failure rather than silently doing nothing.
+
+### 19.5 Second deep bug hunt — findings
+
+- **Fixed, a real test-design bug**:
+  `tests/test_filesystem_safety.py::CrossDeviceMoveTests::test_move_across_devices_rolls_back_if_the_original_cannot_be_trashed`
+  asserted `self.assertFalse(file_controller._SEND2TRASH)` as a
+  *precondition* rather than mocking it — meaning the test only ever passed
+  because the `send2trash` package happened not to be installed wherever it
+  ran. It broke the moment `send2trash` was installed in this same session
+  (to get accurate dependency-driven skip counts, see below), for a reason
+  that had nothing to do with the code under test. Fixed by patching
+  `_safe_trash` directly to report unavailability, exercising the exact same
+  rollback branch in `_move_across_devices` deterministically regardless of
+  what happens to be `pip install`ed on the machine running the suite.
+- **A sandbox coverage blind spot, not a code bug**: this sandbox was
+  missing `numpy`, `fastapi`, `PyQt6`, `httpx`, `python-multipart`, `psutil`,
+  `rapidfuzz`, and `google-genai` — all already listed in `requirements.txt`
+  but never installed — so a large slice of the suite (dashboard routes,
+  avatar-adjacent code, the RapidFuzz-accelerated fuzzy-matching path) was
+  being silently skipped rather than actually run. Installing them raised
+  the executed test count and, importantly, confirmed
+  `core/text_match.py` behaves identically on its RapidFuzz and `difflib`
+  backends — only the `difflib` path had ever actually run in this sandbox
+  before.
+- **Investigated, judged cosmetic and left alone**: a `pyflakes` pass over
+  `actions/`, `core/`, `dashboard/`, and `memory/` found only unused
+  imports, a handful of `f"..."` strings with no `{}` placeholder, three
+  `except Exception as e:` in `core/llm_client.py` where `e` is caught but
+  not printed (a lost diagnostic detail, not a functional defect), and one
+  loop variable in `dashboard/server.py::_close_other_sockets` named
+  `socket` that shadows the module-level `import socket` — but only within
+  that function's own local scope, which never uses the `socket` module, so
+  it has zero behavioural effect. None were touched, since none change
+  behaviour.
+- Manual review of the highest blast-radius code from §19.1–§19.2 (the
+  cross-device move/rollback path, `open_app`'s launch-type diagnosis,
+  `resolve_monitor_token`, `desktop_health`, `config_manager`) found no
+  further functional defects.
+- **A pre-existing, unrelated finding worth recording even though it was
+  out of scope to fix here**: this repository already ships both
+  `README.md` and `readme.md`, and — after this session's own §19.6 below
+  was drafted — both `Project.md` and a would-be `project.md`. On a
+  case-sensitive filesystem (Linux, and GitHub's own storage) these coexist
+  without issue; on a case-insensitive one (Windows' default NTFS
+  configuration, and macOS' default APFS) two files differing only by case
+  in the same directory collide. Since this project's own stated priority
+  is Windows first, that is a real defect for anyone checking this repository
+  out there, not merely a style issue. It was **not** fixed as part of this
+  bug hunt: `README.md`/`readme.md` predate both agent sessions entirely and
+  are outside the explicit scope given for this pass, and resolving it means
+  deciding which of two differently-authored documents to keep, rename, or
+  merge — a product decision, not a bug fix, and one left for the project
+  owner.
+
+### 19.6 File-by-file summary (this session's three rounds)
+
+| File | Role/change |
+| --- | --- |
+| `actions/app_sequence.py` | New: sequential multi-step execution of app-open and media-control steps, one at a time, each verified, with retry-then-continue on failure. |
+| `actions/desktop_health.py` | New: read-only diagnostic snapshot of monitors, window backend, app index, and saved shortcuts. |
+| `core/system_audio.py` | New: cross-platform system-wide default playback device listing/switching (Windows via `IPolicyConfig` COM, Linux via `pactl`, macOS via `SwitchAudioSource`). |
+| `actions/audio_manager.py` | Added `list_system_outputs`/`set_system_output`, clearly distinguished from the pre-existing JARVIS-only `set_input`/`set_output`; both undoable. |
+| `actions/open_app.py` | Launch-type diagnosis, fullscreen/side/monitor placement on open, stale-process detection, saved-shortcut integration. |
+| `actions/file_controller.py` | Verified-copy-then-trash cross-device move with rollback, recursive-mutation safety checks, Explorer integration. |
+| `actions/computer_settings.py` | Monitor parameter in the tool schema now accepts semantic references (`primary`, `secondary`, `left`, `right`, `monitor 2`), not just a bare integer. |
+| `core/window_manager.py` / `core/app_index.py` | `resolve_monitor_token()` and supporting index changes for the above. |
+| `actions/window_manager.py` / `dashboard/server.py` | Minor schema/wiring updates to keep the semantic-monitor and audio changes consistent end to end. |
+| `tests/test_system_audio.py` | New: 18 tests, mocked `pycaw`/`comtypes` (the real Windows COM call cannot run on this sandbox). |
+| `tests/test_audio_manager.py` | New: 9 tests for the new audio-manager actions, including undo. |
+| `tests/test_app_sequence.py`, `tests/test_desktop_health.py` | New: coverage for the round-1/round-2 modules above. |
+| `tests/test_app_launcher.py`, `tests/test_filesystem_safety.py` | Extended for the `open_app`/`file_controller` hardening; the cross-device rollback test was also made deterministic (§19.5). |
+| `tests/test_windows_paths_simulated.py` | Added 6 tests closing the `volume_get`/`volume_set` pycaw coverage gap (§19.4). |
+| `project.md` (lowercase; content merged here) | A standalone summary of this session's three rounds was originally written to `project.md`, then folded into this file as §19 once the `Project.md`/`project.md` case-collision was found; the standalone file was deleted. |
+
+### 19.7 Verification result (this session)
+
+```bash
+QT_QPA_PLATFORM=offscreen python3 .github/scripts/run_tests.py
+QT_QPA_PLATFORM=offscreen python3 .github/scripts/run_overall.py --coverage
+```
+
+With every `requirements.txt` dependency actually installed in the sandbox:
+
+- **570 unit tests, 0 failures, 25 skipped** — up from the 479 recorded in
+  §13, entirely from tests added in §19.3/§19.4 plus dependencies that were
+  previously missing and are now installed. All 25 skips are legitimate and
+  environment-scoped: 13 require `RUN_WINDOWS_INTEGRATION=1` on real Windows
+  hardware; 12 need a working OpenGL runtime (`libGL.so.1`) for PyQt6, which
+  this particular sandbox cannot provide (no root/`apt` access to install
+  the system library) but a normal desktop install already has.
+- `run_overall.py --coverage`: **11 checks passed, 0 failed, 1 skipped**
+  (the Windows hardware integration suite, correctly gated behind
+  `--windows`). **33% overall coverage** (up from an unmeasured/skipped
+  state in §13, since `coverage` itself was not installed there), **19
+  safety-critical modules at or above their floor**, **18 active actions**
+  (up from 16 in §13 — `app_sequence` and `desktop_health` are new), **27
+  dashboard routes**.
+
+### 19.8 Known limitations added or reaffirmed this session
+
+- The new system-wide output-device switch depends on an undocumented COM
+  interface with a Windows-version-dependent vtable layout; two known
+  layouts are tried, but a future Windows release could in principle
+  introduce a third this code does not yet recognize. If both attempts
+  fail, the action reports failure honestly rather than claiming success.
+- PyQt6/avatar-adjacent tests could not run in this particular sandbox for
+  lack of the system `libGL.so.1` library; this is a sandbox limitation, not
+  a code defect, and the same paths are expected to run normally wherever
+  PyQt6 already ships working OpenGL bindings.
+- The `README.md`/`readme.md` case-collision noted in §19.5 remains
+  unresolved, pending a decision from the project owner.
+- Everything else stated in §17 ("Remaining work") and the "What cannot be
+  verified here" / "What is still unverified" passages in §12–§13 still
+  applies unchanged: no physical Windows desktop, no real audio hardware,
+  no Roblox, and no wake-word model were available to either session.
+
+---
+
+## 20. Final project principle
 
 MARK LIV should prefer:
 
