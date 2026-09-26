@@ -35,7 +35,7 @@ class WindowManagerTests(unittest.TestCase):
 
     def test_focus_action_does_not_claim_success_when_focus_cannot_be_verified(self) -> None:
         window = WindowInfo(1, "Editor", "editor.exe", 1, 0, 0, 800, 600)
-        with patch("actions.window_manager.find_window", return_value=window), \
+        with patch("actions.window_manager.find_windows", return_value=[window]), \
              patch("actions.window_manager.focus_window", return_value=False):
             result = window_manager({"action": "focus", "target": "Editor"})
         self.assertIn("could not verify", result.casefold())
@@ -44,7 +44,7 @@ class WindowManagerTests(unittest.TestCase):
     def test_window_move_registers_an_undo_snapshot(self) -> None:
         window = WindowInfo(1, "Test", "test.exe", 1, 50, 60, 850, 660)
         undo_stack.clear()
-        with patch("actions.window_manager.find_window", return_value=window), \
+        with patch("actions.window_manager.find_windows", return_value=[window]), \
              patch("actions.window_manager.operate") as operate:
             result = window_manager({"action": "move", "target": "Test", "x": 200, "y": 220,
                                      "width": 900, "height": 700})
@@ -77,7 +77,7 @@ class WindowManagerTests(unittest.TestCase):
     def test_direct_fullscreen_action_uses_maximize_and_keeps_taskbar_available(self) -> None:
         window = WindowInfo(1, "Editor", "editor.exe", 1, 50, 50, 850, 650)
         undo_stack.clear()
-        with patch("actions.window_manager.find_window", return_value=window), \
+        with patch("actions.window_manager.find_windows", return_value=[window]), \
              patch("actions.window_manager.place_window", return_value=window) as place:
             result = window_manager({"action": "fulscreen", "target": "Editor"})
         place.assert_called_once_with(window, None, "maximized")

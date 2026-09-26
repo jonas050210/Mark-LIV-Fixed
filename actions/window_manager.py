@@ -173,11 +173,16 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
             result += f" I could not minimize {failed} window(s)."
         return result
 
-    if action in {"close", "quit"} and target:
+    # Any named window operation must clear the same strict match bar as
+    # close/quit. A weak fuzzy match is not an acceptable target for moving,
+    # minimising, or focusing somebody's windows either: acting on Visual
+    # Studio Code because the user said Chrome is still the wrong operation.
+    # With no target, retain the intentional "active window" behaviour.
+    if target:
         strict_matches = find_windows(target, min_score=80)
         window = strict_matches[0] if strict_matches else None
     else:
-        window = find_window(target)
+        window = find_window()
     if window is None:
         return f"I could not find a visible window matching '{target or 'the active window'}'."
 

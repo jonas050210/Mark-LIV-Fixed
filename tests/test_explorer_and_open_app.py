@@ -112,6 +112,24 @@ class OpenAppTests(unittest.TestCase):
             matches = open_app._matching_windows("Roblox", "RobloxPlayerBeta.exe")
         self.assertEqual(matches, [process_window])
 
+    def test_multiword_editor_request_does_not_match_a_browser_tab_on_one_word(self) -> None:
+        browser_tab = WindowInfo(
+            handle=303, title="Code Search - Google Chrome", process="chrome.exe", pid=33,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch("core.window_manager.list_windows", return_value=[browser_tab]):
+            matches = open_app._matching_windows("Visual Studio Code", "code")
+        self.assertEqual(matches, [])
+
+    def test_short_platform_alias_can_still_match_the_real_process(self) -> None:
+        editor = WindowInfo(
+            handle=304, title="Untitled document", process="code.exe", pid=34,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch("core.window_manager.list_windows", return_value=[editor]):
+            matches = open_app._matching_windows("Visual Studio Code", "code")
+        self.assertEqual(matches, [editor])
+
     def test_normal_open_focuses_existing_window_without_launching(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[self.window]), \
              patch.object(open_app, "_focus_window", return_value=True) as focus, \

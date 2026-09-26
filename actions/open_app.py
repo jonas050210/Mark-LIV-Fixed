@@ -283,8 +283,46 @@ def _is_roblox(value: str) -> bool:
     return "roblox" in _normalised_window_text(value)
 
 
+def _window_query_terms(value: str) -> set[str]:
+    return {
+        term for term in _normalised_window_text(value).split()
+        if len(term) >= 3 and term not in {"open", "launch", "start", "application", "app"}
+    }
+
+
+def _window_match_score(window, query: str, *, allow_title: bool = True) -> int:
+    """Score one window against a requested app without one-word false matches."""
+    text = _normalised_window_text(query)
+    terms = _window_query_terms(query)
+    if not text or not terms:
+        return 0
+    title = _normalised_window_text(getattr(window, "title", ""))
+    process = _normalised_window_text(getattr(window, "process", ""))
+
+    # A process match is strongest: browser page titles are arbitrary and often
+    # include a word such as "code", "word", or "steam" without being that
+    # desktop application at all.
+    if text in process:
+        return 120
+    if allow_title and text in title:
+        return 110
+    if all(term in process for term in terms):
+        return 100
+    if allow_title and all(term in title for term in terms):
+        return 90
+    return 0
+
+
 def _matching_windows(requested: str, normalized: str):
-    """Return visible windows belonging to an application, without launching it."""
+    """Return confidently matched app windows, ordered by identity strength.
+
+    A previous any-word match treated a Chrome tab named "Code Search" as Visual
+    Studio Code, then focused or restarted the browser when the user asked for
+    their editor.  Multi-word spoken names must now match as a whole (or all
+    meaningful words). A shorter platform alias like ``code`` can still match
+    an executable's process name, but is deliberately not allowed to match an
+    unrelated page title by itself.
+    """
     try:
         from core.window_manager import list_windows
         windows = list_windows()
@@ -294,22 +332,34 @@ def _matching_windows(requested: str, normalized: str):
 
     requested_text = _normalised_window_text(requested)
     normalized_text = _normalised_window_text(normalized)
-    terms = {
-        term for value in (requested_text, normalized_text)
-        for term in value.split()
-        if len(term) >= 3 and term not in {"open", "launch", "start", "application", "app"}
-    }
-    matches = []
+    requested_terms = _window_query_terms(requested)
+    normalized_terms = _window_query_terms(normalized)
+    weaker_normalized_name = (
+        normalized_text != requested_text
+        and (
+            len(normalized_terms) <= 1
+            or (requested_terms and normalized_terms < requested_terms)
+        )
+    )
+    scored = []
     for window in windows:
-        title = _normalised_window_text(getattr(window, "title", ""))
-        process = _normalised_window_text(getattr(window, "process", ""))
         if _is_roblox(requested) or _is_roblox(normalized):
-            matched = "roblox" in title or "roblox" in process
+            title = _normalised_window_text(getattr(window, "title", ""))
+            process = _normalised_window_text(getattr(window, "process", ""))
+            score = 120 if "roblox" in process else 110 if "roblox" in title else 0
         else:
-            matched = any(term in title or term in process for term in terms)
-        if matched:
-            matches.append(window)
-    return matches
+            score = _window_match_score(window, requested_text)
+            if normalized_text != requested_text:
+                score = max(
+                    score,
+                    _window_match_score(
+                        window, normalized_text, allow_title=not weaker_normalized_name,
+                    ),
+                )
+        if score:
+            scored.append((score, window))
+    scored.sort(key=lambda row: (-row[0], int(getattr(row[1], "handle", 0) or 0)))
+    return [window for _score, window in scored]
 
 
 def _browser_title_match_may_be_a_web_app(existing, *queries: str) -> bool:

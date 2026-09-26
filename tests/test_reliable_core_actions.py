@@ -112,6 +112,14 @@ class MultiWindowActionTests(unittest.TestCase):
         with patch.object(core_windows, "list_windows", return_value=windows):
             self.assertEqual(core_windows.find_windows("Chrome", min_score=80), [])
 
+    def test_named_window_operations_do_not_apply_to_a_fuzzy_neighbour(self) -> None:
+        windows = [_window(1, "Visual Studio Code")]
+        with patch.object(core_windows, "list_windows", return_value=windows), \
+             patch.object(window_manager, "operate") as operate:
+            result = window_manager.window_manager({"action": "minimize", "target": "Chrome"})
+        self.assertIn("could not find", result.casefold())
+        operate.assert_not_called()
+
 
 class OpenWithApplicationTests(unittest.TestCase):
     def test_resolved_file_is_passed_as_a_real_application_argument(self) -> None:
