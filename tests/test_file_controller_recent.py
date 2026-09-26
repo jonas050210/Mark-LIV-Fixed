@@ -59,6 +59,31 @@ class RecentFilesTests(unittest.TestCase):
         self.assertIn("report.pdf", result)
         self.assertNotIn("newest.txt", result)
 
+    def test_reveal_recent_selects_the_newest_matching_file_without_opening_it(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            old = root / "old.pdf"
+            newest = root / "newest.pdf"
+            newer_non_match = root / "ignore-me.txt"
+            old.write_bytes(b"old")
+            newest.write_bytes(b"new")
+            newer_non_match.write_text("newer but not a PDF", encoding="utf-8")
+            now = time.time()
+            os.utime(old, (now - 60, now - 60))
+            os.utime(newest, (now, now))
+            os.utime(newer_non_match, (now + 60, now + 60))
+            with patch.object(file_controller.explorer, "open_in_explorer", return_value="Selected newest.pdf") as reveal:
+                result = file_controller.reveal_recent_file(str(root), extension=".pdf")
+
+        self.assertEqual(result, "Selected newest.pdf")
+        reveal.assert_called_once_with(newest, select=True)
+
+    def test_reveal_recent_action_defaults_to_downloads(self) -> None:
+        with patch.object(file_controller, "reveal_recent_file", return_value="Selected note.txt") as reveal:
+            result = file_controller.file_controller({"action": "reveal_recent"})
+        self.assertEqual(result, "Selected note.txt")
+        reveal.assert_called_once_with(path="downloads", extension="")
+
 
 if __name__ == "__main__":
     unittest.main()
