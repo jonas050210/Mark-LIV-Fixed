@@ -19,6 +19,7 @@ Two things it deliberately does NOT install:
 import platform
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 
 # Setup is commonly launched from legacy Windows consoles. Keep status symbols
@@ -42,6 +43,35 @@ MAX_PY = (3, 13)        # highest version this is actually tested on
 def _run(label: str, args: list[str]) -> None:
     print(f"\n▶ {label}")
     subprocess.run(args, check=True, timeout=1800)
+
+
+def _replace_deprecated_pynvml() -> None:
+    """Migrate the retired ``pynvml`` distribution without changing its API.
+
+    ``nvidia-ml-py`` intentionally exports the same ``pynvml`` import name.
+    Old installs can contain both distributions; Python then imports the
+    deprecated one and emits a warning every time MARK LIV starts. Remove only
+    the retired distribution and reinstall the maintained provider's files.
+    """
+    try:
+        metadata.version("pynvml")
+    except metadata.PackageNotFoundError:
+        return
+    print("\n▶ Replacing deprecated pynvml with maintained nvidia-ml-py…")
+    removed = subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "pynvml"],
+        timeout=180, check=False,
+    )
+    if removed.returncode != 0:
+        print("⚠️  Could not remove deprecated pynvml; GPU readings still work, but its warning may remain.")
+        return
+    try:
+        _run("Restoring NVIDIA ML bindings…", [
+            sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+            "nvidia-ml-py>=12,<14",
+        ])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("⚠️  NVIDIA ML bindings could not be restored automatically; GPU metrics are optional.")
 
 
 def _check_python() -> None:
@@ -115,6 +145,7 @@ def main() -> None:
     # requirements.txt filters OS-specific extras by itself via pip markers.
     _run("Installing Python dependencies (OS-specific extras auto-filtered)…",
          [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    _replace_deprecated_pynvml()
 
     # Chromium covers Chrome/Edge/Opera/Brave/Vivaldi; Firefox for Firefox.
     # (Safari automation additionally needs: python -m playwright install webkit)

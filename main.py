@@ -1440,10 +1440,21 @@ class JarvisLive:
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                        # Open the visible feed first, then take the image from
+                        # that same stream after it has warmed up. This avoids a
+                        # second VideoCapture racing the preview and prevents
+                        # Gemini from receiving a dark first webcam frame.
                         self.ui.start_camera_stream()
                         self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                        img_b = await loop.run_in_executor(
+                            None, self.ui.wait_for_camera_snapshot, 4.0,
+                        )
+                        if not img_b:
+                            raise RuntimeError(
+                                "The camera preview did not produce a usable frame within 4 seconds."
+                            )
+                        mime_t = "image/jpeg"
+                        print(f"[Vision] 📷 Camera (settled): {len(img_b):,} bytes")
                         _stall = "camera"
                     else:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
@@ -1665,6 +1676,10 @@ class JarvisLive:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
+            if name == "screen_process" and self._vision_cam_active:
+                # A failed warm-up must not leave the camera indicator/feed on.
+                self.ui.stop_camera_stream()
+                self._vision_cam_active = False
             kind = type(e).__name__
             result = f"Tool '{name}' failed ({kind})."
             traceback.print_tb(e.__traceback__)

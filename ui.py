@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.path_policy import atomic_write_bytes, atomic_write_text, resolve_user_path
+from core.user_paths import location as _user_location
 
 # The floating panels live in ui_panels/ rather than in this file. ui.py was
 # 5600 lines and every panel added to it made the next one harder to place; the
@@ -1595,6 +1596,13 @@ class MainWindow(QMainWindow):
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
         self._cam_stop = threading.Event()
+        # The live feed is the single owner of the webcam. The vision action
+        # waits for a settled frame from this feed instead of opening a second
+        # competing VideoCapture before the on-screen preview is visible.
+        self._cam_lock = threading.Lock()
+        self._cam_thread: threading.Thread | None = None
+        self._cam_snapshot_ready = threading.Event()
+        self._cam_snapshot: bytes | None = None
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
         self._cam_preview = _CameraPreview(self.centralWidget())
@@ -1644,15 +1652,47 @@ class MainWindow(QMainWindow):
                 )
 
     def start_camera_stream(self) -> None:
-        self._cam_stop.clear()
+        """Start one live webcam owner, idempotently.
+
+        Opening the device once for a still image and again for the preview made
+        a spoken "look at my camera" capture race its own live feed. Starting
+        the visible stream first makes the privacy state obvious, and its frame
+        is also the exact frame sent for vision.
+        """
+        with self._cam_lock:
+            if self._cam_thread is not None and self._cam_thread.is_alive():
+                return
+            self._cam_stop.clear()
+            self._cam_snapshot_ready.clear()
+            self._cam_snapshot = None
+            thread = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
+            self._cam_thread = thread
         self._cam_stream_sig.emit(True)
-        t = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
-        t.start()
+        thread.start()
+
+    def wait_for_camera_snapshot(self, timeout: float = 4.0) -> bytes | None:
+        """Wait for a stable frame from the visible stream without touching Qt.
+
+        This method is safe to call from the asyncio/executor worker. It waits
+        until the preview has had time to initialise and several real frames
+        have arrived, avoiding the dark/old first frame many webcams produce.
+        """
+        self.start_camera_stream()
+        try:
+            timeout = max(0.1, min(float(timeout), 10.0))
+        except (TypeError, ValueError):
+            timeout = 4.0
+        if not self._cam_snapshot_ready.wait(timeout):
+            return None
+        with self._cam_lock:
+            return bytes(self._cam_snapshot) if self._cam_snapshot else None
 
     def _cam_loop(self) -> None:
+        cap = None
         try:
             import cv2
-            # Reuse camera index detected by screen_processor (cached in api_keys.json)
+            # Reuse the configured/detected camera index. DSHOW opens much more
+            # quickly and reliably for most Windows webcams.
             cam_idx = 0
             try:
                 raw_index = _read_full_config().get("camera_index", 0)
@@ -1665,22 +1705,51 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 backend = 0
             cap = cv2.VideoCapture(cam_idx, backend)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
+            if not cap.isOpened() and cam_idx != 0:
+                cap.release()
+                cap = cv2.VideoCapture(0, backend)
             if not cap.isOpened():
                 return
-            # warm-up frames
-            for _ in range(5):
-                cap.read()
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
+
+            opened_at = time.monotonic()
+            valid_frames = 0
+            while not self._cam_stop.is_set() and cap.isOpened():
                 ret, frame = cap.read()
-                if ret and frame is not None:
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                    self._cam_frame_sig.emit(buf.tobytes())
-            cap.release()
+                if not ret or frame is None:
+                    # Do not busy-loop while a USB camera is waking up.
+                    self._cam_stop.wait(0.03)
+                    continue
+                valid_frames += 1
+                ok, preview = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65]
+                )
+                if ok:
+                    self._cam_frame_sig.emit(preview.tobytes())
+
+                # Let the visible feed arrive first, then select a later frame
+                # for Gemini. A time + frame-count gate works across 30/60fps
+                # cameras and slow exposure/autofocus startup alike.
+                if (not self._cam_snapshot_ready.is_set()
+                        and valid_frames >= 6
+                        and time.monotonic() - opened_at >= 0.70):
+                    ok, still = cv2.imencode(
+                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82]
+                    )
+                    if ok:
+                        with self._cam_lock:
+                            self._cam_snapshot = still.tobytes()
+                        self._cam_snapshot_ready.set()
+                self._cam_stop.wait(0.033)
         except Exception as e:
             print(f"[Camera] Stream error ({type(e).__name__}).")
         finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            with self._cam_lock:
+                self._cam_thread = None
             self._cam_stream_sig.emit(False)
 
     def stop_camera_stream(self) -> None:
@@ -1853,84 +1922,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _get_desktop_dir() -> Path:
-        """
-        Resolve the user's REAL desktop directory instead of assuming
-        ~/Desktop, which breaks when:
-          • OneDrive "Known Folder Move" relocates the desktop
-            (C:/Users/x/OneDrive/Desktop) — very common on Win 10/11;
-          • the XDG desktop is localized on Linux (~/Masaüstü,
-            ~/Schreibtisch, ~/Bureau, …).
-        Falls back to ~/Desktop only as a last resort.
-        """
-        home = Path.home()
-        _os = platform.system()
-
-        if _os == "Windows":
-            # ── 1) SHGetKnownFolderPath(FOLDERID_Desktop) — the canonical
-            #       answer; follows OneDrive redirection. No dependencies. ──
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                class _GUID(ctypes.Structure):
-                    _fields_ = [("Data1", wintypes.DWORD),
-                                ("Data2", wintypes.WORD),
-                                ("Data3", wintypes.WORD),
-                                ("Data4", ctypes.c_ubyte * 8)]
-
-                # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
-                fid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
-                            (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9,
-                                                 0x9A, 0x87, 0xC6, 0x41))
-                buf = ctypes.c_wchar_p()
-                if ctypes.windll.shell32.SHGetKnownFolderPath(
-                        ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0:
-                    p = Path(buf.value)
-                    ctypes.windll.ole32.CoTaskMemFree(buf)
-                    if p.is_dir():
-                        return p
-            except Exception:
-                pass
-
-            # ── 2) Registry: User Shell Folders (may contain %VARS%) ──────
-            try:
-                import winreg
-                with winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER,
-                        r"Software\Microsoft\Windows\CurrentVersion"
-                        r"\Explorer\User Shell Folders") as key:
-                    val, _t = winreg.QueryValueEx(key, "Desktop")
-                p = Path(os.path.expandvars(val))
-                if p.is_dir():
-                    return p
-            except Exception:
-                pass
-
-        elif _os == "Linux":
-            # ── xdg-user-dir honours localized names (~/Masaüstü, …) ──────
-            try:
-                out = subprocess.run(["xdg-user-dir", "DESKTOP"],
-                                     capture_output=True, text=True, timeout=5)
-                p = Path(out.stdout.strip())
-                if out.stdout.strip() and p != home and p.is_dir():
-                    return p
-            except Exception:
-                pass
-            try:
-                cfg = home / ".config" / "user-dirs.dirs"
-                for line in cfg.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("XDG_DESKTOP_DIR"):
-                        val = line.split("=", 1)[1].strip().strip('"')
-                        p = Path(val.replace("$HOME", str(home)))
-                        if p != home and p.is_dir():
-                            return p
-            except Exception:
-                pass
-
-        # macOS: ~/Desktop is always the real path (localization is
-        # display-only). Everything else lands here as a last resort.
-        return home / "Desktop"
+        """Return the shared canonical Desktop (including OneDrive redirects)."""
+        return _user_location("desktop")
 
     def _create_desktop_shortcut(self):
         """
@@ -4038,6 +4031,10 @@ class JarvisUI:
     def start_camera_stream(self) -> None:
         """Thread-safe: start live camera feed in the full HUD area."""
         self._win.start_camera_stream()
+
+    def wait_for_camera_snapshot(self, timeout: float = 4.0) -> bytes | None:
+        """Return a settled JPEG from the already-visible live camera feed."""
+        return self._win.wait_for_camera_snapshot(timeout)
 
     def stop_camera_stream(self) -> None:
         """Thread-safe: stop the live camera feed."""

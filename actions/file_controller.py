@@ -17,6 +17,7 @@ except ImportError:
 
 from core.undo import push_undo, refuse
 from core import explorer
+from core.user_paths import location as _user_location
 from core.path_policy import (
     FileFingerprint,
     PathPolicyError,
@@ -223,47 +224,31 @@ def _read_regular_bytes(path: Path, limit: int) -> tuple[bytes, FileFingerprint]
     return content, captured
 
 
+# All file actions share the Shell/XDG location resolver with Explorer. On
+# Windows that means "desktop" refers to a redirected OneDrive Desktop rather
+# than the often-missing C:\\Users\\name\\Desktop fallback.
 def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
+    return _user_location("desktop")
+
 
 def _get_downloads() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Downloads"
+    return _user_location("downloads")
+
 
 def _get_documents() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Documents"
+    return _user_location("documents")
+
 
 def _get_pictures() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_PICTURES_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Pictures"
+    return _user_location("pictures")
+
 
 def _get_music() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_MUSIC_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Music"
+    return _user_location("music")
+
 
 def _get_videos() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_VIDEOS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Videos"
+    return _user_location("videos")
 
 
 def _resolve_path(raw: str) -> Path:

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from core.path_policy import atomic_create_bytes, resolve_user_path
+from core.user_paths import location as _user_location
 
 try:
     import pyautogui
@@ -33,7 +34,9 @@ def _get_os() -> str:
 _SAFE_SCREENSHOT_ROOTS = (Path.home(),)
 
 def _safe_screenshot_path(requested: str | None) -> Path:
-    fallback_parent = Path.home() / "Desktop"
+    # Windows Known Folders follows OneDrive Folder Backup, unlike a guessed
+    # ``Path.home() / 'Desktop'``.
+    fallback_parent = _user_location("desktop")
     if not fallback_parent.is_dir():
         fallback_parent = Path.home()
     fallback = fallback_parent / "jarvis_screenshot.png"

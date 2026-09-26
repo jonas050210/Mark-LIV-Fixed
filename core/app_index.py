@@ -34,13 +34,17 @@ from pathlib import Path
 
 from core.json_store import JsonStore, JsonStoreCorruptError
 from core.text_match import ratio as _text_ratio
+from core.user_paths import desktop_candidates
 
 _OS = platform.system()
 BASE_DIR = Path(__file__).resolve().parent.parent
 INDEX_FILE = BASE_DIR / "config" / "app_index.json"
 USAGE_FILE = BASE_DIR / "config" / "app_usage.json"
 
-INDEX_VERSION = 2
+# Version 3 adds personal Desktop shortcuts, including a OneDrive-redirected
+# Desktop. Existing caches therefore rebuild once instead of hiding those apps
+# until the next daily TTL expiry.
+INDEX_VERSION = 3
 CACHE_TTL_SECONDS = 24 * 60 * 60
 MAX_RECENT = 12
 MAX_PINNED = 12
@@ -148,6 +152,11 @@ def _source_directories() -> list[Path]:
             base = os.environ.get(variable, "")
             if base:
                 directories.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+        # A user often pins personal/PWA shortcuts on their Desktop rather than
+        # the Start Menu. `desktop_candidates` follows the Windows Known Folder
+        # API, so this includes C:\\Users\\…\\OneDrive\\Desktop when Folder
+        # Backup is enabled, plus an old local Desktop during a migration.
+        directories.extend(desktop_candidates())
         local = os.environ.get("LOCALAPPDATA", "")
         if local:
             directories.append(Path(local) / "Roblox" / "Versions")
@@ -290,19 +299,26 @@ def _resolve_shortcut_target(path: Path) -> tuple[str, str]:
     return executable, Path(executable).stem if executable else ""
 
 
-def _windows_start_menu_entries() -> list[AppEntry]:
+def _windows_shortcut_entries(roots: list[Path], *, source_name: str) -> list[AppEntry]:
+    """Index launchable shortcuts from a trusted Windows shell location.
+
+    The same shortcut rules apply in Start Menu and Desktop folders. Keeping the
+    scanner shared is important: a browser PWA stored on OneDrive Desktop still
+    has to retain its Chromium ``--app-id`` switches, rather than being flattened
+    into an ordinary browser launch.
+    """
     entries: list[AppEntry] = []
-    roots = []
-    for variable in ("ProgramData", "APPDATA"):
-        base = os.environ.get(variable, "")
-        if base:
-            roots.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
     scanned = 0
     for root in roots:
         if not root.is_dir():
             continue
         try:
-            for path in root.rglob("*.lnk"):
+            # ``rglob('*.lnk')`` is case-sensitive on a few non-Windows test
+            # filesystems. Filter suffixes ourselves so Windows behaviour is
+            # represented accurately everywhere.
+            for path in root.rglob("*"):
+                if path.suffix.casefold() != ".lnk" or not path.is_file():
+                    continue
                 scanned += 1
                 if scanned > MAX_SCAN_FILES:
                     return entries
@@ -315,27 +331,41 @@ def _windows_start_menu_entries() -> list[AppEntry]:
                         name=name,
                         kind=_KIND_EXEC,
                         target=executable,
-                        source="startmenu",
+                        source=source_name,
                     ))
-                else:
-                    # Parameterised shortcuts must remain shortcuts. Chromium
-                    # PWAs are tagged generically from their switches, not from
-                    # a hard-coded site list, so Arena, Twitch, YouTube and any
-                    # future installed web app follow the same path.
-                    lowered_arguments = shortcut_arguments.casefold()
-                    source = "webapp" if any(
-                        switch in lowered_arguments
-                        for switch in ("--app-id=", "--app=")
-                    ) else "startmenu"
-                    entries.append(AppEntry(
-                        name=name,
-                        kind=_KIND_LNK,
-                        target=str(path),
-                        source=source,
-                    ))
+                    continue
+
+                # Parameterised shortcuts must remain shortcuts. Chromium PWAs
+                # are tagged generically from their switches, not from a
+                # hard-coded site list, so current and future apps work alike.
+                lowered_arguments = shortcut_arguments.casefold()
+                source = "webapp" if any(
+                    switch in lowered_arguments
+                    for switch in ("--app-id=", "--app=")
+                ) else source_name
+                entries.append(AppEntry(
+                    name=name,
+                    kind=_KIND_LNK,
+                    target=str(path),
+                    source=source,
+                ))
         except OSError:
             continue
     return entries
+
+
+def _windows_start_menu_entries() -> list[AppEntry]:
+    roots = []
+    for variable in ("ProgramData", "APPDATA"):
+        base = os.environ.get(variable, "")
+        if base:
+            roots.append(Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    return _windows_shortcut_entries(roots, source_name="startmenu")
+
+
+def _windows_desktop_entries() -> list[AppEntry]:
+    """Discover personal app shortcuts from Desktop, including OneDrive Desktop."""
+    return _windows_shortcut_entries(desktop_candidates(), source_name="desktop")
 
 
 def _windows_roblox_entries() -> list[AppEntry]:
@@ -398,10 +428,17 @@ def _windows_store_entries() -> list[AppEntry]:
     if not powershell:
         return entries
     try:
+        # Windows PowerShell otherwise writes in the active legacy code page.
+        # App names frequently contain bytes that cp1252 cannot decode (the
+        # 0x81 errors seen in the live app sequence), so force UTF-8 at the
+        # producer and make decoding loss-tolerant as a final guard.
+        command = (
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "
+            "Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }"
+        )
         completed = subprocess.run(
-            [powershell, "-NoProfile", "-NonInteractive", "-Command",
-             "Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }"],
-            capture_output=True, text=True, timeout=25,
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
         )
     except Exception:
         return entries
@@ -430,6 +467,7 @@ def _scan_windows() -> list[AppEntry]:
     entries = list(_WINDOWS_URI_ENTRIES)
     entries += _windows_registry_entries()
     entries += _windows_start_menu_entries()
+    entries += _windows_desktop_entries()
     entries += _windows_roblox_entries()
     entries += _windows_store_entries()
     return entries
@@ -530,8 +568,8 @@ _SCANNERS = {"Windows": _scan_windows, "Darwin": _scan_macos, "Linux": _scan_lin
 def _deduplicate(entries: list[AppEntry]) -> list[AppEntry]:
     """Keep one entry per name, preferring the most directly launchable source."""
     rank = {
-        "registry": 0, "builtin": 0, "bundle": 1, "desktop": 1,
-        "webapp": 1, "startmenu": 2, "appsfolder": 3, "roblox": 1,
+        "registry": 0, "builtin": 0, "bundle": 1, "webapp": 1,
+        "startmenu": 2, "desktop": 2, "appsfolder": 3, "roblox": 1,
     }
 
     def _rank(item: AppEntry) -> int:

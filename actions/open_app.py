@@ -466,6 +466,13 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
     started_at = time.monotonic()
     deadline = started_at + max(1.0, timeout)
     single_new_since: float | None = None
+    # A window matching the requested name may already have existed just before
+    # the launch snapshot (or appear while cancellation is being requested).
+    # Give a new process a tiny settling interval before accepting a title-only
+    # match; PID ownership remains immediate above. This also makes a cancelled
+    # wait deterministic instead of sometimes returning an unrelated Chrome
+    # window before its cancellation event can be observed.
+    title_match_not_before = started_at + 0.20
     while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             return None
@@ -505,7 +512,7 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
         matching_new = [
             window for window in matching_all if _window_key(window) not in existing_keys
         ]
-        if matching_new:
+        if matching_new and time.monotonic() >= title_match_not_before:
             return matching_new[-1]
 
         if allow_focused_existing and time.monotonic() - started_at >= 0.75:

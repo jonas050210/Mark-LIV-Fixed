@@ -191,7 +191,7 @@ def _dashboard_assets() -> str:
     try:
         completed = subprocess.run(
             [node, "--check", str(script_path)],
-            capture_output=True, text=True, timeout=20, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False,
         )
     finally:
         script_path.unlink(missing_ok=True)
@@ -231,7 +231,7 @@ def _setup_and_requirements() -> str:
         raise RuntimeError("the required PyQt6 dependency is missing")
     completed = subprocess.run(
         [sys.executable, "setup.py", "--check"],
-        cwd=REPO, capture_output=True, text=True, timeout=30, check=False,
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
     )
     if completed.returncode:
         detail = (completed.stderr or completed.stdout).strip()
@@ -298,7 +298,7 @@ def _run_unit_tests() -> str:
     env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", "test_*.py", "-v"],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=300, check=False,
+        cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, check=False,
     )
     if completed.returncode:
         tail = (completed.stderr or completed.stdout).strip().splitlines()[-30:]
@@ -364,14 +364,14 @@ def _run_coverage() -> str:
         completed = subprocess.run(
             common + ["run", "--source", ".", "--omit", "tests/*,*/site-packages/*",
                       "-m", "unittest", "discover", "-s", str(TESTS), "-p", "test_*.py"],
-            cwd=REPO, env=env, capture_output=True, text=True, timeout=600, check=False,
+            cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, check=False,
         )
         if completed.returncode:
             tail = (completed.stderr or completed.stdout).strip().splitlines()[-20:]
             raise RuntimeError("tests failed under coverage:\n" + "\n".join(tail))
         report = subprocess.run(
             common + ["json", "-o", "-", "--quiet"],
-            cwd=REPO, env=env, capture_output=True, text=True, timeout=120, check=False,
+            cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
         )
         if report.returncode:
             raise RuntimeError("coverage report failed: " + report.stderr.strip()[-400:])
@@ -408,7 +408,7 @@ def _run_windows_tests() -> str:
     env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
         [sys.executable, "-m", "unittest", "tests.test_windows_integration", "-v"],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=180, check=False,
+        cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, check=False,
     )
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout).strip()[-5000:])
@@ -419,7 +419,7 @@ def _environment() -> dict:
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=REPO, capture_output=True, text=True, check=False, timeout=10,
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=10,
         ).stdout.strip()
     except OSError:
         commit = ""
