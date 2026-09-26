@@ -441,7 +441,9 @@ TOOL = {
                 "description": (
                     "Which monitor: a 1-based number ('1', '2'), 'primary'/'main' "
                     "(the Windows primary display), 'secondary'/'second' (the other "
-                    "display), 'left'/'right' (by physical position), or 'monitor 2'."
+                    "display), 'left'/'right' (by physical position), or 'monitor 2'. "
+                    "German is accepted too: 'ersten'/'zweiten'/'dritten' (or any "
+                    "case form), 'Hauptmonitor', 'links'/'rechts', 'Bildschirm 2'."
                 ),
             },
             "side": {

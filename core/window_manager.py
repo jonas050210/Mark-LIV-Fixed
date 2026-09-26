@@ -99,8 +99,21 @@ class MonitorInfo:
         return max(0, self.work_bottom - self.work_top)
 
 
+def fold_umlauts(value: str) -> str:
+    """German umlauts to their base letters, so matching survives either
+    spelling: a window titled 'Müller Rechnung' is findable as 'muller', and
+    a spoken 'öffne Spotify' normalises to 'offne spotify'."""
+    return (
+        str(value or "")
+        .replace("ä", "a").replace("ö", "o").replace("ü", "u")
+        .replace("ß", "ss").replace("Ä", "a").replace("Ö", "o").replace("Ü", "u")
+    )
+
+
 def _normalise(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+    return re.sub(
+        r"[^a-z0-9]+", " ", fold_umlauts(str(value or "").casefold())
+    ).strip()
 
 
 def _process_name(pid: int) -> str:
@@ -131,6 +144,13 @@ _BROWSER_PROCESS_STEMS = {
 _GENERIC_BROWSER_WORDS = {
     "browser", "web browser", "webbrowser", "internet", "internet browser",
     "browser window", "the browser", "my browser",
+    # German — the assistant is spoken to in both languages, and "Browser"
+    # itself already matched; these are the phrases around it that did not.
+    # Compounds are listed too: spoken German fuses "Browserfenster" into
+    # one word, which _normalise keeps as a single token.
+    "browser fenster", "das browser fenster", "internet fenster",
+    "webbrowser fenster", "der browser", "mein browser",
+    "browserfenster", "internetfenster", "webbrowserfenster",
 }
 
 
@@ -628,10 +648,12 @@ def clear_launch_memory() -> None:
 
 
 # Words that carry no identity; a shared one of these must never make two
-# different names "agree".
+# different names "agree". English and German, post-umlaut-folding.
 _LABEL_NOISE_WORDS = {
     "the", "a", "an", "app", "application", "please", "open", "opened",
     "launch", "launched", "start", "started", "window", "and", "on", "in",
+    "und", "bitte", "offne", "geoffnet", "mache", "mach", "fenster",
+    "auf", "den", "dem", "der", "die", "das", "ein", "eine",
 }
 
 
@@ -887,6 +909,14 @@ _ORDINAL_WORDS = {
     "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
 }
 
+# German ordinals arrive with case endings — "ersten", "erste", "erster" are
+# all "first" — so they are matched by stem rather than by a table of every
+# inflection. The umlaut folding upstream keeps "fünften" intact as "funften".
+_DE_ORDINAL_STEMS = {
+    "erst": 1, "zweit": 2, "dritt": 3, "viert": 4, "funft": 5, "fünft": 5,
+    "sechst": 6, "siebt": 7, "acht": 8, "neunt": 9, "zehnt": 10,
+}
+
 
 def resolve_monitor_token(token: int | str | None) -> int:
     """Resolve a spoken or typed monitor reference to a 1-based index.
@@ -896,7 +926,9 @@ def resolve_monitor_token(token: int | str | None) -> int:
     primary display, per the user's own definition of "main monitor"),
     secondary/second (the other display, whichever one that is), or
     left/right (chosen by physical position, for setups where the user
-    thinks in terms of arrangement rather than numbers). Raises ValueError
+    thinks in terms of arrangement rather than numbers). German references
+    resolve natively: "ersten/zweiten/…" (ordinals with any case ending),
+    "links"/"rechts", "Hauptmonitor", "Bildschirm 2". Raises ValueError
     with a message safe to show the user when the token cannot be resolved
     against the monitors actually connected.
     """
@@ -926,28 +958,39 @@ def resolve_monitor_token(token: int | str | None) -> int:
             f"monitor must be between 1 and {len(monitors)} (there is no monitor {value})"
         )
 
-    words = set(re.findall(r"[a-z]+", text.casefold()))
+    words = set(
+        re.findall(r"[a-zäöüß]+", fold_umlauts(str(text).casefold()))
+    )
     if not words:
         raise ValueError("no monitor was specified")
 
     primary = next((m for m in monitors if m.primary), monitors[0])
     non_primary = [m for m in monitors if m.index != primary.index]
 
-    if words & {"primary", "main"}:
+    if words & {"primary", "main", "haupt", "hauptmonitor", "hauptbildschirm"}:
         return primary.index
-    if words & {"secondary", "second", "other"}:
+    if words & {"secondary", "second", "other", "anderer", "anderen", "anderes"}:
         if non_primary:
             return non_primary[0].index
         raise ValueError("only one monitor is connected")
-    if words & {"left", "leftmost"}:
+    if words & {"left", "leftmost", "links"}:
         return min(monitors, key=lambda m: m.left).index
-    if words & {"right", "rightmost"}:
+    if words & {"right", "rightmost", "rechts"}:
         return max(monitors, key=lambda m: m.left).index
     for word, value in _ORDINAL_WORDS.items():
         if word in words:
             if 1 <= value <= len(monitors):
                 return value
             raise ValueError(f"monitor must be between 1 and {len(monitors)}")
+    # German ordinals by stem: any word that merely *starts* with "erst",
+    # "zweit", … is that ordinal in some case form ("auf meinen ERSTEN
+    # Monitor" must not fail because the English table has no "ersten").
+    for word in words:
+        for stem, value in _DE_ORDINAL_STEMS.items():
+            if word.startswith(stem):
+                if 1 <= value <= len(monitors):
+                    return value
+                raise ValueError(f"monitor must be between 1 and {len(monitors)}")
 
     raise ValueError(
         "monitor must be a number, 'primary', 'secondary', 'left', 'right', or 'monitor N'"

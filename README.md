@@ -47,6 +47,8 @@ The assistant now has named window and monitor control. Examples:
 - `Open YouTube` … `Make it fullscreen on monitor 1` (works even while the page title is still loading)
 - `Make the browser fullscreen` (any browser window: Chrome, Edge, Firefox, Brave, …)
 - `Shutdown` / `Close yourself` / `Beende dich` — closes the assistant immediately
+- German works natively where it is spoken: `auf meinen ersten Monitor`, `Hauptmonitor`, `links`/`rechts` (monitor names), `mach lauter` / `ton aus` / `lautstärke auf 30`, `bildschirm sperren`, `dunkelmodus`, `pc ausschalten` (with the usual confirmation), and window titles with umlauts match with or without them (`Müller` = `muller`)
+- `list_tabs` / `switch_tab` — number or title part switches between the tabs of a browser window the assistant controls (`switch_tab: YouTube`); without one it says so honestly instead of opening anything
 
 Window commands survive the two classic races: a page whose title has not loaded yet is re-checked for a few seconds, and the window the assistant itself just opened is remembered, so a follow-up command still finds it. When nothing matches, the currently visible windows are listed back so the assistant can correct itself in the same conversation instead of insisting nothing is open. The settings drawer's **OPEN WINDOWS** panel shows the same list — every window the desktop reports, with the backend name that produced it — and each row focuses its window on click; the panel refreshes itself while open. A tray icon offers show/hide, the window list, and an immediate shutdown.
 

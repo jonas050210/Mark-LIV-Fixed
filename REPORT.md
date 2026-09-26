@@ -1,6 +1,6 @@
 # MARK LIV — Fix- & Verbesserungsreport (Kurzformat)
 
-**Datum:** 26.09.2026 · **Branch:** `arena/01a0dd3a-mark-liv-fixed` · **Status:** ✅ Runde 1 + Runde 2 fertig · 713 Tests grün, Linter sauber
+**Datum:** 26.09.2026 · **Branch:** `arena/01a0dd3a-mark-liv-fixed` · **Status:** ✅ Runde 1–3 fertig · 749 Tests grün, Linter sauber
 
 ---
 
@@ -75,10 +75,38 @@ Dein Mitschnitt (YouTube geöffnet → „Mache es Fullscreen auf meinen ersten 
 - Neu: `tests/test_window_events.py` (8 Tests: Fallback-Sleep, Revision, Cache-Gültigkeit/-Invalidierung, Bypass ohne Hook) und 12 Per-App-Volume-Tests in `tests/test_audio_manager.py` (fake pycaw-Modul, Setzen/Clamp/Mute/Undo/Mehrdeutigkeit/ehrliche Fehler).
 - `ruff check .` sauber.
 
-## 7) Weitere Verbesserungsvorschläge (offen)
+## 7) Runde 3 — umgesetzte Verbesserungen (Sprache & Tabs)
 
-1. **Tab-Bewusstsein:** Browser via CDP auslesen, damit „der YouTube-Tab" unter 20 offenen Tabs gezielt ansprechbar ist (nicht nur das Fenster).
+| # | Typ | Datei(en) | Änderung | Nutzen |
+|---|-----|-----------|----------|--------|
+| 20 | ✨ Feature | `core/window_manager.py` | **Deutsche Monitor-Namen:** „auf meinen **ersten** Monitor", „**zweiten**", … (jede Kasusform), „**Hauptmonitor**", „**links**/**rechts**", „**anderen** Monitor", „Bildschirm 2" | Der originalen Nutzer-Transkript-Satz funktioniert jetzt wörtlich |
+| 21 | 🐛 Fix | `core/window_manager.py` | **Umlaut-Faltung** in `_normalise`: ä→a, ö→o, ü→u, ß→ss | „Müller" hieß bislang „m ller" — jedes Fenster mit Umlaut im Titel war nicht treffbar; jetzt matcht auch getipptes „muller" |
+| 22 | ✨ Feature | `core/window_manager.py` | **Deutsche Browser-/Füllwörter:** „Browser(-)fenster", „Internetfenster" als generische Referenz; „öffne/bitte/und/fenster/das/die…" sind Rauschen bei der Label-Prüfung | „öffne bitte das Spotify Fenster" verwechselt nichts mehr — nur der echte Name zählt |
+| 23 | ✨ Feature | `actions/browser_control.py` | **Tab-Bewusstsein Teil 1:** `list_tabs` (nummerierte Liste, aktiver Tab markiert) + `switch_tab` (Nummer oder Titel-/URL-Teil, Umlaut-faltend, bringt den Tab nach vorn) | Mehrere offene Seiten in der gesteuerten Session gezielt wechseln, ohne neu zu navigieren |
+| 24 | 🛡️ Ehrlichkeit | `actions/browser_control.py` | list/switch_tabs **nur mit bestehender Session** — kein heimlich geöffnetes Automationsfenster; ohne Session ehrliche Antwort | Kein „ich sehe deine Tabs" über die Grenzen hinaus (echte Browser-Tabs bräuchten einen Debug-Port) |
+| 25 | ✨ Feature | `actions/computer_settings.py` | **Deutsche System-Befehle:** „mach lauter/leiser", „ton aus", „lautstärke auf 30", „heller/dunkler", „bildschirm sperren", „dunkelmodus", „wlan", „neu laden", „vollbild", „pc ausschalten/herunterfahren", „neustart", … | Alltägliche deutsche Sprachbefehle treffen die richtige Aktion statt „unbekannter Befehl" |
+| 26 | 🛡️ Schutz | `actions/computer_settings.py` | „ton" mit Wortgrenze erkannt | „button 3" wird nicht mehr als „Lautstärke 3" fehlinterpretiert |
+| 27 | 📝 Doku | `actions/window_manager.py`, `actions/open_app.py`, `actions/browser_control.py` | Tool-Beschreibungen nennen die deutschen Monitor-Token bzw. `tab`-Parameter | Das Modell weiß, dass es Deutsch übergeben darf — ohne GUI-Änderung |
+
+**Keine GUI-Änderungen** (wie gewünscht): `ui.py`, `ui_panels/`, Tray und Dashboard sind unberührt.
+
+**Details:**
+- **Deutsche Ordinalia** werden über Stämme (erst-, zweit-, dritt- … zehnt-) erkannt, damit jede Kasus-/Endungsform („ersten/erste/erster") trifft; die Zahl im Namen („Bildschirm 2") gewinnt weiterhin immer zuerst, genau wie „primary/secondary/left/right" (jetzt plus „Haupt-", „anderen", „links/rechts").
+- **Tab-Bewusstsein Teil 1** sieht nur die Tabs des Fensters, das der Assistent selbst steuert (Playwright-Session) — die Tabs des normalen Benutzer-Browsers sind ohne Debug-Port prinzipiell nicht einsehbar. Genau das sagt die Meldung, statt etwas zu behaupten oder still ein Fenster zu öffnen.
+- **Power-Befehle** („pc ausschalten" …) behalten die Bestätigungsgate wie englische Pendants; nur „shutdown"/„schließe dich" **über den Assistenten** schließt weiterhin sofort (Runde-1-Vertrag, unangetastet).
+
+## 8) Testergebnis Runde 3
+
+- **749 Tests grün** (752 gesamt; 3 vorbestehende Umgebungsfehler wie auf `main`: `defusedxml` ×2, `core/explorer._OS` ×1 — nicht durch diese Änderungen).
+- Neu: `tests/test_german_commands.py` (38 Tests): Umlaut-Faltung, deutsche Monitor-Token (Ordinalia in allen Kasus, Ablehnung bei „dritten" mit 2 Monitoren, semantische Namen), generische Browser-Wörter, Füllwort-Rauschen, deutsche System-Aliase inkl. „button 3"-Schutz, Tab-Session-Methoden (Liste/Nummer/Titel/Umlaut/Fehlerfälle) und Routing (ehrliche Meldung ohne Session, Weiterleitung mit).
+- Schema-/Dispatcher-Konsistenztest weiter grün (neue Aktionen in `_DIRECT_ACTIONS` deklariert).
+- `ruff check .` sauber. Root-`test_overall.py` unverändert zum Baseline (8 bestanden, 1 vorbestehend fehlgeschlagen, 3 übersprungen).
+
+## 9) Weitere Verbesserungsvorschläge (offen)
+
+1. **Tab-Bewusstsein Teil 2:** Browser via CDP auslesen, damit „der YouTube-Tab" unter 20 Tabs des *normalen* Browsers gezielt ansprechbar ist (braucht Start mit `--remote-debugging-port`; Teil 1 deckt nur die gesteuerte Session ab).
 2. **Deutsches Wake-Word-Modell** (openWakeWord custom), damit „Jarvis" zuverlässiger reagiert.
-3. **Dashboard-Fernsteuerung:** OPEN-WINDOWS-Panel auch ins Phone-Dashboard legen (per-window Fokus/Close existiert dort schon; die Backend-Diagnosezeile fehlt).
+3. **Dashboard-Fernsteuerung:** OPEN-WINDOWS-Panel auch ins Phone-Dashboard legen (GUI-Änderung, deshalb in Runde 3 bewusst ausgelassen).
 4. **Mikrofon-Routing pro Befehl** (z. B. Kommunikation vs. Standard) — erweiterbar über `audio_manager`.
+
 
