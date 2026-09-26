@@ -99,6 +99,49 @@ class SetSystemOutputTests(unittest.TestCase):
         self.assertEqual(undo.peek(), "")
 
 
+class MarkLivDeviceSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        undo.clear()
+
+    def tearDown(self) -> None:
+        undo.clear()
+
+    def test_unique_partial_name_resolves_to_the_listed_microphone(self) -> None:
+        with patch.object(audio_manager, "get_input_device", return_value="Old Mic"), \
+             patch.object(audio_manager, "get_output_device", return_value="Old Speakers"), \
+             patch.object(audio_manager.audio_devices, "list_devices", return_value=["JBL Quantum 400 Microphone"]), \
+             patch.object(audio_manager, "save_input_device") as save:
+            result = audio_manager.audio_manager(
+                {"action": "set_input", "device": "jbl quantum"}
+            )
+        save.assert_called_once_with("JBL Quantum 400 Microphone")
+        self.assertIn("JBL Quantum 400 Microphone", result)
+
+    def test_unknown_device_is_not_saved_or_reconnected(self) -> None:
+        with patch.object(audio_manager, "get_input_device", return_value="Old Mic"), \
+             patch.object(audio_manager, "get_output_device", return_value="Old Speakers"), \
+             patch.object(audio_manager.audio_devices, "list_devices", return_value=["JBL Quantum 400 Microphone"]), \
+             patch.object(audio_manager, "save_input_device") as save:
+            result = audio_manager.audio_manager(
+                {"action": "set_input", "device": "nonexistent microphone"}
+            )
+        self.assertIn("could not find a selectable microphone", result.casefold())
+        save.assert_not_called()
+        self.assertEqual(undo.peek(), "")
+
+    def test_ambiguous_device_name_requires_an_exact_choice(self) -> None:
+        with patch.object(audio_manager, "get_input_device", return_value="Old Mic"), \
+             patch.object(audio_manager, "get_output_device", return_value="Old Speakers"), \
+             patch.object(
+                 audio_manager.audio_devices,
+                 "list_devices",
+                 return_value=["JBL Quantum 400 Microphone", "JBL Webcam Microphone"],
+             ), patch.object(audio_manager, "save_input_device") as save:
+            result = audio_manager.audio_manager({"action": "set_input", "device": "jbl"})
+        self.assertIn("matches more than one microphone", result)
+        save.assert_not_called()
+
+
 class UnknownActionTests(unittest.TestCase):
     def test_an_unrecognised_action_lists_every_valid_one(self) -> None:
         result = audio_manager.audio_manager({"action": "does_not_exist"})
