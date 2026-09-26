@@ -799,7 +799,7 @@ Primary MARK LIV application entry point. It coordinates:
 - memory and proactive behavior.
 
 #### `ui.py`
-Main local desktop GUI. It renders the avatar, HUD, settings, confirmations, logs, status, input controls, audio controls, wake-word controls, and local control surface. The settings drawer exposes a live 30/60/120/240/unlimited HUD render cap. Animation, audio decay, smoothing, blinking, and fallback-core interpolation are wall-clock based so changing FPS does not alter motion speed. Clipboard-change detection and its popup were removed; explicit clipboard commands remain separate actions.
+Main local desktop GUI. It renders the avatar, HUD, settings, confirmations, logs, status, input controls, audio controls, wake-word controls, and local control surface. The HUD uses a fixed 180 FPS render target; the settings drawer has no frame-rate selector. Animation, audio decay, smoothing, blinking, and fallback-core interpolation are wall-clock based. Clipboard-change detection and its popup were removed; explicit clipboard commands remain separate actions.
 
 #### `check_wake_word.py`
 Safe standalone diagnostic for optional wake-word readiness. It avoids importing or executing unsafe native functionality in the main GUI process.
@@ -1020,7 +1020,7 @@ Runtime secret/config files such as `api_keys.json`, Spotify tokens, OAuth crede
 Marks the memory directory as a package.
 
 #### `memory/config_manager.py`
-Validated transactional configuration storage with bounded display names, atomic patches, private files, sanitized diagnostics, and validated HUD FPS persistence for 30, 60, 120, 240, or unlimited rendering.
+Validated transactional configuration storage with bounded display names, atomic patches, private files, and sanitized diagnostics. HUD frame rate is fixed in the UI and is not persisted as a user setting.
 
 #### `memory/memory_manager.py`
 Validated transactional long-term memory with bounded values, prompt-core and index budgets, session-summary save/peek/acknowledge behavior, and safe corruption recovery.
@@ -1042,7 +1042,7 @@ Template and example structure for creating a new plugin.
 Tests bounded app listing, explicit index refresh, immediate window-close policy, and native handle routing from legacy system-control requests.
 
 #### `tests/test_reliable_core_actions.py`
-Tests application status/restart safety, named multi-window operations, `open_with`, every supported HUD FPS value, invalid FPS rejection, and permanent removal of clipboard-change detection.
+Tests application status/restart safety, named multi-window operations, `open_with`, the fixed 180 FPS HUD with no selectable setting, and permanent removal of clipboard-change detection.
 
 #### `tests/test_action_policy.py`
 Tests trusted action loading, strict schemas, confirmation expiry and race handling, bounded web-search workers, reminder storage, process cancellation, process-group escalation, and bounded output tails.
@@ -1374,8 +1374,8 @@ This pass followed the rule that a smaller native action is better than a broad 
 - Added `app_catalog` (`list`, `refresh`) and `app_lifecycle` (`status`, `diagnose`, `restart`). Graceful restart waits for closure and never force-kills an app that may contain unsaved work.
 - Extended `window_manager` with `list_app_windows`, `minimize_all`, and `close_all`, all requiring an explicit target application.
 - Added `file_controller.open_with`, which resolves exactly one safe file and passes it to a named indexed application as a real argv item.
-- Added a live HUD frame-rate selector for 30, 60, 120, 240, or unlimited FPS. It changes MARK LIV's HUD only, not game FPS.
-- Made HUD phase, blink cadence, audio decay, smoothing, and fallback interpolation wall-clock based so changing FPS does not speed up or slow down animation.
+- HUD render timing is now fixed at a 180 FPS target. The selectable HUD frame-rate control was removed; this changes MARK LIV's HUD only, not game FPS.
+- Kept HUD phase, blink cadence, audio decay, smoothing, and fallback interpolation wall-clock based so the fixed render target does not change animation speed.
 - Removed clipboard-change detection, the automatic clipboard popup, signal wiring, resize logic, and implicit clipboard-text handoff. Explicit user-requested copy/paste actions remain.
 
 ### 18.2 File-by-file synchronization
@@ -1396,7 +1396,7 @@ This pass followed the rule that a smaller native action is better than a broad 
 | `actions/file_controller.py` | Adds safe `open_with` and rechecks the final resolved/search result against path policy. |
 | `core/app_index.py` | Cache version 2, PWA shortcut metadata, Roblox sources, source signatures, ranking, and dead-target handling. |
 | `core/window_manager.py` | Adds thresholded all-window matching so destructive batch calls can reject weak fuzzy matches. |
-| `memory/config_manager.py` | Validates and transactionally stores only 30/60/120/240/0 HUD FPS values. |
+| `memory/config_manager.py` | Transactional runtime configuration; HUD FPS is fixed in the UI rather than persisted. |
 | `tests/test_app_catalog.py` | Covers app catalog, immediate-close metadata, and native legacy-action routing. |
 | `tests/test_app_index_internals.py` | Covers Arena/Twitch/YouTube PWAs, ordinary shortcuts, Roblox discovery, and cache-version rebuilds. |
 | `tests/test_app_launcher.py` | Covers stale-target repair, bounded retry, and browser-tab/PWA ambiguity. |

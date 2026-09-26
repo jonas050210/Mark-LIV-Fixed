@@ -29,7 +29,7 @@ from PyQt6.QtGui import (
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
@@ -78,6 +78,12 @@ APP_PROTOCOL = APP_VERSION.split()[-1]
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
 _LEFT_W  = 148
+
+# The HUD is deliberately fixed at one smooth target rather than exposing a
+# performance setting in the drawer. This controls MARK LIV's own rendering,
+# never the frame rate of games or other applications.
+HUD_TARGET_FPS = 180
+HUD_FRAME_SECONDS = 1.0 / HUD_TARGET_FPS
 _RIGHT_W = 340
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -456,23 +462,25 @@ class HudCanvas(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.setTimerType(Qt.TimerType.PreciseTimer)
+        self._tmr.setSingleShot(True)
         self._tmr.timeout.connect(self._step)
-        try:
-            from memory.config_manager import get_hud_max_fps
-            initial_fps = get_hud_max_fps()
-        except Exception:
-            initial_fps = 60
-        self.set_max_fps(initial_fps)
+        self._next_frame_at = time.monotonic()
+        self._schedule_next_frame()
 
-    def set_max_fps(self, fps: int) -> None:
-        """Apply the HUD render cap immediately; zero means event-loop unlimited."""
-        allowed = {30, 60, 120, 240, 0}
-        value = int(fps)
-        if value not in allowed:
-            raise ValueError("HUD FPS must be 30, 60, 120, 240, or 0")
-        self._max_fps = value
-        interval = 0 if value == 0 else max(1, round(1000 / value))
-        self._tmr.start(interval)
+    def _schedule_next_frame(self) -> None:
+        """Schedule the next 180 FPS HUD tick without a selectable cap.
+
+        Qt timers accept whole milliseconds while 180 FPS is 5.56 ms. Carrying
+        a monotonic deadline forward lets successive waits alternate around that
+        fractional value instead of rounding every tick down to 166 FPS.
+        """
+        now = time.monotonic()
+        self._next_frame_at += HUD_FRAME_SECONDS
+        if self._next_frame_at <= now:
+            missed = int((now - self._next_frame_at) / HUD_FRAME_SECONDS) + 1
+            self._next_frame_at += missed * HUD_FRAME_SECONDS
+        delay_ms = max(1, round((self._next_frame_at - now) * 1000))
+        self._tmr.start(delay_ms)
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
@@ -649,7 +657,7 @@ class HudCanvas(QWidget):
             self._scale += (self._tgt_scale - self._scale) * lerp_alpha
             self._halo  += (self._tgt_halo  - self._halo)  * lerp_alpha
 
-        # Wall-clock blinking keeps the same cadence at every FPS setting.
+        # Wall-clock blinking keeps the same cadence at the fixed HUD target.
         if time.monotonic() - self._last_blink_t >= 38 / 60:
             self._blink = not self._blink
             self._last_blink_t = time.monotonic()
@@ -657,15 +665,14 @@ class HudCanvas(QWidget):
         else:
             _blinked = False
 
-        # The selected FPS is the active render ceiling. Idle rendering remains
-        # capped around 20 fps so an unattended assistant does not waste a CPU
-        # core. Unlimited uses a zero-interval precise timer and paints every
-        # active event-loop turn, exactly as labelled in settings.
+        # Active HUD rendering follows the fixed 180 FPS target. Idle rendering
+        # remains around 20 FPS so a hidden or unattended assistant does not
+        # waste a CPU core; animation state still advances smoothly in either
+        # case and resumes without a visual snap.
         self._paint_tick += 1
         active = (self.speaking or amp > 0.02
                   or self.state in ("THINKING", "PROCESSING"))
-        timer_fps = self._max_fps if self._max_fps > 0 else 240
-        idle_divisor = max(1, round(timer_fps / 20))
+        idle_divisor = max(1, round(HUD_TARGET_FPS / 20))
         if _blinked or active or self._paint_tick % idle_divisor == 0:
             # Nothing is on screen when the window is hidden or minimised, so
             # rendering the avatar into it is pure waste — and this app is meant
@@ -673,6 +680,7 @@ class HudCanvas(QWidget):
             # so it picks up mid-motion instead of snapping when you come back.
             if self._on_screen():
                 self.update()
+        self._schedule_next_frame()
 
     def _on_screen(self) -> bool:
         """True only when this canvas can actually be seen by the user."""
@@ -2484,30 +2492,6 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._hud_btn)
         self._refresh_hud_btn()
 
-        fps_row = QWidget()
-        fps_lay = QHBoxLayout(fps_row)
-        fps_lay.setContentsMargins(0, 0, 0, 0)
-        fps_lay.setSpacing(6)
-        fps_lbl = QLabel("HUD MAX FPS")
-        fps_lbl.setFont(QFont("Courier New", 7))
-        fps_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        fps_lay.addWidget(fps_lbl)
-        self._fps_combo = QComboBox()
-        self._fps_combo.setFont(QFont("Courier New", 7))
-        for label, value in (("30", 30), ("60", 60), ("120", 120),
-                             ("240", 240), ("UNLIMITED", 0)):
-            self._fps_combo.addItem(label, value)
-        try:
-            from memory.config_manager import get_hud_max_fps
-            current_fps = get_hud_max_fps()
-        except Exception:
-            current_fps = 60
-        selected = self._fps_combo.findData(current_fps)
-        self._fps_combo.setCurrentIndex(max(0, selected))
-        self._fps_combo.currentIndexChanged.connect(self._change_hud_fps)
-        fps_lay.addWidget(self._fps_combo, 1)
-        lay.addWidget(fps_row)
-
         audio_btn = QPushButton("🎧  AUDIO DEVICES")
         audio_btn.setFixedHeight(26)
         audio_btn.setFont(QFont("Courier New", 7))
@@ -3379,17 +3363,6 @@ class MainWindow(QMainWindow):
         self._log.append_log(
             "SYS: HUD switched to the animated face." if want == "face"
             else "SYS: HUD switched to the reactor core.")
-
-    def _change_hud_fps(self, _index: int):
-        value = int(self._fps_combo.currentData())
-        try:
-            from memory.config_manager import save_hud_max_fps
-            save_hud_max_fps(value)
-            self.hud.set_max_fps(value)
-            label = "unlimited" if value == 0 else str(value)
-            self._log.append_log(f"SYS: HUD maximum frame rate set to {label} FPS.")
-        except Exception as exc:
-            self._log.append_log(f"ERR: Could not set HUD FPS ({type(exc).__name__}).")
 
     def _toggle_ptt(self):
         from memory.config_manager import (get_push_to_talk_enabled,

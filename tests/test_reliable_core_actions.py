@@ -125,17 +125,20 @@ class OpenWithApplicationTests(unittest.TestCase):
         launch.assert_not_called()
 
 
-class HudFrameRateConfigTests(unittest.TestCase):
-    def test_all_declared_frame_rate_options_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(config_manager, "CONFIG_FILE", Path(directory) / "config.json"):
-            for value in (30, 60, 120, 240, 0):
-                config_manager.save_hud_max_fps(value)
-                self.assertEqual(config_manager.get_hud_max_fps(), value)
+class HudFrameRateTests(unittest.TestCase):
+    def test_hud_target_is_fixed_at_180_fps_without_a_settings_control(self) -> None:
+        source = Path(__file__).resolve().parents[1].joinpath("ui.py").read_text(encoding="utf-8")
+        self.assertIn("HUD_TARGET_FPS = 180", source)
+        self.assertIn("HUD_FRAME_SECONDS = 1.0 / HUD_TARGET_FPS", source)
+        self.assertNotIn("HUD MAX FPS", source)
+        self.assertNotIn("_fps_combo", source)
+        self.assertNotIn("_change_hud_fps", source)
+        self.assertNotIn("set_max_fps", source)
 
-    def test_invalid_frame_rate_is_refused(self) -> None:
-        with self.assertRaises(ValueError):
-            config_manager.save_hud_max_fps(144)
+    def test_old_persisted_fps_setting_has_no_active_configuration_api(self) -> None:
+        self.assertFalse(hasattr(config_manager, "get_hud_max_fps"))
+        self.assertFalse(hasattr(config_manager, "save_hud_max_fps"))
+        self.assertFalse(hasattr(config_manager, "HUD_FPS_OPTIONS"))
 
     def test_clipboard_detection_panel_is_removed(self) -> None:
         source = Path(__file__).resolve().parents[1].joinpath("ui.py").read_text(encoding="utf-8")

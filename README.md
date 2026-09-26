@@ -114,7 +114,7 @@ and state.
 
 Application and Explorer control are deliberately conservative. `open Chrome` or `open Roblox` focuses an existing window instead of silently creating another one. A second Roblox client is only attempted for an explicit request such as `open another Roblox`; MARK LIV verifies the new window and moves it to the opposite monitor when a second display is available, otherwise it reports the limitation. File searches resolve Windows known folders, search the user's home folder by default, use Everything when installed, and show numbered candidates when more than one file matches. `open` and `select` only act on a unique exact or search result, so MARK LIV does not guess between similarly named files.
 
-The settings drawer includes a live HUD maximum frame-rate selector for 30, 60, 120, 240, or unlimited FPS. This changes MARK LIV's own software-rendered HUD, not game frame rates. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
+MARK LIV's own software-rendered HUD uses a fixed 180 FPS target; this never changes game frame rates. The frame-rate selector has been removed from settings. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
 
 Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.
 
