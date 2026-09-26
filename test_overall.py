@@ -228,10 +228,26 @@ def _dashboard_route_contract() -> str:
 
 def _setup_and_requirements() -> str:
     ast.parse((REPO / "setup.py").read_text(encoding="utf-8"), filename="setup.py")
-    lines = (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines()
-    requirements = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    requirements: list[str] = []
+    pending = [REPO / "requirements.txt"]
+    seen: set[Path] = set()
+    while pending:
+        source = pending.pop().resolve()
+        if source in seen:
+            continue
+        seen.add(source)
+        if not source.is_file() or source.parent != REPO:
+            raise RuntimeError(f"missing or unsafe requirements include: {source}")
+        for raw in source.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(("-r ", "--requirement ")):
+                pending.append(REPO / line.split(maxsplit=1)[1].strip())
+            else:
+                requirements.append(line)
     if not requirements:
-        raise RuntimeError("requirements.txt contains no dependencies")
+        raise RuntimeError("requirements files contain no dependencies")
     if "PyQt6>=6.6,<7" not in requirements:
         raise RuntimeError("the required PyQt6 dependency is missing")
     completed = subprocess.run(
@@ -321,19 +337,28 @@ def _run_unit_tests() -> str:
 # permission bits, Windows reparse points and the native window API are each
 # unreachable somewhere. A floor that only holds on Linux would fail the
 # Windows runner for no defect.
+OVERALL_COVERAGE_FLOOR = 36
+
 COVERAGE_FLOORS = {
+    "config/__init__.py": 95,
     "core/action_result.py": 90,
     "core/action_runtime.py": 85,
     "core/app_index.py": 76,
     "core/background_scheduler.py": 88,
     "core/browser_handoff.py": 90,
     "core/confirm.py": 70,
+    "core/diagnostics.py": 95,
+    "core/echo.py": 82,
+    "core/installer.py": 95,
     "core/json_store.py": 84,
     "core/path_policy.py": 62,
+    "core/restart.py": 95,
     "core/sandbox.py": 78,
     "core/text_match.py": 82,
     "core/undo.py": 85,
+    "core/viseme.py": 90,
     "memory/session_store.py": 88,
+    "actions/diagnostics.py": 70,
     "actions/layout_manager.py": 74,
     "actions/open_app.py": 60,
     "actions/reminder.py": 65,
@@ -398,9 +423,13 @@ def _run_coverage() -> str:
     if below:
         raise RuntimeError("coverage below the agreed floor — " + "; ".join(below))
     total = measured.get("totals", {}).get("percent_covered", 0.0)
+    if total + 0.5 < OVERALL_COVERAGE_FLOOR:
+        raise RuntimeError(
+            f"overall coverage {total:.0f}% is below {OVERALL_COVERAGE_FLOOR}%"
+        )
     return (
         f"{len(COVERAGE_FLOORS)} safety-critical modules at or above their floor; "
-        f"{total:.0f}% overall"
+        f"{total:.0f}% overall (floor {OVERALL_COVERAGE_FLOOR}%)"
     )
 
 

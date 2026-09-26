@@ -125,13 +125,13 @@ def run_bounded(
         streams = (getattr(proc, "stdout", None), getattr(proc, "stderr", None))
         for thread in capture_threads:
             thread.join(timeout=0.25)
-        for stream, thread in zip(streams, capture_threads):
+        for stream, thread in zip(streams, capture_threads, strict=False):
             if stream is not None and thread.is_alive():
                 try:
                     os.close(stream.fileno())
                 except OSError:
                     pass
-        for stream, thread in zip(streams, capture_threads):
+        for stream, thread in zip(streams, capture_threads, strict=False):
             thread.join(timeout=0.75)
             if stream is not None:
                 try:

@@ -9,7 +9,7 @@ import time
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
-from ui_panels.base import C, HudPanel
+from ui_panels.base import C
 
 
 class RemoteKeyOverlay(QWidget):

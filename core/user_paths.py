@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import platform
 import uuid
 from pathlib import Path
 
@@ -42,8 +41,6 @@ def _windows_known_folder(guid_text: str) -> Path | None:
     The pointer must be freed by the matching COM allocator even when the path
     itself does not currently exist (for example while OneDrive is reconnecting).
     """
-    if platform.system() != "Windows":
-        return None
     pointer = ctypes.c_wchar_p()
     try:
         class GUID(ctypes.Structure):
@@ -101,46 +98,17 @@ def _onedrive_candidates(folder: str, home: Path) -> list[Path]:
     return result
 
 
-def _linux_xdg(name: str, home: Path) -> Path | None:
-    variable = {
-        "desktop": "XDG_DESKTOP_DIR",
-        "documents": "XDG_DOCUMENTS_DIR",
-        "downloads": "XDG_DOWNLOAD_DIR",
-        "pictures": "XDG_PICTURES_DIR",
-        "music": "XDG_MUSIC_DIR",
-        "videos": "XDG_VIDEOS_DIR",
-    }.get(name)
-    if not variable:
-        return None
-    value = os.environ.get(variable, "").strip().strip('"')
-    if not value:
-        return None
-    value = value.replace("${HOME}", str(home)).replace("$HOME", str(home))
-    candidate = Path(value).expanduser()
-    return candidate if candidate.is_absolute() else home / candidate
-
-
 def locations() -> dict[str, Path]:
-    """Return canonical user folders, including OneDrive-redirection on Windows."""
+    """Return Windows Known Folders with OneDrive-aware fallbacks."""
     home = Path.home()
-    system = platform.system()
     found: dict[str, Path] = {"home": home}
     for name, folder in _FOLDER_NAMES.items():
-        if system == "Windows":
-            native = _windows_known_folder(KNOWN_FOLDER_GUIDS[name])
-            if native is not None:
-                found[name] = native
-                continue
-            one_drive = next((path for path in _onedrive_candidates(folder, home) if path.is_dir()), None)
-            if one_drive is not None:
-                found[name] = one_drive
-                continue
-        elif system == "Linux":
-            xdg = _linux_xdg(name, home)
-            if xdg is not None:
-                found[name] = xdg
-                continue
-        found[name] = home / folder
+        native = _windows_known_folder(KNOWN_FOLDER_GUIDS[name])
+        if native is not None:
+            found[name] = native
+            continue
+        one_drive = next((path for path in _onedrive_candidates(folder, home) if path.is_dir()), None)
+        found[name] = one_drive if one_drive is not None else home / folder
     return found
 
 
@@ -158,9 +126,8 @@ def desktop_candidates() -> list[Path]:
     """
     home = Path.home()
     candidates = [location("desktop")]
-    if platform.system() == "Windows":
-        candidates.append(home / "Desktop")
-        candidates.extend(_onedrive_candidates("Desktop", home))
+    candidates.append(home / "Desktop")
+    candidates.extend(_onedrive_candidates("Desktop", home))
     unique: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:

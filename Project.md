@@ -2,7 +2,9 @@
 
 **Repository:** `jonas050210/Mark-LIV-fixed`
 
-**Working branch:** `arena/01a0d9fa-mark-liv-fixed` (branched from the merge of `arena/01a0d987-mark-liv-fixed`, the session that wrote most of this document through §19; see §20 for what changed since)
+**Current reviewed branch:** `arena/01a0dd06-mark-liv-fixed`
+
+Historical branch names later in this document identify the sessions in which that work was completed; they are not checkout instructions.
 
 **Purpose of this document:** This is the complete project record for the current implementation. It explains the project’s purpose, architecture, files, decisions, safety rules, implemented features, tests, limitations, and the work completed during this development session. It is intentionally more detailed than `README.md`.
 
@@ -14,7 +16,7 @@
 
 ## 1. What MARK LIV is
 
-MARK LIV is a cross-platform, JARVIS-style desktop assistant built around the Gemini Live API. It can:
+MARK LIV is a Windows 10/11 JARVIS-style desktop assistant built around the Gemini Live API. Cross-platform references in the historical record below describe earlier implementations; Windows is now the only supported runtime. It can:
 
 - listen and speak in real time;
 - display a holographic animated avatar;
@@ -77,9 +79,9 @@ The important requirements were:
 
 ## 3. Current implementation status
 
-The repository-wide implementation, security hardening, persistence work, regression suite, cross-platform CI, local Session Vault, reliable Windows application launching, and native window-control work are complete on the working branch.
+The repository-wide implementation, security hardening, persistence work, Windows-only CI, local Session Vault, reliable Windows application launching, and native window-control work are complete on the working branch.
 
-As of 2026-09-25, `python test_overall.py` discovers 16 active actions and runs 479 unit tests successfully, with 69 expected optional/platform skips. The overall verification reports 9 passed, 0 failed, and 3 skipped checks in the Linux sandbox. The physical Windows integration suite remains opt-in because it requires an interactive Windows desktop, installed PWAs, Roblox, and real hardware.
+As of 2026-09-26, `python test_overall.py --coverage` discovers 22 active actions and executes 685 tests successfully. In the fully provisioned Linux verification environment, 25 platform/optional tests are skipped, all 26 safety-critical coverage floors and the 36% repository-wide floor pass, the dashboard constructs all 27 routes, and overall verification reports 11 passed, 0 failed, and 1 Windows-hardware skip. The physical Windows integration suite remains opt-in because it requires an interactive Windows desktop, installed PWAs, Roblox, and real hardware.
 
 The current sandbox is Linux, so destructive Windows hardware integration, real Roblox behavior, physical multi-monitor placement, and actual audio-device behavior still require manual validation on suitable hardware. These are environmental validation limits, not unfinished repository code.
 
@@ -1145,12 +1147,11 @@ The three overall skips are explicit environment limits: FastAPI/uvicorn are not
 
 ### Continuous integration
 
-Six jobs: Ubuntu, Windows and macOS against Python 3.11 and 3.13. Each runs
-setup validation, compilation, the full unit suite, and the overall
-verification with `--coverage`; the Linux jobs install the Qt runtime so the
-panel tests execute rather than skip. The Windows jobs additionally run
-`tests/test_windows_integration.py`, and every job uploads its JSON report as
-an artifact.
+Two jobs: Windows against Python 3.11 and 3.13. Each installs the complete
+Windows runtime plus verification dependencies, runs setup validation,
+compilation, lint/security/dependency checks, the full unit suite, overall
+verification with `--coverage`, and `tests/test_windows_integration.py`. Every
+job uploads its JSON report as an artifact.
 
 A GitHub Windows runner has no desktop — it executes in session 0 — so the
 tests that need one skip themselves there. What does run on every Windows

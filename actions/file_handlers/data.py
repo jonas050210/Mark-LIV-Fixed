@@ -216,15 +216,16 @@ def _process_json(path: Path, action: str, params: dict, speak=None) -> str:
 
     return _process_json(path, "analyze", {"instruction": action})
 def _process_xml(path: Path, action: str, params: dict, speak=None) -> str:
+    # XML files are user-controlled. defusedxml rejects entities, DTDs and
+    # expansion attacks in the parser itself instead of relying on a brittle
+    # byte-pattern pre-check.
+    from defusedxml import ElementTree as SafeET
     import xml.etree.ElementTree as ET
 
     action = action or "validate"
     try:
         content = path.read_bytes()
-        upper_content = content.upper()
-        if b"<!DOCTYPE" in upper_content or b"<!ENTITY" in upper_content:
-            return "Invalid XML: DTD and entity declarations are not allowed."
-        root = ET.fromstring(content)
+        root = SafeET.fromstring(content)
         tree = ET.ElementTree(root)
     except Exception as exc:
         return f"Invalid XML: {type(exc).__name__}"

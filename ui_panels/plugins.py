@@ -9,7 +9,7 @@ import threading
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget
-from ui_panels.base import C, HudPanel
+from ui_panels.base import C
 
 
 class PluginManagerOverlay(QWidget):

@@ -18,8 +18,7 @@ class UserPathTests(unittest.TestCase):
             home = Path(directory) / "jonas"
             redirected = home / "OneDrive" / "Desktop"
             redirected.mkdir(parents=True)
-            with patch.object(user_paths.platform, "system", return_value="Windows"), \
-                 patch.object(user_paths.Path, "home", return_value=home), \
+            with patch.object(user_paths.Path, "home", return_value=home), \
                  patch.object(user_paths, "_windows_known_folder", return_value=redirected):
                 found = user_paths.locations()
         self.assertEqual(found["desktop"], redirected)
@@ -30,8 +29,7 @@ class UserPathTests(unittest.TestCase):
             home = Path(directory) / "jonas"
             desktop = home / "OneDrive" / "Desktop"
             desktop.mkdir(parents=True)
-            with patch.object(user_paths.platform, "system", return_value="Windows"), \
-                 patch.object(user_paths.Path, "home", return_value=home), \
+            with patch.object(user_paths.Path, "home", return_value=home), \
                  patch.object(user_paths, "_windows_known_folder", return_value=None), \
                  patch.dict(user_paths.os.environ, {"OneDrive": str(home / "OneDrive")}, clear=False):
                 found = user_paths.locations()
@@ -44,8 +42,7 @@ class UserPathTests(unittest.TestCase):
             legacy = root / "Desktop"
             redirected.mkdir(parents=True)
             legacy.mkdir()
-            with patch.object(user_paths.platform, "system", return_value="Windows"), \
-                 patch.object(user_paths.Path, "home", return_value=root), \
+            with patch.object(user_paths.Path, "home", return_value=root), \
                  patch.object(user_paths, "location", return_value=redirected), \
                  patch.object(user_paths, "_onedrive_candidates", return_value=[redirected]):
                 candidates = user_paths.desktop_candidates()

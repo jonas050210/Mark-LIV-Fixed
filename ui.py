@@ -20,18 +20,17 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
-    QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal,
+    QLineF, QPointF,
+    QRectF, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QBrush, QColor, QDragEnterEvent, QDropEvent, QFont,
+    QKeySequence, QPainter, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QMainWindow, QPushButton, QSizePolicy, QSplitter,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.path_policy import atomic_write_bytes, atomic_write_text, resolve_user_path
@@ -42,12 +41,12 @@ from actions.system_monitor import get_gpu_metrics as _read_gpu_metrics
 # 5600 lines and every panel added to it made the next one harder to place; the
 # window now only learns how to open them.
 from ui_panels.audio_devices import AudioDeviceOverlay
-from ui_panels.base import HudPanel as _HudOverlay
 from ui_panels.confirm import ConfirmBanner
-from ui_panels.customize import CustomizeOverlay, HueWheel
+from ui_panels.customize import CustomizeOverlay
 from ui_panels.memory import MemoryOverlay
 from ui_panels.plugins import PluginManagerOverlay, PluginSettingsOverlay
 from ui_panels.remote_key import RemoteKeyOverlay
+from ui_panels.review import render_review_html
 from ui_panels.setup import SetupOverlay
 
 try:
@@ -1180,7 +1179,7 @@ class _DropCanvas(QWidget):
                    "Images · Video · Audio · PDF · Docs · Code · Data")
 
     def _paint_drag_over(self, p, W, H):
-        cx, cy = W / 2, H / 2
+        cy = H / 2
         p.setFont(QFont("Courier New", 20))
         p.setPen(QPen(qcol(C.PRI), 1))
         p.drawText(QRectF(0, cy - 24, W, 32), Qt.AlignmentFlag.AlignCenter, "⬇")
@@ -2599,63 +2598,9 @@ class MainWindow(QMainWindow):
     # that is presentation; the plugin supplies no styling and knows no palette,
     # which is also what lets a re-theme repaint a review correctly.
 
-    # Severity is marked by a symbol and a colour, not by a word. The findings
-    # themselves are in the user's language, and "[SERIOUS]" sitting inside a
-    # Turkish sentence is the kind of seam this project tries not to have —
-    # while translating the tag would mean a table per language, which is worse.
-    # A shape carries it in every language, and shape plus colour still reads
-    # for someone who cannot separate red from amber. What the marks mean
-    # arrives the way everything else does: JARVIS says it out loud.
-    _REVIEW_MARKS = {"serious": ("RED", "▲"), "caution": ("ACC2", "●"), "note": ("PRI_DIM", "·")}
-
-    @staticmethod
-    def _esc(s) -> str:
-        return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
-                .replace(">", "&gt;").replace("\n", "<br>"))
-
     def _show_review(self, title: str, summary: str, findings, unclear):
         """Slot — Qt main thread. Lays a document review into the content panel."""
-        e = self._esc
-        parts = [f'<div style="color:{C.TEXT}; font-family:Courier New;">']
-
-        if summary:
-            parts.append(
-                f'<div style="color:{C.WHITE}; border-left:2px solid {C.PRI};'
-                f' padding-left:8px; margin-bottom:10px;">{e(summary)}</div>')
-
-        for f in (findings or []):
-            key, mark = self._REVIEW_MARKS.get(f.get("severity"), ("PRI_DIM", "·"))
-            colour = getattr(C, key)
-            parts.append(f'<div style="margin-bottom:11px;">')
-            parts.append(
-                f'<span style="color:{colour}; font-weight:bold;">{mark}</span> '
-                f'<span style="color:{C.WHITE}; font-weight:bold;">'
-                f'{e(f.get("heading"))}</span>')
-            if f.get("detail"):
-                parts.append(f'<div style="margin-left:12px;">{e(f["detail"])}</div>')
-            if f.get("quote"):
-                # The document's own wording, visually separated from the
-                # explanation so the two are never mistaken for each other.
-                parts.append(
-                    f'<div style="margin-left:12px; color:{C.TEXT_DIM};'
-                    f' border-left:1px solid {C.BORDER}; padding-left:7px;">'
-                    f'&ldquo;{e(f["quote"])}&rdquo;</div>')
-            if f.get("suggestion"):
-                parts.append(
-                    f'<div style="margin-left:12px; color:{C.PRI};">'
-                    f'&rarr; {e(f["suggestion"])}</div>')
-            parts.append('</div>')
-
-        if unclear:
-            parts.append(
-                f'<div style="margin-top:6px; border-top:1px solid {C.BORDER};'
-                f' padding-top:7px; color:{C.TEXT_MED};">'
-                'The document does not settle:</div>')
-            for u in unclear:
-                parts.append(
-                    f'<div style="margin-left:12px; color:{C.TEXT_MED};">'
-                    f'&middot; {e(u)}</div>')
-        parts.append('</div>')
+        html = render_review_html(summary, findings, unclear, C)
 
         import time as _time
         self.hud.glance(0.0, -0.85, hold=1.3)
@@ -2667,7 +2612,7 @@ class MainWindow(QMainWindow):
         # imposing one language's rules on all of them is the bug, not the fix.
         self._content_title_lbl.setText((title or "Document")[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))
-        self._content_display.setHtml("".join(parts))
+        self._content_display.setHtml(html)
         self._content_display.moveCursor(
             self._content_display.textCursor().MoveOperation.Start)
         first_show = not self._content_panel.isVisible()
@@ -3622,19 +3567,13 @@ class MainWindow(QMainWindow):
         self.hud.speaking = (state == "SPEAKING")
 
     def _check_config(self) -> bool:
-        data = _read_full_config()
-        key = data.get("gemini_api_key")
-        os_name = data.get("os_system")
-        return (
-            isinstance(key, str) and bool(key.strip())
-            and isinstance(os_name, str)
-            and os_name.strip().lower() in {"windows", "mac", "linux"}
-        )
+        key = _read_full_config().get("gemini_api_key")
+        return isinstance(key, str) and bool(key.strip())
 
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
-        ow, oh = 460, 390
+        ow, oh = 420, 180
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
@@ -3644,14 +3583,11 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    def _on_setup_done(self, key: str, os_name: str):
+    def _on_setup_done(self, key: str):
         from memory.config_manager import patch_config
 
         try:
-            patch_config(
-                gemini_api_key=str(key or "").strip(),
-                os_system=str(os_name or "").strip().lower(),
-            )
+            patch_config(gemini_api_key=str(key or "").strip(), os_system="windows")
         except Exception as exc:
             self._log.append_log(
                 f"ERR: Setup could not save configuration ({type(exc).__name__})."
@@ -3664,9 +3600,7 @@ class MainWindow(QMainWindow):
         self._apply_state("LISTENING")
         from memory.config_manager import get_assistant_name
         self._assistant_name = get_assistant_name()
-        self._log.append_log(
-            f"SYS: Initialised. OS={str(os_name).upper()}. {self._assistant_name} online."
-        )
+        self._log.append_log(f"SYS: Initialised. {self._assistant_name} online.")
 
 
 class _RootShim:

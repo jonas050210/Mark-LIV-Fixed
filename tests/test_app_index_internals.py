@@ -222,7 +222,7 @@ class WindowsSpecialApplicationDiscoveryTests(unittest.TestCase):
             entries = app_index._windows_start_menu_entries()
         web_apps = {entry.name: entry for entry in entries}
         self.assertEqual(set(web_apps), {"Arena", "Twitch", "YouTube"})
-        for name, shortcut in zip(("Arena", "Twitch", "YouTube"), shortcuts):
+        for name, shortcut in zip(("Arena", "Twitch", "YouTube"), shortcuts, strict=False):
             self.assertEqual(web_apps[name].kind, "lnk")
             self.assertEqual(web_apps[name].source, "webapp")
             self.assertEqual(Path(web_apps[name].target), shortcut)

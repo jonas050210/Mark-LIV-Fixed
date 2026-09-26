@@ -196,8 +196,8 @@ def _get_cpu_temp() -> float:
         for name in [
             "coretemp", "k10temp", "cpu_thermal", "acpitz", "cpu-thermal", "zenpower", "it8688",
         ]:
-            if name in temps and temps[name]:
-                return float(temps[name][0].current)
+            if entries := temps.get(name):
+                return float(entries[0].current)
         for entries in temps.values():
             if entries:
                 return float(entries[0].current)

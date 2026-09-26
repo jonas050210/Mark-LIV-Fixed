@@ -284,31 +284,14 @@ def _media_key(action: str) -> bool:
     code = _VK_MEDIA.get(action)
     if code is None:
         return False
-    import platform
+    try:
+        import ctypes
 
-    system = platform.system()
-    if system == "Windows":
-        try:
-            import ctypes
-
-            ctypes.windll.user32.keybd_event(code, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(code, 0, 2, 0)
-            return True
-        except Exception:
-            return False
-    if system == "Linux":
-        import shutil
-        import subprocess
-
-        if shutil.which("playerctl"):
-            command = {"play": "play", "pause": "pause", "playpause": "play-pause",
-                       "next": "next", "previous": "previous", "stop": "stop"}[action]
-            try:
-                return subprocess.run(["playerctl", command], capture_output=True,
-                                      timeout=5).returncode == 0
-            except Exception:
-                return False
-    return False
+        ctypes.windll.user32.keybd_event(code, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(code, 0, 2, 0)
+        return True
+    except Exception:
+        return False
 
 
 def _fallback_note(action: str, api_error: str) -> str:
