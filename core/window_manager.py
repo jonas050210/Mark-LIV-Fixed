@@ -802,7 +802,7 @@ def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
     # Maximising through the native window manager keeps the taskbar visible and
     # avoids sending a focus-dependent key to the wrong application. Keep the
     # legacy spelling accepted, but give it that safer, expected meaning.
-    if state in {"full", "full_screen", "full screen", "fullscreen"}:
+    if state in {"full", "full_screen", "full screen", "fullscreen", "fulscreen"}:
         state = "maximized"
     if state in {"maximize", "maximised", "maximise"}:
         state = "maximized"

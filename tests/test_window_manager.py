@@ -56,7 +56,7 @@ class WindowManagerTests(unittest.TestCase):
         undo_stack.clear()
         with patch("actions.window_manager.find_window", return_value=window), \
              patch("actions.window_manager.place_window", return_value=window) as place:
-            result = window_manager({"action": "fullscreen", "target": "Editor"})
+            result = window_manager({"action": "fulscreen", "target": "Editor"})
         place.assert_called_once_with(window, None, "maximized")
         self.assertIn("maximized", result)
         self.assertIn("taskbar", result)

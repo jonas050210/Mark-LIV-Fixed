@@ -771,7 +771,7 @@ def computer_settings(
         "close_app": "close", "close_window": "close",
         # Spoken fullscreen is the native maximise button, not F11. Keep the
         # taskbar visible and target a real window through window_manager.
-        "full_screen": "maximize", "fullscreen": "maximize",
+        "full_screen": "maximize", "fullscreen": "maximize", "fulscreen": "maximize",
         "move_to_monitor": "move_to_monitor", "snap": "snap",
         "snap_left": "snap", "snap_right": "snap",
     }

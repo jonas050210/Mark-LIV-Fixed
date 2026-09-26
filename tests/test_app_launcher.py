@@ -214,7 +214,7 @@ class PlacementTests(unittest.TestCase):
              patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
              patch("core.window_manager.place_window", return_value=placed) as place:
             result = open_app.open_app(
-                {"app_name": "Chrome", "monitor": 2, "state": "fullscreen"}
+                {"app_name": "Chrome", "monitor": 2, "state": "fulscreen"}
             )
         self.assertIn("monitor 2", result)
         self.assertIn("maximised", result)

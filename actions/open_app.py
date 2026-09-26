@@ -557,7 +557,7 @@ def _placement_request(parameters: dict) -> tuple[int | str | None, str]:
     # Voice "fullscreen" means the Windows maximise control for this app, not
     # F11. The taskbar remains visible; core.window_manager handles the native
     # operation by window handle.
-    if state in {"fullscreen", "full_screen", "full screen", "full"}:
+    if state in {"fullscreen", "fulscreen", "full_screen", "full screen", "full"}:
         state = "maximized"
     return monitor_ref, state
 

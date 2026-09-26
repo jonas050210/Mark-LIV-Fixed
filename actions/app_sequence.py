@@ -134,7 +134,7 @@ def _validate_steps(raw) -> tuple[list[dict], str]:
         state = str(item.get("state") or "").strip().casefold()
         # Keep spoken fullscreen consistent with open_app/window_manager: use
         # the native maximize button and preserve access to the taskbar.
-        if state in {"fullscreen", "full_screen", "full screen", "full"}:
+        if state in {"fullscreen", "fulscreen", "full_screen", "full screen", "full"}:
             state = "maximized"
         if state and state not in _ALLOWED_STATES:
             return [], f"Step {index}: state must be one of {', '.join(sorted(_ALLOWED_STATES))}."

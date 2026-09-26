@@ -138,7 +138,7 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
                 "The application may be showing its own save prompt."
             )
         return f"Closed {_target_label(window)}."
-    if action in {"fullscreen", "full_screen", "full", "maximize", "maximise"}:
+    if action in {"fullscreen", "fulscreen", "full_screen", "full", "maximize", "maximise"}:
         # Spoken "fullscreen" deliberately means the native maximise button:
         # it fills the usable desktop but keeps the Windows taskbar visible.
         # It never sends F11 or a focus-dependent hotkey.
