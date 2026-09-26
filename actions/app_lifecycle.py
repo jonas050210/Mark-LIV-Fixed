@@ -14,9 +14,13 @@ def _process_details(windows) -> list[str]:
     seen: set[int] = set()
     for window in windows:
         pid = int(getattr(window, "pid", 0) or 0)
-        if pid in seen:
+        # Only dedupe on a real pid. Windows with no pid at all previously
+        # collapsed into a single "PID unknown" row after the first one,
+        # silently dropping every other unidentified window from the report.
+        if pid and pid in seen:
             continue
-        seen.add(pid)
+        if pid:
+            seen.add(pid)
         state = "running"
         if pid:
             try:
@@ -72,7 +76,7 @@ def _restart(name: str) -> str:
     if entries and entries[0].source == "webapp" and windows:
         browser_processes = ("chrome", "msedge", "brave", "vivaldi", "opera")
         if any(
-            any(name in str(window.process or "").casefold() for name in browser_processes)
+            any(browser in str(window.process or "").casefold() for browser in browser_processes)
             for window in windows
         ):
             return (

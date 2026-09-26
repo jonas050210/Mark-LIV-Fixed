@@ -442,10 +442,19 @@ class DashboardServer:
         return True
 
     def _reset_login_attempts(self, identity: str) -> None:
-        if identity in self._login_attempts:
-            self._login_attempts.pop(identity, None)
-        else:
-            self._login_attempts.pop("__overflow__", None)
+        """Clear one identity's failed-attempt history after it authenticates.
+
+        Only ever touches that identity's own bucket. The previous version
+        fell back to clearing the shared "__overflow__" bucket whenever the
+        caller's identity had no bucket of its own — which is the ordinary
+        case for any client succeeding on its first try, not just one that
+        had actually been folded into the overflow bucket. That let an
+        unrelated, freshly-seen client wipe out the rate-limit history the
+        overflow bucket was tracking for every other identity sharing it,
+        once the 255-identity cardinality budget had been reached.
+        """
+        self._login_attempts.pop(identity, None)
+
 
     @staticmethod
     def _ssl_enabled() -> bool:
@@ -482,9 +491,9 @@ class DashboardServer:
         A socket that was accepted with a token now revoked would otherwise
         keep receiving broadcasts for as long as it stayed connected.
         """
-        for socket in list(self._clients) + list(self._phone_clients):
+        for client_ws in list(self._clients) + list(self._phone_clients):
             try:
-                await socket.close(code=1008)
+                await client_ws.close(code=1008)
             except Exception:
                 pass
         self._clients.clear()
@@ -1120,7 +1129,9 @@ class DashboardServer:
                 if not 1 <= monitor_index <= 32:
                     return JSONResponse({"ok": False, "error": "monitor must be between 1 and 32."},
                                         status_code=400)
-                parameters["monitor"] = monitor_index
+                # open_app's schema accepts semantic monitor names as well as
+                # numbers, so its "monitor" parameter is a string.
+                parameters["monitor"] = str(monitor_index)
 
             state = body.get("state")
             if state not in (None, ""):

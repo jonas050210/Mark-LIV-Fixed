@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import os
 import platform
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from core.text_match import partial_ratio
 
@@ -617,12 +615,97 @@ def windows_for_pid(pid: int | None) -> list[WindowInfo]:
     return [window for window in list_windows() if int(window.pid or 0) in wanted]
 
 
-def monitor_for(index: int | str | None) -> MonitorInfo:
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+
+
+def resolve_monitor_token(token: int | str | None) -> int:
+    """Resolve a spoken or typed monitor reference to a 1-based index.
+
+    Accepts a plain 1-based number ("2"), an explicit reference ("monitor 2",
+    "display 2", "screen 2"), or a semantic name: primary/main (the Windows
+    primary display, per the user's own definition of "main monitor"),
+    secondary/second (the other display, whichever one that is), or
+    left/right (chosen by physical position, for setups where the user
+    thinks in terms of arrangement rather than numbers). Raises ValueError
+    with a message safe to show the user when the token cannot be resolved
+    against the monitors actually connected.
+    """
     monitors = list_monitors()
-    try:
-        wanted = int(index or 1)
-    except (TypeError, ValueError):
+    if isinstance(token, bool):
+        raise ValueError("monitor must be a number or name, not true/false")
+    if isinstance(token, int):
+        if 1 <= token <= len(monitors):
+            return token
+        raise ValueError(f"monitor must be between 1 and {len(monitors)}")
+    if token is None:
+        raise ValueError("no monitor was specified")
+
+    text = str(token).strip()
+    if not text:
+        raise ValueError("no monitor was specified")
+
+    # An explicit number always wins, whether bare ("2") or phrased
+    # ("monitor 2", "display 2", "second screen" would still fall through to
+    # the word map below because it has no digit).
+    digits = re.findall(r"\d+", text)
+    if digits:
+        value = int(digits[0])
+        if 1 <= value <= len(monitors):
+            return value
+        raise ValueError(
+            f"monitor must be between 1 and {len(monitors)} (there is no monitor {value})"
+        )
+
+    words = set(re.findall(r"[a-z]+", text.casefold()))
+    if not words:
+        raise ValueError("no monitor was specified")
+
+    primary = next((m for m in monitors if m.primary), monitors[0])
+    non_primary = [m for m in monitors if m.index != primary.index]
+
+    if words & {"primary", "main"}:
+        return primary.index
+    if words & {"secondary", "second", "other"}:
+        if non_primary:
+            return non_primary[0].index
+        raise ValueError("only one monitor is connected")
+    if words & {"left", "leftmost"}:
+        return min(monitors, key=lambda m: m.left).index
+    if words & {"right", "rightmost"}:
+        return max(monitors, key=lambda m: m.left).index
+    for word, value in _ORDINAL_WORDS.items():
+        if word in words:
+            if 1 <= value <= len(monitors):
+                return value
+            raise ValueError(f"monitor must be between 1 and {len(monitors)}")
+
+    raise ValueError(
+        "monitor must be a number, 'primary', 'secondary', 'left', 'right', or 'monitor N'"
+    )
+
+
+def monitor_for(index: int | str | None) -> MonitorInfo:
+    """Resolve a monitor reference, defaulting to monitor 1 when unset.
+
+    A bare int keeps its historical lenient behaviour (falsy values default
+    to monitor 1). Strings — semantic ("primary", "secondary", "left") or
+    numeric ("2") — are resolved through resolve_monitor_token, whose
+    ValueError is a clear, user-facing message rather than a silent
+    fallback, since nothing before this depended on strings being ignored.
+    """
+    monitors = list_monitors()
+    if index is None or index == "":
         wanted = 1
+    elif isinstance(index, str):
+        wanted = resolve_monitor_token(index)
+    else:
+        try:
+            wanted = int(index or 1)
+        except (TypeError, ValueError):
+            wanted = 1
     if wanted < 1 or wanted > len(monitors):
         raise ValueError(f"monitor must be between 1 and {len(monitors)}")
     return monitors[wanted - 1]

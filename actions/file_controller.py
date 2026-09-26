@@ -1,3 +1,4 @@
+import errno
 import heapq
 import os
 import shutil
@@ -446,7 +447,254 @@ def delete_file(path: str, name: str = "") -> str:
         return f"Could not delete: {type(e).__name__}"
 
 
-def move_file(path: str, name: str = "", destination: str = "") -> str:
+class _CopyRefused(Exception):
+    """A deliberate policy refusal, not a system error.
+
+    Carries the exact sentence to show the user, so the caller that raised it
+    can return that text verbatim instead of routing it through `_why`, which
+    is meant for translating opaque system exceptions, not for re-explaining a
+    refusal that was already explained.
+    """
+
+
+def _report(report_progress, percent: float, message: str) -> None:
+    """Emit live progress, tolerating a listener that raises."""
+    if report_progress is None:
+        return
+    try:
+        report_progress(max(0, min(100, int(percent))), message)
+    except Exception:
+        pass
+
+
+def _copy_regular_file(src: Path, dst: Path, *, cancel_event=None, report_progress=None) -> None:
+    """Stream-copy one regular file into a not-yet-existing destination path.
+
+    Raises on any problem; a destination file created before the failure is
+    removed so a half-written copy is never left behind. Shared by copy_file
+    and move_file's cross-drive fallback so both get identical safety
+    guarantees (link/type refusal, the 2 GiB cap, fsync before publish) and
+    the same live progress reporting.
+    """
+    created_destination = False
+    try:
+        source_flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        if hasattr(os, "O_NOFOLLOW"):
+            source_flags |= os.O_NOFOLLOW
+        source_descriptor = os.open(src, source_flags)
+        source_details = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_details.st_mode) or _is_reparse(source_details):
+            os.close(source_descriptor)
+            raise OSError("source is not a regular file")
+        if source_details.st_size > _COPY_TREE_MAX_BYTES:
+            os.close(source_descriptor)
+            raise OSError("file copy refused: source exceeds 2 GiB")
+        total = source_details.st_size
+        last_reported = -100
+        with os.fdopen(source_descriptor, "rb") as source:
+            output = dst.open("xb")
+            created_destination = True
+            copied_bytes = 0
+            with output:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("file copy was cancelled")
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > _COPY_TREE_MAX_BYTES:
+                        raise OSError("file grew beyond the 2 GiB copy limit")
+                    output.write(chunk)
+                    if total > 0:
+                        percent = copied_bytes * 100 / total
+                        if percent >= last_reported + 2 or copied_bytes == total:
+                            last_reported = percent
+                            _report(
+                                report_progress, min(percent, 99),
+                                f"Copying {src.name} "
+                                f"({_format_size(copied_bytes)}/{_format_size(total)})",
+                            )
+                output.flush()
+                os.fsync(output.fileno())
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
+    except Exception:
+        if created_destination:
+            dst.unlink(missing_ok=True)
+        raise
+
+
+def _copy_directory_tree(src: Path, dst: Path, *, cancel_event=None, report_progress=None) -> None:
+    """Stage a full copy of a directory tree next to dst, then publish it atomically.
+
+    Raises `_CopyRefused` for a deliberate policy refusal (too many entries,
+    a link, protected data, an unsupported type, or a cooperative cancel) and
+    any other exception for a system failure. Nothing is left half-published
+    on either kind of failure. Shared by copy_file and move_file's cross-drive
+    fallback so both get identical safety guarantees and progress reporting.
+    """
+    scanned = 0
+    estimated_bytes = 0
+    for current, dirs, files in os.walk(src, followlinks=False):
+        if cancel_event is not None and cancel_event.is_set():
+            raise _CopyRefused("Directory copy was cancelled before publication.")
+        for child in [*(Path(current) / n for n in dirs), *(Path(current) / n for n in files)]:
+            scanned += 1
+            if scanned > _COPY_TREE_MAX_ENTRIES:
+                raise _CopyRefused(
+                    f"Directory copy refused: more than {_COPY_TREE_MAX_ENTRIES:,} entries."
+                )
+            child_stat = child.lstat()
+            if stat.S_ISLNK(child_stat.st_mode) or _is_reparse(child_stat):
+                raise _CopyRefused(
+                    f"Directory copy refused: link or reparse point found at {child.name}."
+                )
+            if not _is_safe_path(child):
+                raise _CopyRefused("Directory copy refused: protected data was found in the source.")
+            if stat.S_ISREG(child_stat.st_mode):
+                estimated_bytes += child_stat.st_size
+                if estimated_bytes > _COPY_TREE_MAX_BYTES:
+                    raise _CopyRefused("Directory copy refused: total file size exceeds 2 GiB.")
+            elif not stat.S_ISDIR(child_stat.st_mode):
+                raise _CopyRefused(f"Directory copy refused: unsupported file type at {child.name}.")
+
+    # Build out of sight and publish with a no-replace rename. This prevents
+    # failed/racing copies from exposing a partial tree.
+    staging = dst.parent / f".{dst.name}.copying-{secrets.token_hex(6)}"
+    copied_bytes = 0
+    last_reported = -100
+
+    def _bounded_copy(source_name, destination_name):
+        nonlocal copied_bytes, last_reported
+        source_path = Path(source_name)
+        destination_path = Path(destination_name)
+        flags = (
+            os.O_RDONLY
+            | int(getattr(os, "O_BINARY", 0))
+            | int(getattr(os, "O_NONBLOCK", 0))
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if not _is_safe_path(source_path, mutation=True):
+            raise OSError("source changed to a link or protected path")
+        descriptor = os.open(source_path, flags)
+        try:
+            opened_details = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_details.st_mode) or _is_reparse(opened_details):
+                raise OSError("source changed to an unsupported file type")
+            source_file = os.fdopen(descriptor, "rb")
+            descriptor = -1
+            with source_file, destination_path.open("xb") as output:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("directory copy was cancelled")
+                    chunk = source_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > _COPY_TREE_MAX_BYTES:
+                        raise OSError("directory grew beyond the 2 GiB copy limit")
+                    output.write(chunk)
+                    if estimated_bytes > 0:
+                        percent = copied_bytes * 100 / estimated_bytes
+                        if percent >= last_reported + 2 or copied_bytes >= estimated_bytes:
+                            last_reported = percent
+                            _report(
+                                report_progress, min(percent, 99),
+                                f"Copying {source_path.name} "
+                                f"({_format_size(copied_bytes)}/{_format_size(estimated_bytes)})",
+                            )
+                output.flush()
+                os.fsync(output.fileno())
+            shutil.copystat(source_path, destination_path, follow_symlinks=False)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return str(destination_path)
+
+    try:
+        shutil.copytree(
+            str(src), str(staging), symlinks=True,
+            copy_function=_bounded_copy,
+        )
+        for current, dirs, files in os.walk(staging, followlinks=False):
+            if any((Path(current) / n).is_symlink() for n in [*dirs, *files]):
+                raise OSError("source changed during copy and introduced a symbolic link")
+        move_no_replace(staging, dst)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _move_across_devices(src: Path, dst: Path, *, cancel_event=None, report_progress=None) -> str:
+    """Move a file or directory onto a different filesystem/drive.
+
+    `move_no_replace` (built on the OS rename primitive) can only relink a
+    name within one filesystem; there is no atomic kernel primitive for
+    moving across drives. This copies the data first, verifying it lands
+    intact, and only removes the original -- to the Recycle Bin/Trash, never
+    permanently -- once the copy is proven complete, so a crash mid-copy or a
+    failed removal never leaves the file existing nowhere.
+    """
+    is_dir = src.is_dir()
+    try:
+        if is_dir:
+            if not _recursive_mutation_safe(src):
+                return (
+                    "Directory move refused because it contains protected data, "
+                    "symbolic links, unreadable entries, or too many items."
+                )
+            try:
+                _copy_directory_tree(src, dst, cancel_event=cancel_event, report_progress=report_progress)
+            except _CopyRefused as exc:
+                return f"Cross-drive move refused: {exc}"
+        else:
+            try:
+                _copy_regular_file(src, dst, cancel_event=cancel_event, report_progress=report_progress)
+            except InterruptedError:
+                return "Cross-drive move was cancelled; the original was not touched."
+    except Exception as exc:
+        return f"I could not move it across drives: {_why(exc)}."
+
+    expected = None if is_dir else fingerprint(dst)
+    trashed = _safe_trash(src)
+    if not trashed.startswith("Moved to Trash"):
+        # The copy landed but the original could not be safely removed: undo
+        # the copy rather than leave a silent, unannounced duplicate behind.
+        shutil.rmtree(dst, ignore_errors=True) if is_dir else dst.unlink(missing_ok=True)
+        return f"I could not move it across drives: {trashed}"
+
+    _report(report_progress, 100, f"Moved {dst.name} across drives")
+
+    if is_dir:
+        return (
+            f"Moved: {src.name} → {dst.parent.name}/ (different drive: copied, then "
+            "trashed the original). Directory moves across drives are not "
+            "auto-undoable, the same way directory copies are not."
+        )
+
+    def _undo_cross_device_move():
+        if not dst.exists():
+            refuse(f"'{dst.name}' is no longer at the new location")
+        if not unchanged(dst, expected):
+            refuse(f"'{dst.name}' changed after the move and was left alone")
+        dst.unlink()
+        return _restore_from_trash(src)
+
+    push_undo(
+        f"moved {src.name} to {dst.parent.name}/ (across drives)",
+        _undo_cross_device_move,
+    )
+    return f"Moved: {src.name} → {dst.parent.name}/ (different drive: copied, then trashed the original)."
+
+
+def move_file(
+    path: str, name: str = "", destination: str = "",
+    cancel_event=None, report_progress=None,
+) -> str:
     try:
         base = _resolve_path(path)
         src = base / validate_child_name(name) if name else base
@@ -476,7 +724,18 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         dst.parent.mkdir(parents=True, exist_ok=True)
         origin = src.resolve()
         final = dst.resolve(strict=False)
-        move_no_replace(src, final)
+
+        try:
+            move_no_replace(src, final)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # Different filesystems/drives: the OS rename primitive cannot do
+            # this atomically, so fall back to a verified copy-then-trash.
+            return _move_across_devices(
+                origin, final, cancel_event=cancel_event, report_progress=report_progress,
+            )
+
         after = fingerprint(final)
         push_undo(
             f"moved {origin.name} to {final.parent.name}/",
@@ -488,7 +747,10 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         return f"I could not move it: {_why(e)}."
 
 
-def copy_file(path: str, name: str = "", destination: str = "", cancel_event=None) -> str:
+def copy_file(
+    path: str, name: str = "", destination: str = "",
+    cancel_event=None, report_progress=None,
+) -> str:
     try:
         base = _resolve_path(path)
         src = base / validate_child_name(name) if name else base
@@ -512,130 +774,18 @@ def copy_file(path: str, name: str = "", destination: str = "", cancel_event=Non
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if src.is_dir():
-            scanned = 0
-            estimated_bytes = 0
-            for current, dirs, files in os.walk(src, followlinks=False):
-                if cancel_event is not None and cancel_event.is_set():
-                    return "Directory copy was cancelled before publication."
-                for child in [*(Path(current) / name for name in dirs),
-                              *(Path(current) / name for name in files)]:
-                    scanned += 1
-                    if scanned > _COPY_TREE_MAX_ENTRIES:
-                        return (
-                            "Directory copy refused: more than "
-                            f"{_COPY_TREE_MAX_ENTRIES:,} entries."
-                        )
-                    child_stat = child.lstat()
-                    if stat.S_ISLNK(child_stat.st_mode) or _is_reparse(child_stat):
-                        return f"Directory copy refused: link or reparse point found at {child.name}."
-                    if not _is_safe_path(child):
-                        return "Directory copy refused: protected data was found in the source."
-                    if stat.S_ISREG(child_stat.st_mode):
-                        estimated_bytes += child_stat.st_size
-                        if estimated_bytes > _COPY_TREE_MAX_BYTES:
-                            return "Directory copy refused: total file size exceeds 2 GiB."
-                    elif not stat.S_ISDIR(child_stat.st_mode):
-                        return f"Directory copy refused: unsupported file type at {child.name}."
-
-            # Build out of sight and publish with a no-replace rename. This
-            # prevents failed/racing copies from exposing a partial tree.
-            staging = dst.parent / f".{dst.name}.copying-{secrets.token_hex(6)}"
-            copied_bytes = 0
-
-            def _bounded_copy(source_name, destination_name):
-                nonlocal copied_bytes
-                source_path = Path(source_name)
-                destination_path = Path(destination_name)
-                flags = (
-                    os.O_RDONLY
-                    | int(getattr(os, "O_BINARY", 0))
-                    | int(getattr(os, "O_NONBLOCK", 0))
-                )
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                if not _is_safe_path(source_path, mutation=True):
-                    raise OSError("source changed to a link or protected path")
-                descriptor = os.open(source_path, flags)
-                try:
-                    opened_details = os.fstat(descriptor)
-                    if not stat.S_ISREG(opened_details.st_mode) or _is_reparse(opened_details):
-                        raise OSError("source changed to an unsupported file type")
-                    source_file = os.fdopen(descriptor, "rb")
-                    descriptor = -1
-                    with source_file, destination_path.open("xb") as output:
-                        while True:
-                            if cancel_event is not None and cancel_event.is_set():
-                                raise InterruptedError("directory copy was cancelled")
-                            chunk = source_file.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            copied_bytes += len(chunk)
-                            if copied_bytes > _COPY_TREE_MAX_BYTES:
-                                raise OSError("directory grew beyond the 2 GiB copy limit")
-                            output.write(chunk)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    shutil.copystat(source_path, destination_path, follow_symlinks=False)
-                finally:
-                    if descriptor >= 0:
-                        os.close(descriptor)
-                return str(destination_path)
-
             try:
-                shutil.copytree(
-                    str(src), str(staging), symlinks=True,
-                    copy_function=_bounded_copy,
-                )
-                for current, dirs, files in os.walk(staging, followlinks=False):
-                    if any((Path(current) / name).is_symlink() for name in [*dirs, *files]):
-                        raise OSError("source changed during copy and introduced a symbolic link")
-                move_no_replace(staging, dst)
-            except Exception:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
+                _copy_directory_tree(src, dst, cancel_event=cancel_event, report_progress=report_progress)
+            except _CopyRefused as exc:
+                return str(exc)
+            _report(report_progress, 100, f"Copied {src.name}")
             return (
                 f"Copied: {src.name} → {dst.parent.name}/. Directory copies are "
                 "not auto-deleted by undo because their contents may change."
             )
 
-        created_destination = False
-        try:
-            source_flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
-            if hasattr(os, "O_NOFOLLOW"):
-                source_flags |= os.O_NOFOLLOW
-            source_descriptor = os.open(src, source_flags)
-            source_details = os.fstat(source_descriptor)
-            if not stat.S_ISREG(source_details.st_mode) or _is_reparse(source_details):
-                os.close(source_descriptor)
-                raise OSError("source is not a regular file")
-            if source_details.st_size > _COPY_TREE_MAX_BYTES:
-                os.close(source_descriptor)
-                raise OSError("file copy refused: source exceeds 2 GiB")
-            with os.fdopen(source_descriptor, "rb") as source:
-                output = dst.open("xb")
-                created_destination = True
-                copied_bytes = 0
-                with output:
-                    while True:
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise InterruptedError("file copy was cancelled")
-                        chunk = source.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        copied_bytes += len(chunk)
-                        if copied_bytes > _COPY_TREE_MAX_BYTES:
-                            raise OSError("file grew beyond the 2 GiB copy limit")
-                        output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-            try:
-                shutil.copystat(src, dst, follow_symlinks=False)
-            except OSError:
-                pass
-        except Exception:
-            if created_destination:
-                dst.unlink(missing_ok=True)
-            raise
+        _copy_regular_file(src, dst, cancel_event=cancel_event, report_progress=report_progress)
+        _report(report_progress, 100, f"Copied {src.name}")
         copied = dst.resolve()
         expected = fingerprint(copied)
 
@@ -931,7 +1081,7 @@ def open_explorer(
     try:
         return explorer.open_in_explorer(target, select=select)
     except FileNotFoundError:
-        return f"Explorer is not available on this operating system."
+        return "Explorer is not available on this operating system."
     except Exception as exc:
         return f"Could not open Explorer: {type(exc).__name__}"
 
@@ -999,6 +1149,7 @@ def file_controller(
     player=None,
     session_memory=None,
     cancel_event=None,
+    report_progress=None,
 ) -> str:
     params = parameters if isinstance(parameters, dict) else {}
     action = str(params.get("action") or "").lower().strip()
@@ -1042,7 +1193,13 @@ def file_controller(
             return delete_file(path, name=name)
 
         elif action == "move":
-            return move_file(path, name=name, destination=params.get("destination", ""))
+            return move_file(
+                path,
+                name=name,
+                destination=params.get("destination", ""),
+                cancel_event=cancel_event,
+                report_progress=report_progress,
+            )
 
         elif action == "copy":
             return copy_file(
@@ -1050,6 +1207,7 @@ def file_controller(
                 name=name,
                 destination=params.get("destination", ""),
                 cancel_event=cancel_event,
+                report_progress=report_progress,
             )
 
         elif action == "rename":
@@ -1131,7 +1289,7 @@ TOOL = {
             "destination": {
                 "type": "STRING",
                 "maxLength": 500,
-                "description": "Destination path for move/copy"
+                "description": "Destination path for move/copy. Move works across drives too: if the fast rename is impossible because source and destination are on different filesystems, it copies the data, verifies it, and only then removes the original."
             },
             "new_name": {
                 "type": "STRING",

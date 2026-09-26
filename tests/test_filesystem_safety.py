@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import os
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -130,6 +132,150 @@ class FileControllerSafetyTests(unittest.TestCase):
             self.assertIn("simulated copy failure", result)
             self.assertFalse(destination.exists())
             self.assertEqual(list(root.glob(".*.copying-*")), [])
+
+
+class CopyProgressTests(unittest.TestCase):
+    def test_copy_file_reports_progress_up_to_completion(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "source.bin"
+            source.write_bytes(b"x" * (2 * 1024 * 1024))
+            destination = root / "copy.bin"
+            progress_calls = []
+
+            result = file_controller.copy_file(
+                str(source), destination=str(destination),
+                report_progress=lambda p, m="": progress_calls.append((p, m)),
+            )
+
+            self.assertIn("Copied", result)
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertTrue(progress_calls)
+            self.assertEqual(progress_calls[-1][0], 100)
+            self.assertTrue(all(0 <= p <= 100 for p, _ in progress_calls))
+
+    def test_copy_directory_reports_progress_up_to_completion(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "tree"
+            source.mkdir()
+            (source / "a.bin").write_bytes(b"a" * (1024 * 1024))
+            (source / "b.bin").write_bytes(b"b" * (1024 * 1024))
+            destination = root / "tree_copy"
+            progress_calls = []
+
+            result = file_controller.copy_file(
+                str(source), destination=str(destination),
+                report_progress=lambda p, m="": progress_calls.append((p, m)),
+            )
+
+            self.assertIn("Copied", result)
+            self.assertTrue((destination / "a.bin").exists())
+            self.assertTrue((destination / "b.bin").exists())
+            self.assertTrue(progress_calls)
+            self.assertEqual(progress_calls[-1][0], 100)
+
+    def test_copy_file_cancellation_leaves_no_partial_destination(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "source.bin"
+            source.write_bytes(b"x" * (2 * 1024 * 1024))
+            destination = root / "copy.bin"
+            cancel_event = threading.Event()
+            cancel_event.set()
+
+            result = file_controller.copy_file(
+                str(source), destination=str(destination), cancel_event=cancel_event,
+            )
+
+            self.assertIn("could not copy", result.casefold())
+            self.assertFalse(destination.exists())
+
+
+class CrossDeviceMoveTests(unittest.TestCase):
+    def test_move_falls_back_to_a_verified_copy_across_devices(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "source.txt"
+            destination = root / "dest" / "source.txt"
+            destination.parent.mkdir()
+            source.write_text("payload", encoding="utf-8")
+            progress_calls = []
+
+            def cross_device(_src, _dst):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+            with patch.object(file_controller, "move_no_replace", side_effect=cross_device), \
+                 patch.object(
+                     file_controller, "_safe_trash",
+                     return_value=f"Moved to Trash: {source.name}",
+                 ) as trash:
+                result = file_controller.move_file(
+                    str(source), destination=str(destination),
+                    report_progress=lambda p, m="": progress_calls.append((p, m)),
+                )
+
+            self.assertIn("different drive", result)
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_text(encoding="utf-8"), "payload")
+            trash.assert_called_once()
+            self.assertTrue(progress_calls)
+            self.assertEqual(progress_calls[-1][0], 100)
+
+    def test_move_across_devices_rolls_back_if_the_original_cannot_be_trashed(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "source.txt"
+            destination = root / "dest" / "source.txt"
+            destination.parent.mkdir()
+            source.write_text("payload", encoding="utf-8")
+
+            def cross_device(_src, _dst):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+            # Whether send2trash happens to be installed on the machine
+            # running this suite is not something a test should depend on --
+            # a passing test must not start failing just because someone
+            # `pip install`s an unrelated package. `_safe_trash` is forced to
+            # report unavailability directly, which exercises the same
+            # rollback branch in `_move_across_devices` deterministically.
+            unavailable = (
+                "send2trash is not installed. "
+                "Run: pip install send2trash — "
+                "Permanent deletion is disabled for safety."
+            )
+            with patch.object(file_controller, "move_no_replace", side_effect=cross_device), \
+                 patch.object(file_controller, "_safe_trash", return_value=unavailable):
+                result = file_controller.move_file(str(source), destination=str(destination))
+
+            self.assertIn("could not move it across drives", result)
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_text(encoding="utf-8"), "payload")
+            self.assertFalse(destination.exists())
+
+    def test_move_across_devices_refuses_an_unsafe_directory(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            source = root / "tree"
+            protected = source / "private"
+            protected.mkdir(parents=True)
+            (protected / "secret.txt").write_text("secret", encoding="utf-8")
+            destination = root / "tree_copy"
+
+            def cross_device(_src, _dst):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+            with patch.object(file_controller, "move_no_replace", side_effect=cross_device), \
+                 patch(
+                     "core.path_policy.protected_roots",
+                     return_value=(protected.resolve(),),
+                 ):
+                result = file_controller.move_file(str(source), destination=str(destination))
+
+            self.assertIn("Access denied", result)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
 
 
 class GeneratedOutputSafetyTests(unittest.TestCase):

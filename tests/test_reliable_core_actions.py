@@ -44,6 +44,29 @@ class ApplicationLifecycleTests(unittest.TestCase):
         operate.assert_not_called()
 
 
+    def test_diagnose_reports_every_window_even_when_pid_is_unknown(self) -> None:
+        """Windows with no reported pid must not collapse into a single row.
+
+        _process_details dedupes by pid so a genuinely repeated process is not
+        listed twice, but pid 0 means "unknown", not "the same process" -- two
+        different windows that both fail to report a pid are still two
+        different windows and both belong in the diagnostic output.
+        """
+        entry = AppEntry("Editor", "exec", "/apps/editor.exe", "registry")
+        unknown_a = WindowInfo(1, "Editor — file1.py", "editor.exe", 0, 0, 0, 800, 600)
+        unknown_b = WindowInfo(2, "Editor — file2.py", "editor.exe", 0, 0, 0, 800, 600)
+        with patch.object(
+            app_lifecycle, "_snapshot", return_value=([unknown_a, unknown_b], [entry])
+        ):
+            result = app_lifecycle.app_lifecycle(
+                {"action": "diagnose", "app_name": "Editor"}
+            )
+        self.assertEqual(
+            result.count("PID unknown"), 2,
+            "both windows with an unreported pid should be listed, not just the first",
+        )
+
+
 class MultiWindowActionTests(unittest.TestCase):
     def test_minimize_all_addresses_each_matching_window(self) -> None:
         windows = [_window(1), _window(2)]

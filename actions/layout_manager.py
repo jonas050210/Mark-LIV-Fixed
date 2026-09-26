@@ -23,6 +23,7 @@ from core.window_manager import (
     list_windows,
     monitor_for,
     monitor_of,
+    move_to_monitor,
     operate,
     place_window,
 )
@@ -209,11 +210,20 @@ def _apply(rows: list[dict]) -> tuple[int, list[str]]:
                 monitor = monitor_for(index) if 1 <= index <= monitor_count else None
                 if state in {"maximized", "fullscreen"}:
                     place_window(window, monitor, state, focus=False)
-                else:
+                elif monitor is not None:
                     operate(window, "restore")
                     operate(window, "move",
                             int(row["left"]), int(row["top"]),
                             max(200, int(row["width"])), max(150, int(row["height"])))
+                else:
+                    # The monitor this window was saved on is no longer
+                    # connected (e.g. unplugged since the layout was saved).
+                    # Restoring the stale absolute coordinates could place the
+                    # window off-screen entirely, so fall back to a centred
+                    # placement on monitor 1 instead of guessing at geometry
+                    # that no longer corresponds to any real display.
+                    operate(window, "restore")
+                    move_to_monitor(window, monitor_for(1))
             applied += 1
         except Exception as exc:
             missing.append(f"{row.get('process') or row.get('title')} ({type(exc).__name__})")

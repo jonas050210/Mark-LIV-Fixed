@@ -18,9 +18,10 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tests.windows_fakes import (
     FakeLink,
@@ -317,6 +318,64 @@ class WindowsLaunchTests(unittest.TestCase):
         self.assertEqual(startfile_calls, ["ms-settings:display"])
 
 
+class DirectPathLaunchTests(unittest.TestCase):
+    """A personal shortcut the installed-app index never scanned must still launch."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.exe = make_exe(self.root, "app.exe")
+        self.link = self.root / "YouTube.lnk"
+        self.link.write_bytes(b"L fake shortcut")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_a_desktop_lnk_is_recognised_as_a_direct_target(self) -> None:
+        from core import app_index
+        self.assertTrue(app_index.is_direct_launch_target(str(self.link)))
+
+    def test_a_document_path_is_not_treated_as_a_direct_target(self) -> None:
+        from core import app_index
+        document = self.root / "notes.txt"
+        document.write_text("hello")
+        self.assertFalse(app_index.is_direct_launch_target(str(document)))
+
+    def test_a_missing_path_is_not_a_direct_target(self) -> None:
+        from core import app_index
+        self.assertFalse(app_index.is_direct_launch_target(str(self.root / "Ghost.lnk")))
+
+    def test_a_url_is_never_treated_as_a_filesystem_path(self) -> None:
+        from core import app_index
+        self.assertFalse(app_index.is_direct_launch_target("https://youtube.com"))
+
+    def test_a_desktop_lnk_launches_through_the_shell_on_windows(self) -> None:
+        from core import app_index
+        startfile_calls = []
+        with patch.object(app_index, "_OS", "Windows"), \
+             patch.object(app_index.os, "startfile", startfile_calls.append, create=True):
+            self.assertIsNone(app_index.launch_path(str(self.link)))
+        self.assertEqual(startfile_calls, [str(self.link)])
+
+    def test_an_exe_is_spawned_directly(self) -> None:
+        from core import app_index
+        with patch.object(app_index, "_OS", "Windows"), \
+             patch.object(app_index, "_spawn", return_value=4242) as spawn:
+            self.assertEqual(app_index.launch_path(str(self.exe)), 4242)
+        self.assertEqual(spawn.call_args[0][0][0], str(self.exe))
+
+    def test_a_missing_target_raises_a_clear_error(self) -> None:
+        from core import app_index
+        with self.assertRaises(app_index.LaunchError):
+            app_index.launch_path(str(self.root / "Ghost.lnk"))
+
+    def test_arguments_to_a_shortcut_are_refused(self) -> None:
+        from core import app_index
+        with patch.object(app_index, "_OS", "Windows"):
+            with self.assertRaises(app_index.LaunchError):
+                app_index.launch_path(str(self.link), ["some-doc.txt"])
+
+
 class WindowsReminderTests(unittest.TestCase):
     """Scheduling through schtasks, without a Task Scheduler to talk to."""
 
@@ -447,6 +506,99 @@ class WindowsSettingsTests(unittest.TestCase):
         script = " ".join(run.call_args[0][0])
         self.assertIn("ErrorActionPreference='Stop'", script)
         self.assertIn("No Wi-Fi adapter found", script)
+
+    def _fake_pycaw_and_comtypes(self, master_volume_level, set_result=None):
+        """A fake `pycaw`/`comtypes` pair for the Windows master-volume path.
+
+        `volume_get`/`volume_set` reach `AudioUtilities.GetSpeakers()
+        .Activate(...)`, then `ctypes.cast(POINTER(IAudioEndpointVolume), ...)`
+        the result. `ctypes.POINTER` cannot build a real interface pointer
+        type from a mock class, so both `ctypes.POINTER` and `ctypes.cast`
+        are stubbed; `cast` hands back the endpoint-volume double directly.
+        """
+        endpoint_volume = MagicMock()
+        endpoint_volume.GetMasterVolumeLevel.return_value = master_volume_level
+        if set_result is not None:
+            endpoint_volume.SetMasterVolumeLevel = set_result
+
+        fake_pycaw_pkg = types.ModuleType("pycaw")
+        fake_pycaw_mod = types.ModuleType("pycaw.pycaw")
+        fake_pycaw_mod.AudioUtilities = MagicMock()
+        fake_pycaw_mod.AudioUtilities.GetSpeakers.return_value.Activate.return_value = object()
+        fake_pycaw_mod.IAudioEndpointVolume = MagicMock()
+        fake_pycaw_mod.IAudioEndpointVolume._iid_ = "iid-sentinel"
+
+        fake_comtypes = types.ModuleType("comtypes")
+        fake_comtypes.CLSCTX_ALL = 23
+
+        modules = fake_modules(pycaw=fake_pycaw_pkg, **{"pycaw.pycaw": fake_pycaw_mod},
+                                comtypes=fake_comtypes)
+        return modules, endpoint_volume
+
+    def test_volume_get_converts_decibels_to_a_percentage_on_windows(self) -> None:
+        from actions import computer_settings
+
+        modules, endpoint_volume = self._fake_pycaw_and_comtypes(master_volume_level=0.0)
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             patch("ctypes.cast", return_value=endpoint_volume), \
+             patch("ctypes.POINTER"), \
+             modules:
+            self.assertEqual(computer_settings.volume_get(), 100)
+
+    def test_volume_get_treats_the_silence_floor_as_zero_percent(self) -> None:
+        from actions import computer_settings
+
+        modules, endpoint_volume = self._fake_pycaw_and_comtypes(master_volume_level=-65.25)
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             patch("ctypes.cast", return_value=endpoint_volume), \
+             patch("ctypes.POINTER"), \
+             modules:
+            self.assertEqual(computer_settings.volume_get(), 0)
+
+    def test_volume_get_returns_none_when_pycaw_is_unavailable(self) -> None:
+        from actions import computer_settings
+
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             fake_modules(pycaw=None, **{"pycaw.pycaw": None}):
+            self.assertIsNone(computer_settings.volume_get())
+
+    def test_volume_set_applies_the_requested_percentage_via_pycaw(self) -> None:
+        from actions import computer_settings
+
+        set_result = MagicMock()
+        modules, endpoint_volume = self._fake_pycaw_and_comtypes(
+            master_volume_level=0.0, set_result=set_result
+        )
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             patch("ctypes.cast", return_value=endpoint_volume), \
+             patch("ctypes.POINTER"), \
+             modules:
+            self.assertTrue(computer_settings.volume_set(50))
+        set_result.assert_called_once()
+        applied_db = set_result.call_args[0][0]
+        self.assertAlmostEqual(applied_db, 20 * __import__("math").log10(0.5), places=3)
+
+    def test_volume_set_zero_uses_the_silence_floor_not_log_of_zero(self) -> None:
+        from actions import computer_settings
+
+        set_result = MagicMock()
+        modules, endpoint_volume = self._fake_pycaw_and_comtypes(
+            master_volume_level=0.0, set_result=set_result
+        )
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             patch("ctypes.cast", return_value=endpoint_volume), \
+             patch("ctypes.POINTER"), \
+             modules:
+            self.assertTrue(computer_settings.volume_set(0))
+        applied_db = set_result.call_args[0][0]
+        self.assertEqual(applied_db, -65.25)
+
+    def test_volume_set_reports_failure_instead_of_a_false_success_on_windows(self) -> None:
+        from actions import computer_settings
+
+        with patch.object(computer_settings, "_OS", "Windows"), \
+             fake_modules(pycaw=None, **{"pycaw.pycaw": None}):
+            self.assertFalse(computer_settings.volume_set(50))
 
 
 class WindowsPathPolicyTests(unittest.TestCase):
