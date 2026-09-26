@@ -651,24 +651,61 @@ _DANGEROUS_ACTIONS = set(_IRREVERSIBLE)
 # out in full. What is left is spelling tolerance, and difflib does that in
 # microseconds instead of ~600 ms and a quota unit.
 _ALIASES = {
-    "volume_up":       ("louder", "raise volume", "turn it up", "increase volume"),
-    "volume_down":     ("quieter", "lower volume", "turn it down", "decrease volume"),
-    "mute":            ("silence", "sound off", "no sound"),
-    "brightness_up":   ("brighter", "raise brightness", "increase brightness"),
-    "brightness_down": ("dimmer", "dim", "lower brightness", "decrease brightness"),
+    "volume_up":       ("louder", "raise volume", "turn it up", "increase volume",
+                        # German
+                        "lauter", "mach lauter", "lautstärke hoch", "erhöhe die lautstärke"),
+    "volume_down":     ("quieter", "lower volume", "turn it down", "decrease volume",
+                        # German
+                        "leiser", "mach leiser", "lautstärke runter"),
+    "mute":            ("silence", "sound off", "no sound",
+                        # German
+                        "stumm", "stummschalten", "ton aus"),
+    "brightness_up":   ("brighter", "raise brightness", "increase brightness",
+                        # German
+                        "heller", "mach heller", "heller stellen"),
+    "brightness_down": ("dimmer", "dim", "lower brightness", "decrease brightness",
+                        # German
+                        "dunkler", "mach dunkler", "dunkler stellen", "abdunkeln"),
     "close_window":    ("close this", "close it"),
-    "full_screen":     ("fullscreen", "maximise screen"),
-    "show_desktop":    ("minimise everything", "go to desktop"),
-    "lock_screen":     ("lock", "lock the pc", "lock computer"),
-    "sleep_display":   ("screen off", "turn off the screen", "display off"),
-    "dark_mode":       ("night mode", "light mode", "toggle theme"),
-    "toggle_wifi":     ("wifi", "wi-fi", "internet off", "internet on"),
-    "task_manager":    ("processes", "task list"),
-    "screenshot":      ("capture screen", "take a screenshot", "snip"),
-    "refresh_page":    ("refresh", "reload page"),
-    "new_tab":         ("open a tab", "open new tab"),
-    "shutdown":        ("power off", "turn off the computer", "switch off the pc"),
-    "restart":         ("reboot", "restart the pc"),
+    "full_screen":     ("fullscreen", "maximise screen",
+                        # German
+                        "vollbild", "maximieren"),
+    "show_desktop":    ("minimise everything", "go to desktop",
+                        # German
+                        "desktop anzeigen", "zeige den desktop"),
+    "lock_screen":     ("lock", "lock the pc", "lock computer",
+                        # German
+                        "sperren", "bildschirm sperren", "pc sperren"),
+    "sleep_display":   ("screen off", "turn off the screen", "display off",
+                        # German
+                        "bildschirm aus", "bildschirm ausschalten"),
+    "dark_mode":       ("night mode", "light mode", "toggle theme",
+                        # German
+                        "dunkelmodus", "dunkler modus", "nacht modus"),
+    "toggle_wifi":     ("wifi", "wi-fi", "internet off", "internet on",
+                        # German
+                        "wlan", "wlan aus", "wlan an", "wlan ausschalten"),
+    "task_manager":    ("processes", "task list",
+                        # German
+                        "taskmanager", "prozesse"),
+    "screenshot":      ("capture screen", "take a screenshot", "snip",
+                        # German
+                        "bildschirmfoto", "screenshot machen", "mach ein screenshot"),
+    "refresh_page":    ("refresh", "reload page",
+                        # German
+                        "neu laden", "seite neu laden", "aktualisieren"),
+    "new_tab":         ("open a tab", "open new tab",
+                        # German
+                        "neuer tab", "neuen tab"),
+    "shutdown":        ("power off", "turn off the computer", "switch off the pc",
+                        # German — the PC, not the assistant; a bare 'shutdown'
+                        # about the assistant is handled as shutdown_jarvis
+                        # before this layer is ever reached.
+                        "pc ausschalten", "pc herunterfahren", "rechner ausschalten",
+                        "fahre den pc herunter"),
+    "restart":         ("reboot", "restart the pc",
+                        # German
+                        "neustart", "pc neu starten", "neustarten", "rechner neu starten"),
 }
 
 _VALUE_ACTIONS = {"volume_set", "type_text", "press_key", "reload_n",
@@ -700,7 +737,12 @@ def _detect_action(description: str) -> dict:
 
     # 2. "set volume to 30", "sesi 30 yap" — a number next to a volume word.
     num = re.search(r"(\d{1,3})\s*%?", low)
-    if num and any(w in low for w in ("volume", "ses", "sound", "lautstark", "громкость")):
+    # 'ton' needs a word boundary: without one, 'button 3' would contain
+    # 'ton' and read as "set the volume to 3".
+    volume_word = any(w in low for w in (
+        "volume", "ses", "sound", "lautstark", "lautstärke", "громкость",
+    )) or re.search(r"\bton\b", low)
+    if num and volume_word:
         return {"action": "volume_set", "value": max(0, min(100, int(num.group(1))))}
 
     # 3. Alias phrases.
@@ -929,7 +971,7 @@ def computer_settings(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "system_control",
-    "description": "Controls system and active-window settings: volume, brightness, keyboard shortcuts, fullscreen, dark mode, WiFi, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload, and confirmed power actions. Use window_manager for a named application/window such as minimizing Chrome or moving Discord to monitor 2. Restart, shutdown, and WiFi changes require confirmation; never claim they are complete before the user confirms. Volume, brightness, and dark mode can be reversed with undo.",
+    "description": "Controls system and active-window settings: volume, brightness, keyboard shortcuts, fullscreen, dark mode, WiFi, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload, and confirmed power actions. Use window_manager for a named application/window such as minimizing Chrome or moving Discord to monitor 2. Restart, shutdown, and WiFi changes require confirmation; never claim they are complete before the user confirms. Volume, brightness, and dark mode can be reversed with undo. The restart/shutdown actions power off or reboot the whole COMPUTER — only use them when the user explicitly names the computer/PC (e.g. 'shut down the PC', 'fahre den Rechner herunter'). A bare 'shutdown'/'close yourself'/'beende dich' about the assistant means shutdown_jarvis, which closes the assistant immediately.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

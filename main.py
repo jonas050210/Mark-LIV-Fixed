@@ -358,9 +358,13 @@ TOOL_DECLARATIONS = [
     {
         "name": "shutdown_jarvis",
         "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
+            "Shuts down the assistant completely and IMMEDIATELY — no confirmation "
+            "is shown and the user is never asked again. Call this when the user "
+            "expresses intent to end the conversation, close the assistant, say "
+            "goodbye, or stop Jarvis: 'shutdown', 'close yourself', 'that's all "
+            "for today', 'beende dich', 'schließe dich', 'mach dich zu', 'tschüss "
+            "bis später'. This closes the ASSISTANT ONLY, not the computer; "
+            "shutting down the PC is a different, confirmed action. "
             "The user can say this in ANY language."
         ),
         "parameters": {
@@ -563,6 +567,9 @@ class JarvisLive:
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_identity_change = self._on_identity_change # name/persona → rebuild prompt
         self.ui.on_audio_device_change = self._on_audio_device_change
+        # Tray "Shutdown JARVIS": the same immediate close the voice command
+        # uses, with a spoken goodbye because there is no model turn in flight.
+        self.ui.on_shutdown_request = self._on_ui_shutdown_request
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
         self._run_task: asyncio.Task | None = None
@@ -957,8 +964,11 @@ class JarvisLive:
                 "valid": True,
                 "error": "",
                 "category": "core",
-                "risk": "confirmation" if name in {"shutdown_jarvis", "restart_jarvis"} else "low",
-                "requires_confirmation": name in {"shutdown_jarvis", "restart_jarvis"},
+                # shutdown_jarvis executes immediately by design (the user can
+                # simply start the assistant again); only a restart of the
+                # assistant still goes through the on-screen gate.
+                "risk": "confirmation" if name == "restart_jarvis" else "low",
+                "requires_confirmation": name == "restart_jarvis",
                 "confirmation_actions": [],
                 "requires_admin": False,
                 "undoable": name == "undo",
@@ -1614,31 +1624,22 @@ class JarvisLive:
                     _result_status = "confirmation_pending"
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self._send_readonly_turn(
-                                {"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]}
-                            )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    self.ui.root.quit()
-                if confirm_gate.pending_title():
-                    result = "There is already a confirmation waiting on screen. Ask the user to answer that one first."
-                    _result_status = "confirmation_busy"
-                else:
-                    result = confirm_gate.request(
-                        key=self._active_action_ids.get(id(fc)) or "shutdown_jarvis",
-                        title="Close MARK LIV",
-                        detail="The assistant will save the session and close.",
-                        run=lambda: (self._loop.call_soon_threadsafe(
-                            lambda: self._spawn_background(_do_shutdown())
-                        ) or "Closing MARK LIV."),
-                    )
-                    _result_status = "confirmation_pending"
+                # Closing the assistant is the user's own call and is fully
+                # reversible — start the app again. "Shutdown" / "schließe
+                # dich" therefore executes immediately: the session is still
+                # saved and a goodbye is still spoken, but no on-screen gate
+                # interrupts the request. Only PC-level power actions keep the
+                # confirmation banner.
+                self.ui.write_log("SYS: Shutdown requested — closing immediately.")
+                # No goodbye_hint here: the tool result below already asks the
+                # model for the final spoken line; a second, read-only goodbye
+                # turn would be spoken on top of it.
+                self.request_immediate_shutdown()
+                result = (
+                    "MARK LIV is closing now. Say ONE brief, warm goodbye in the "
+                    "user's own language. Do not offer anything else."
+                )
+                _result_status = "succeeded"
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
@@ -2650,6 +2651,49 @@ class JarvisLive:
         task.add_done_callback(_finished)
         return task
 
+    def _on_ui_shutdown_request(self) -> None:
+        """Tray-icon shutdown: immediate close, with a spoken goodbye.
+
+        Unlike the shutdown_jarvis tool call there is no model turn waiting on
+        a tool result here, so the goodbye comes from a read-only turn instead.
+        """
+        self.request_immediate_shutdown(
+            goodbye_hint="Say a brief natural goodbye to the user, then stop."
+        )
+
+    def request_immediate_shutdown(self, *, goodbye_hint: str = "") -> None:
+        """Close the assistant now — session saved, no confirmation gate.
+
+        Closing the assistant is reversible (start it again), so the on-screen
+        gate that guards irreversible actions is deliberately skipped. Safe to
+        call from any thread; the work is marshalled onto the live loop.
+        ``goodbye_hint`` is optional extra instruction for the model's final
+        spoken line, used by the shutdown_jarvis tool call.
+        """
+        async def _do_shutdown():
+            await self._save_session_summary()
+            # Give a spoken goodbye (if any) a moment to finish before the
+            # window disappears mid-sentence.
+            await asyncio.sleep(3.0)
+            self.ui.root.quit()
+
+        async def _goodbye_then_shutdown():
+            if goodbye_hint and self.session:
+                try:
+                    await self._send_readonly_turn(
+                        {"role": "user", "parts": [{"text": goodbye_hint}]}
+                    )
+                except Exception:
+                    pass
+            await _do_shutdown()
+
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(
+            lambda: self._spawn_background(_goodbye_then_shutdown())
+        )
+
     def request_shutdown(self) -> None:
         """Stop the live session from the UI thread without abandoning tasks."""
         loop = self._loop
@@ -2694,6 +2738,18 @@ class JarvisLive:
         # Enumerate audio devices off-thread. The settings drawer must never pay
         # for host-API enumeration on the Qt thread.
         audio_devices.prefetch()
+
+        # Desktop window events: every window wait in the actions layer can
+        # wake the instant a window appears, is re-titled, or moves, instead
+        # of polling; and the window list can be cached between events. Where
+        # the hook cannot be installed this is a no-op and the polling
+        # behaviour from before continues unchanged.
+        try:
+            from core import window_events
+
+            window_events.start()
+        except Exception as exc:
+            record_diagnostic("window-events", "hook not installed", exception=exc)
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:

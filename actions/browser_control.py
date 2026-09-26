@@ -6,6 +6,7 @@ import concurrent.futures
 import ipaddress
 import os
 import platform
+import re
 import secrets
 import shutil
 import stat
@@ -19,6 +20,34 @@ from urllib.parse import quote_plus, urlsplit
 from core import browser_handoff
 from core.path_policy import move_no_replace, resolve_user_path
 from core.user_paths import location as _user_location
+from core.window_manager import fold_umlauts
+
+def _site_label(url: str) -> str:
+    """The name a user would call a site: 'youtube' for youtube.com/watch."""
+    try:
+        host = urlsplit(str(url or "")).hostname or ""
+    except Exception:
+        return ""
+    parts = [p for p in host.casefold().split(".") if p not in ("www", "com", "de", "net", "org")]
+    return parts[0] if parts else ""
+
+
+def _remember_native_window(url: str) -> None:
+    """Track the window a native open produced, off the action thread.
+
+    The go_to path returns as soon as the OS accepts the URL; the browser
+    window appears a moment later with a title that only settles once the
+    page loads. Watching in the background and recording the result as the
+    most recent launch is what lets a following "make it fullscreen" find the
+    page even while its title still reads 'New Tab'.
+    """
+    try:
+        from core.window_manager import watch_launched_window
+
+        watch_launched_window(_site_label(url) or str(url or "")[:60], timeout=6.0)
+    except Exception:
+        pass
+
 
 # Playwright is optional: native URL navigation remains useful without it.
 # Import the automation package only when an interactive browser action is
@@ -986,6 +1015,77 @@ class _BrowserSession:
             return "Tab closed."
         return "No active tab to close."
 
+    async def list_tabs(self) -> str:
+        """Numbered list of THIS automation session's tabs.
+
+        Only the controlled window's tabs can be seen; the user's own
+        browser window is a separate process and its tabs are not visible
+        without a debug port. Umlauts in titles are folded so a spoken
+        'Müllseite' still matches what is printed here.
+        """
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if not pages:
+            return "No tabs are open in this browser session."
+        lines = []
+        for i, page in enumerate(pages, 1):
+            try:
+                title = (await page.title() or "").strip()
+            except Exception:
+                title = ""
+            label = title or page.url
+            marker = " (active)" if page is self._page else ""
+            lines.append(f"  {i}. {label}{marker}")
+        return f"{len(pages)} tab(s) open:\n" + "\n".join(lines)
+
+    async def switch_tab(self, tab: str | int = "") -> str:
+        """Make another tab of THIS session the active page.
+
+        `tab` is a 1-based number or a title/URL fragment (case-insensitive,
+        umlaut-folded). The chosen page is brought to the front so the user
+        sees what the assistant switched to.
+        """
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if not pages:
+            return "No tabs are open in this browser session."
+
+        raw = str(tab or "").strip()
+        chosen = None
+        digits = re.findall(r"\d+", raw)
+        if digits:
+            index = int(digits[0])
+            if 1 <= index <= len(pages):
+                chosen = pages[index - 1]
+            else:
+                return f"There is no tab {index} — only {len(pages)} tab(s) are open."
+        elif raw:
+            needle = fold_umlauts(raw.casefold())
+            matches = []
+            for p in pages:
+                try:
+                    title = (await p.title() or "")
+                except Exception:
+                    title = ""
+                if needle in fold_umlauts((title + " " + p.url).casefold()):
+                    matches.append(p)
+            if not matches:
+                return f"No open tab matches '{raw}'."
+            chosen = matches[0]
+        else:
+            return "Please say which tab: a number or part of its title."
+
+        if chosen is self._page:
+            return "That tab is already active."
+        self._page = chosen
+        try:
+            await chosen.bring_to_front()
+        except Exception:
+            pass  # headless contexts refuse this; switching still succeeded
+        try:
+            title = (await chosen.title() or "").strip() or chosen.url
+        except Exception:
+            title = chosen.url
+        return f"Switched to: {title}"
+
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
         staging = None
@@ -1154,6 +1254,8 @@ _INTERACTIVE_ACTIONS = frozenset({
 _DIRECT_ACTIONS = frozenset({
     "switch", "list_browsers", "close_all", "close", "go_to", "search",
     "new_tab",
+    # Tab awareness (part 1): routed above, never auto-create a session.
+    "list_tabs", "switch_tab",
 })
 
 
@@ -1198,6 +1300,35 @@ def browser_control(
         _log(player, result)
         return result
 
+    # ── Tab awareness (part 1): only the controlled session ──────────────────
+    # list/switch tabs need a window the assistant can actually see into.
+    # The user's own browser runs as a separate process without a debug
+    # port, so its tabs are invisible — pretending otherwise (or silently
+    # opening an automation window just to list *its* tabs) would be worse
+    # than an honest answer.
+    if action in ("list_tabs", "switch_tab"):
+        target = browser or _registry._active_browser
+        if not target or not _registry.has(target):
+            result = (
+                "I can only see the tabs of a browser window I control. "
+                "None is open yet — ask me to open the site first, then I "
+                "can list and switch its tabs."
+            )
+            _log(player, result)
+            return result
+        sess = _registry.get(target)
+        try:
+            if action == "list_tabs":
+                result = sess.run(sess.list_tabs())
+            else:
+                result = sess.run(sess.switch_tab(params.get("tab", "")))
+        except concurrent.futures.TimeoutError:
+            result = f"Browser action '{action}' timed out (60s)."
+        except Exception as e:
+            result = f"Browser error ({action}): {type(e).__name__}"
+        _log(player, result)
+        return result
+
     # ── Navigation is ALWAYS native ──────────────────────────────────────────
     # go_to / search / new_tab open the site in the user's own browser —
     # their own profile, logged-in accounts and start page; exactly as if the
@@ -1236,6 +1367,7 @@ def browser_control(
         result = _open_native(nav_url, browser)
         if result.startswith("Opened") and nav_url:
             _registry.note_native_url(_normalize_url(nav_url))
+            _remember_native_window(nav_url)
         _log(player, result)
         return result
 
@@ -1356,9 +1488,9 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["go_to", "search", "click", "type", "scroll", "fill_form", "smart_click", "smart_type", "get_text", "get_url", "press", "new_tab", "close_tab", "screenshot", "back", "forward", "reload", "switch", "list_browsers", "close", "close_all"],
+                "enum": ["go_to", "search", "click", "type", "scroll", "fill_form", "smart_click", "smart_type", "get_text", "get_url", "press", "new_tab", "close_tab", "screenshot", "back", "forward", "reload", "switch", "list_browsers", "list_tabs", "switch_tab", "close", "close_all"],
                 "maxLength": 32,
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | list_tabs | switch_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all. list_tabs/switch_tab see ONLY the tabs of a browser window this assistant controls (opened via go_to/search flows); they never read the user's own browser."
             },
             "browser": {
                 "type": "STRING",
@@ -1424,6 +1556,11 @@ TOOL = {
                 "enum": ["chrome", "edge", "firefox", "opera", "operagx", "brave", "vivaldi", "safari"],
                 "maxLength": 20,
                 "description": "Browser name for switch; browser is preferred."
+            },
+            "tab": {
+                "type": "STRING",
+                "maxLength": 200,
+                "description": "Which tab to switch to for switch_tab: a 1-based number ('2') or part of the tab's title/URL ('YouTube')."
             },
             "fields": {
                 "type": "ARRAY",

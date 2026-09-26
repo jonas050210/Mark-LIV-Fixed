@@ -42,6 +42,7 @@ class ExtractedOverlayTests(unittest.TestCase):
         from ui_panels.plugins import PluginManagerOverlay, PluginSettingsOverlay
         from ui_panels.remote_key import RemoteKeyOverlay
         from ui_panels.setup import SetupOverlay
+        from ui_panels.windows import WindowsOverlay
 
         return [
             (SetupOverlay, (self.host,)),
@@ -52,6 +53,7 @@ class ExtractedOverlayTests(unittest.TestCase):
             (ConfirmBanner, ("Restart the computer", "The computer will restart.")),
             (AudioDeviceOverlay, ()),
             (MemoryOverlay, ()),
+            (WindowsOverlay, (self.host,)),
             (RemoteKeyOverlay, ("http://127.0.0.1:8765", "PAIRKEY")),
         ]
 

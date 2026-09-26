@@ -5,6 +5,7 @@ import math
 import os
 import platform
 import random
+import re
 import shlex
 import subprocess
 import sys
@@ -24,13 +25,13 @@ from PyQt6.QtCore import (
     QRectF, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QDragEnterEvent, QDropEvent, QFont,
-    QKeySequence, QPainter, QPen, QPixmap, QRadialGradient, QShortcut,
+    QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QIcon,
+    QKeySequence, QMenu, QPainter, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QStackedWidget, QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.path_policy import atomic_write_bytes, atomic_write_text, resolve_user_path
@@ -48,6 +49,7 @@ from ui_panels.plugins import PluginManagerOverlay, PluginSettingsOverlay
 from ui_panels.remote_key import RemoteKeyOverlay
 from ui_panels.review import render_review_html
 from ui_panels.setup import SetupOverlay
+from ui_panels.windows import WindowsOverlay
 
 try:
     from core.avatar import HoloAvatar
@@ -911,6 +913,9 @@ class MetricBar(QWidget):
 
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
+    # Some log lines arrive with their own clock; keep that one instead of
+    # stamping a second time.
+    _TS_RE = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?)\s*")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -945,6 +950,7 @@ class LogWidget(QTextEdit):
         self._text    = ""
         self._pos     = 0
         self._tag     = "sys"
+        self._ts      = ""
         self._ai_name_lc = "jarvis"   # updated when assistant name changes
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
@@ -965,8 +971,18 @@ class LogWidget(QTextEdit):
             self._typing = False
             return
         self._typing = True
-        self._text   = self._queue.pop(0)
-        self._pos    = 0
+        text = self._queue.pop(0)
+        # Every log line carries a wall-clock time. When a user later asks
+        # "why did it say it couldn't find the window?", the sequence of
+        # events — launch, lookup, failure — is only readable with one.
+        stamp = self._TS_RE.match(text)
+        if stamp:
+            self._ts = stamp.group(1)
+            text = text[stamp.end():]
+        else:
+            self._ts = time.strftime("%H:%M:%S")
+        self._text = text
+        self._pos  = 0
         tl = self._text.lower()
         _ai_pfx = f"{self._ai_name_lc}:"
         if   tl.startswith("you:"):                              self._tag = "you"
@@ -978,6 +994,14 @@ class LogWidget(QTextEdit):
 
     def _step(self):
         if self._pos < len(self._text):
+            if self._pos == 0 and self._ts:
+                # The stamp is typed once, dimly, before the line itself.
+                cur = self.textCursor()
+                fmt = cur.charFormat()
+                fmt.setForeground(QBrush(qcol(C.TEXT_DIM)))
+                cur.movePosition(cur.MoveOperation.End)
+                cur.insertText(f"{self._ts} ", fmt)
+                self.setTextCursor(cur)
             ch  = self._text[self._pos]
             cur = self.textCursor()
             fmt = cur.charFormat()
@@ -1366,6 +1390,7 @@ class MainWindow(QMainWindow):
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_identity_change = None  # callable: () -> None — rebuild prompt/persona
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
+        self.on_shutdown_request = None  # callable: () -> None — close the assistant now
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
@@ -1517,6 +1542,93 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+        # Tray icon: the assistant keeps a presence in the notification area
+        # with the two things a user wants without opening the HUD — bring it
+        # back, and close it immediately.
+        self._build_tray()
+
+    # ── System tray ──────────────────────────────────────────────────────────
+
+    def _build_tray(self) -> None:
+        """Notification-area icon with show/hide, windows, and instant shutdown.
+
+        Everything is wrapped defensively: a headless session or a platform
+        without a tray must never keep the assistant from starting, and the
+        shutdown entry deliberately does NOT ask again — the same immediate
+        close the voice command now uses.
+        """
+        self._tray = None
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+            ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+            icon = QIcon(str(ico_path)) if ico_path.exists() else self.windowIcon()
+            if icon.isNull():
+                icon = QApplication.instance().windowIcon()
+
+            menu = QMenu()
+            menu.setStyleSheet(f"""
+                QMenu {{ background: {C.DARK}; color: {C.TEXT};
+                         border: 1px solid {C.BORDER_B}; padding: 4px; }}
+                QMenu::item {{ padding: 4px 18px; }}
+                QMenu::item:selected {{ background: {C.PRI_GHO}; color: {C.WHITE}; }}
+            """)
+
+            def _toggle_visibility():
+                if self.isVisible():
+                    self.hide()
+                else:
+                    self.show()
+                    self.raise_()
+                    self.activateWindow()
+
+            act_show = menu.addAction("Show / hide")
+            act_show.triggered.connect(_toggle_visibility)
+            act_windows = menu.addAction("Open windows")
+            act_windows.triggered.connect(self._open_windows_panel)
+
+            menu.addSeparator()
+            act_quit = menu.addAction("Shutdown JARVIS")
+            act_quit.triggered.connect(self._tray_shutdown)
+            menu.aboutToShow.connect(
+                lambda: act_quit.setEnabled(callable(self.on_shutdown_request))
+            )
+
+            tray = QSystemTrayIcon(icon, self)
+            tray.setContextMenu(menu)
+            tray.setToolTip(f"{self._assistant_name} — online")
+            # A plain single click toggles the window too, matching what the
+            # menu's first entry does; the menu opens on the platform's own
+            # trigger (right click on Windows/Linux).
+            tray.activated.connect(
+                lambda reason: _toggle_visibility()
+                if reason == QSystemTrayIcon.ActivationReason.Trigger
+                else None
+            )
+            tray.show()
+            self._tray = tray
+        except Exception:
+            self._tray = None
+
+    def _tray_shutdown(self):
+        """Close the assistant from the tray — immediately, no confirm dialog.
+
+        The session save and goodbye live in the assistant's own graceful
+        shutdown path; if that is not wired yet (still starting up), fall back
+        to closing the window directly.
+        """
+        try:
+            self._log.append_log("SYS: Shutdown requested from the tray.")
+        except Exception:
+            pass
+        if callable(self.on_shutdown_request):
+            try:
+                self.on_shutdown_request()
+                return
+            except Exception:
+                pass
+        QApplication.instance().quit()
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -2302,6 +2414,24 @@ class MainWindow(QMainWindow):
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
         lay.addWidget(hdr)
 
+        # The drawer keeps growing; a two-letter filter finds the control the
+        # user is looking for faster than scanning fifteen labels.
+        self._drawer_search = QLineEdit()
+        self._drawer_search.setPlaceholderText("Search controls…")
+        self._drawer_search.setFont(QFont("Courier New", 8))
+        self._drawer_search.setFixedHeight(24)
+        self._drawer_search.setClearButtonEnabled(True)
+        self._drawer_search.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C.BG}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 0 6px;
+            }}
+            QLineEdit:focus {{ border-color: {C.PRI_DIM}; }}
+        """)
+        self._drawer_search.textChanged.connect(self._filter_drawer_buttons)
+        lay.addWidget(self._drawer_search)
+
         remote_btn = QPushButton("◉  REMOTE CONTROL")
         remote_btn.setFixedHeight(30)
         remote_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
@@ -2309,6 +2439,15 @@ class MainWindow(QMainWindow):
         remote_btn.setStyleSheet(_BTN_STYLE_PRI)
         remote_btn.clicked.connect(self._open_remote)
         lay.addWidget(remote_btn)
+
+        win_btn = QPushButton("🪟  OPEN WINDOWS")
+        win_btn.setFixedHeight(30)
+        win_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        win_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        win_btn.setToolTip("Every window the desktop reports — click one to focus it")
+        win_btn.setStyleSheet(_BTN_STYLE_PRI)
+        win_btn.clicked.connect(self._open_windows_panel)
+        lay.addWidget(win_btn)
 
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
@@ -2432,6 +2571,9 @@ class MainWindow(QMainWindow):
         # boundary defensive for future settings controls.
         try:
             self._refresh_wake_btns()   # resolve wake state on open (lazy)
+            # A fresh open shows every control; the last search should not
+            # hide half the drawer from someone who forgot it was typed.
+            self._drawer_search.clear()
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
@@ -2450,6 +2592,21 @@ class MainWindow(QMainWindow):
         self._quick_drawer.setFixedWidth(_W)
         self._quick_drawer.adjustSize()
         self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
+
+    def _filter_drawer_buttons(self, text: str) -> None:
+        """Show only drawer controls whose label matches the typed filter.
+
+        Resolved through findChildren rather than a hand-kept list so the
+        buttons whose labels change at runtime (wake word, autostart, brief)
+        are filtered by what they currently say, not what they said at build
+        time.
+        """
+        query = " ".join(str(text or "").casefold().split())
+        for button in self._quick_drawer.findChildren(QPushButton):
+            label = " ".join(button.text().casefold().split())
+            button.setVisible(not query or query in label)
+        self._quick_drawer.adjustSize()
+        self._position_quick_drawer()
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
@@ -3462,6 +3619,27 @@ class MainWindow(QMainWindow):
         self._centre_overlay(ov)
         self._memory_overlay = ov
 
+    # ── Open-windows panel ───────────────────────────────────────────────────
+
+    def _open_windows_panel(self):
+        """Show what the desktop reports as open, with click-to-focus rows.
+
+        This is the user-facing half of the window-discovery fix: when a voice
+        command cannot find an app, the same list the assistant matches against
+        is one click away, including the backend name that produced it.
+        """
+        try:
+            ov = WindowsOverlay(
+                parent=self.centralWidget(), log=self._log.append_log
+            )
+            self._centre_overlay(ov)
+            self._windows_overlay = ov   # keep a reference so it isn't GC'd
+        except Exception as exc:
+            try:
+                self._log.append_log(f"ERR: Windows panel failed ({type(exc).__name__}).")
+            except Exception:
+                pass
+
     # ── Irreversible-action confirmation ─────────────────────────────────────
 
     def _show_confirm_banner(self, title: str, detail: str):
@@ -3660,6 +3838,14 @@ class JarvisUI:
     @on_interrupt.setter
     def on_interrupt(self, cb):
         self._win.on_interrupt = cb
+
+    @property
+    def on_shutdown_request(self):
+        return self._win.on_shutdown_request
+
+    @on_shutdown_request.setter
+    def on_shutdown_request(self, cb):
+        self._win.on_shutdown_request = cb
 
     @property
     def on_voice_change(self):

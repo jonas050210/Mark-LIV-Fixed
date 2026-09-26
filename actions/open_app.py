@@ -416,6 +416,22 @@ def _visible_window_keys() -> set[tuple]:
         return set()
 
 
+def _wait_desktop_change(poll: float) -> None:
+    """Sleep until the desktop reports a window change, or the poll interval.
+
+    A launch's window typically triggers show and title events, so waiting on
+    them wakes the launch verification the moment the window is real instead
+    of up to a full poll interval later. Falls back to a plain sleep wherever
+    the event hook is not running.
+    """
+    try:
+        from core import window_events
+
+        window_events.wait_for_change(poll)
+    except Exception:
+        time.sleep(poll)
+
+
 def _wait_for_windows(requested: str, normalized: str, minimum: int,
                       existing_keys: set[tuple] | None = None, timeout: float = 8.0,
                       cancel_event=None):
@@ -430,7 +446,7 @@ def _wait_for_windows(requested: str, normalized: str, minimum: int,
         new_windows = [window for window in latest if _window_key(window) not in existing_keys]
         if len(latest) >= minimum and (not existing_keys or new_windows):
             return latest, new_windows
-        time.sleep(0.25)
+        _wait_desktop_change(0.25)
     latest = _matching_windows(requested, normalized)
     return latest, [window for window in latest if _window_key(window) not in existing_keys]
 
@@ -497,7 +513,7 @@ def _wait_for_pid_window(pid: int | None, timeout: float = 12.0, cancel_event=No
             return []
         if found:
             return found
-        time.sleep(0.2)
+        _wait_desktop_change(0.2)
     return []
 
 
@@ -588,7 +604,7 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
                 return new_windows[0]
         else:
             single_new_since = None
-        time.sleep(0.2)
+        _wait_desktop_change(0.2)
     return None
 
 
@@ -713,6 +729,25 @@ def _open_app_core(
         # Let Chromium route the installed app id. A title-only browser match
         # may be an ordinary tab and is not proof that the PWA is open.
         existing = []
+    if not existing and not explicit_second:
+        # A window launched moments ago may still be titled "New Tab" while
+        # its page loads. If the remembered launch answers to this name, treat
+        # it as the app being open instead of starting a second instance.
+        try:
+            from core.window_manager import recent_launch_window_for
+
+            remembered = (
+                recent_launch_window_for(app_name)
+                or recent_launch_window_for(normalized)
+            )
+        except Exception:
+            remembered = None
+        if remembered is not None:
+            from core.window_manager import refresh_window
+
+            live = refresh_window(remembered)
+            if live is not None:
+                existing = [live]
 
     if player:
         player.write_log("[open_app] Launch requested")
@@ -721,10 +756,28 @@ def _open_app_core(
     # platform handler directly rather than searching the index for it.
     if is_uri(shortcut_target) or is_uri(normalized):
         target = shortcut_target if is_uri(shortcut_target) else normalized
+        # The page this puts on screen is a browser_handoff event too: a
+        # following "click the top story" must resume on it, not on blank.
+        try:
+            from core import browser_handoff
+
+            browser_handoff.note(target)
+        except Exception:
+            pass
+        # Remember the window the URL opens, so a following "make it fullscreen"
+        # can find it even while the page title is still loading. Opening in an
+        # existing window's new tab is fine too: its title changes once the page
+        # loads, which the before/after key comparison below detects.
+        existing_keys = _visible_window_keys()
         try:
             launch_uri(target)
         except Exception as exc:
             return False, f"I could not open that link ({type(exc).__name__})."
+        window = _await_launched_window(
+            app_name, normalized, None, existing_keys, timeout=6.0,
+        )
+        if window is not None:
+            _remember_launch(app_name or target, window)
         return True, f"Opened {app_name}."
 
     # A normal open is idempotent.  In particular, do not create a duplicate
@@ -922,7 +975,16 @@ def _remember_launch(name: str, window) -> None:
 
     Only the window this launch produced is closed, and only if it is still the
     same window, so an undo cannot take down something the user opened since.
+    The window is also recorded as the most recent launch, which is what lets a
+    following window command ("now make it fullscreen") find an app whose title
+    is still loading or does not contain its spoken name.
     """
+    try:
+        from core.window_manager import remember_last_window
+
+        remember_last_window(name, window)
+    except Exception:
+        pass
     handle = int(getattr(window, "handle", 0) or 0)
     if not handle:
         return
@@ -1048,7 +1110,9 @@ TOOL = {
                     "Which monitor to place the window on, when the user names one: a "
                     "1-based number ('1', '2'), 'primary'/'main' (the Windows primary "
                     "display), 'secondary'/'second' (the other display), 'left'/'right' "
-                    "(by physical position), or 'monitor 2'/'display 2'."
+                    "(by physical position), or 'monitor 2'/'display 2'. German is "
+                    "accepted too: 'ersten'/'zweiten'/'dritten' (any case form), "
+                    "'Hauptmonitor', 'links'/'rechts', 'Bildschirm 2'."
                 )
             },
             "state": {
