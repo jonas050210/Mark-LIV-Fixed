@@ -272,9 +272,10 @@ TOOL_DECLARATIONS = [
     {
         "name": "system_status",
         "description": (
-            "Returns real-time system metrics: CPU usage, RAM, GPU load, CPU temperature, "
-            "uptime, and process count. Use when the user asks about computer performance, "
-            "temperature, memory, or resource usage."
+            "Returns real-time system metrics: CPU usage, RAM, NVIDIA GPU load and GPU temperature "
+            "when its driver exposes NVML (including RTX 4060 Ti), optional CPU temperature, uptime, "
+            "and process count. Use when the user asks about computer performance, temperature, memory, "
+            "or resource usage."
         ),
         "parameters": {
             "type": "OBJECT",

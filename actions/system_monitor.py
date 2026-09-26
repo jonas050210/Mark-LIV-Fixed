@@ -1,9 +1,14 @@
+"""Local system metrics and safe background alerts.
+
+All GPU readings use NVIDIA's NVML interface when an NVIDIA driver is present;
+that includes the RTX 4060 Ti's actual GPU temperature.  The module never uses
+shell commands, never uploads metrics, and never changes or closes programs.
 """
-System Monitor — background metric checks with voice alert support.
-Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
-"""
+from __future__ import annotations
+
 import ctypes
 import platform
+import threading
 import time
 
 try:
@@ -16,168 +21,254 @@ except ImportError:
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 DEFAULT_THRESHOLDS = {
-    "cpu":  90.0,
-    "ram":  90.0,
+    "cpu": 90.0,
+    "ram": 90.0,
     "temp": 85.0,
-    "gpu":  95.0,
+    "gpu": 95.0,
+    "gpu_temp": 85.0,
 }
 
-_COOLDOWN   = 300
+_COOLDOWN = 300
 _CPU_STREAK = 3
 
-# ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
-_nvml_lib: object = None
-_nvml_ok:  object = None   # None=untested  True=works  False=unavailable
+# NVML is available with NVIDIA's driver.  Keep one process-local handle rather
+# than reinitialising it on every HUD/status refresh.
+_nvml_lib: object | None = None
+_nvml_ok: bool | None = None
+_pynvml_module: object | None = None
+_pynvml_handle: object | None = None
+_pynvml_ok: bool | None = None
+_gpu_lock = threading.Lock()
 
 
-def _nvml_gpu() -> float:
-    """GPU utilisation via NVML — zero subprocess on all platforms."""
+class _NvmlUtilisation(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+def _blank_gpu_metrics() -> dict:
+    return {"utilization_percent": None, "temperature_c": None, "name": None}
+
+
+def _clean_gpu_name(value) -> str | None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    text = " ".join(str(value or "").replace("\x00", "").split())
+    return text[:120] or None
+
+
+def _pynvml_gpu_metrics() -> dict:
+    """Read the first NVIDIA GPU through maintained nvidia-ml-py bindings."""
+    global _pynvml_module, _pynvml_handle, _pynvml_ok
+    if _pynvml_ok is False:
+        return _blank_gpu_metrics()
+    try:
+        if _pynvml_handle is None:
+            import pynvml  # provided by the maintained nvidia-ml-py package
+
+            pynvml.nvmlInit()
+            _pynvml_module = pynvml
+            _pynvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        module = _pynvml_module
+        handle = _pynvml_handle
+        utilisation = module.nvmlDeviceGetUtilizationRates(handle)
+        temperature = module.nvmlDeviceGetTemperature(
+            handle, module.NVML_TEMPERATURE_GPU
+        )
+        name = module.nvmlDeviceGetName(handle)
+        _pynvml_ok = True
+        return {
+            "utilization_percent": float(utilisation.gpu),
+            "temperature_c": float(temperature),
+            "name": _clean_gpu_name(name),
+        }
+    except Exception:
+        _pynvml_ok = False
+        _pynvml_module = None
+        _pynvml_handle = None
+        return _blank_gpu_metrics()
+
+
+def _native_nvml_gpu_metrics() -> dict:
+    """Read NVML directly when the optional Python binding is unavailable."""
     global _nvml_lib, _nvml_ok
     if _nvml_ok is False:
-        return -1.0
+        return _blank_gpu_metrics()
     try:
-        class _Util(ctypes.Structure):
-            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
-
         if _nvml_lib is None:
             if _OS == "Windows":
+                loader = getattr(ctypes, "WinDLL", ctypes.CDLL)
                 candidates = ("nvml", r"C:\Windows\System32\nvml.dll")
-                _load = ctypes.WinDLL
+            elif _OS == "Linux":
+                loader = ctypes.CDLL
+                candidates = ("libnvidia-ml.so.1", "libnvidia-ml.so")
             else:
-                candidates = (
-                    "libnvidia-ml.so.1",
-                    "libnvidia-ml.so",
-                    "libnvidia-ml.dylib",
-                )
-                _load = ctypes.CDLL
-            for name in candidates:
+                loader = ctypes.CDLL
+                candidates = ("libnvidia-ml.dylib",)
+            for candidate in candidates:
                 try:
-                    lib = _load(name)
-                    lib.nvmlInit_v2()
-                    _nvml_lib = lib
-                    break
+                    library = loader(candidate)
+                    if int(library.nvmlInit_v2()) == 0:
+                        _nvml_lib = library
+                        break
                 except Exception:
                     continue
 
         if _nvml_lib is None:
             _nvml_ok = False
-            return -1.0
+            return _blank_gpu_metrics()
 
-        dev = ctypes.c_void_p()
-        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
-        u = _Util()
-        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
+        device = ctypes.c_void_p()
+        if int(_nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(device))) != 0:
+            raise OSError("NVML could not open NVIDIA GPU 0")
+
+        utilisation = _NvmlUtilisation()
+        if int(_nvml_lib.nvmlDeviceGetUtilizationRates(device, ctypes.byref(utilisation))) != 0:
+            raise OSError("NVML could not read GPU utilisation")
+
+        # NVML writes temperature through an output pointer.  Treating its
+        # return code as a temperature is why a native implementation can show
+        # N/A or nonsense even when an RTX card is installed.
+        temperature = ctypes.c_uint()
+        temp_result = _nvml_lib.nvmlDeviceGetTemperature(
+            device, 0, ctypes.byref(temperature)  # NVML_TEMPERATURE_GPU
+        )
+        temp_value = float(temperature.value) if int(temp_result) == 0 else None
+
+        name_buffer = ctypes.create_string_buffer(128)
+        name_result = _nvml_lib.nvmlDeviceGetName(
+            device, name_buffer, ctypes.sizeof(name_buffer)
+        )
+        name = _clean_gpu_name(name_buffer.value) if int(name_result) == 0 else None
         _nvml_ok = True
-        return float(u.gpu)
+        return {
+            "utilization_percent": float(utilisation.gpu),
+            "temperature_c": temp_value,
+            "name": name,
+        }
     except Exception:
         _nvml_ok = False
-        return -1.0
+        return _blank_gpu_metrics()
+
+
+def get_gpu_metrics() -> dict:
+    """Return real NVIDIA load, temperature and model where NVML is available.
+
+    The RTX 4060 Ti supports NVML, so a normal up-to-date NVIDIA driver exposes
+    its GPU temperature here.  ``None`` means the local driver/API could not
+    provide that one value; it is not invented from CPU sensors.
+    """
+    # The UI's monitoring thread and a voice/status request can arrive at the
+    # same time. NVML initialisation is process-global, so serialize the first
+    # probe and reuse its cache afterward.
+    with _gpu_lock:
+        metrics = _pynvml_gpu_metrics()
+        if metrics["utilization_percent"] is not None:
+            return metrics
+        return _native_nvml_gpu_metrics()
 
 
 def _get_gpu_usage() -> float:
-    # pynvml — subprocess-free, works everywhere if installed
-    try:
-        import pynvml  # type: ignore
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
-    except Exception:
-        pass
-
-    return _nvml_gpu()
+    """Backward-compatible load helper for callers that only need a percent."""
+    value = get_gpu_metrics().get("utilization_percent")
+    return float(value) if isinstance(value, (int, float)) else -1.0
 
 
 def _get_cpu_temp() -> float:
-    # psutil — works on Linux; occasionally Windows with proper drivers
+    """Best-effort CPU temperature; many Windows machines do not expose it."""
+    if not _PSUTIL or psutil is None:
+        return -1.0
     try:
         temps = psutil.sensors_temperatures()
-        for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
-                     "cpu-thermal", "zenpower", "it8688"]:
+        for name in [
+            "coretemp", "k10temp", "cpu_thermal", "acpitz", "cpu-thermal", "zenpower", "it8688",
+        ]:
             if name in temps and temps[name]:
-                return temps[name][0].current
+                return float(temps[name][0].current)
         for entries in temps.values():
             if entries:
-                return entries[0].current
+                return float(entries[0].current)
     except Exception:
         pass
 
-    # Windows: wmi module (pure Python COM, zero subprocess)
     if _OS == "Windows":
         try:
             import wmi  # type: ignore
-            w = wmi.WMI(namespace="root/wmi")
-            tz = w.MSAcpi_ThermalZoneTemperature()
-            if tz:
-                return (tz[0].CurrentTemperature / 10.0) - 273.15
+
+            temperatures = wmi.WMI(namespace="root/wmi").MSAcpi_ThermalZoneTemperature()
+            if temperatures:
+                return float(temperatures[0].CurrentTemperature / 10.0 - 273.15)
         except Exception:
             pass
-
     return -1.0
 
 
 def get_system_status() -> dict:
-    """Snapshot of current system metrics for the system_status tool."""
-    if not _PSUTIL:
-        return {"available": False, "error": "psutil is not installed. Run: pip install psutil"}
-    cpu  = psutil.cpu_percent(interval=0.2)
-    ram  = psutil.virtual_memory()
-    temp = _get_cpu_temp()
-    gpu  = _get_gpu_usage()
+    """Snapshot of current local metrics for the status and PC-lag actions."""
+    if not _PSUTIL or psutil is None:
+        return {
+            "available": False,
+            "error": "psutil is not installed. Run: pip install psutil",
+        }
+    cpu = psutil.cpu_percent(interval=0.2)
+    ram = psutil.virtual_memory()
+    cpu_temp = _get_cpu_temp()
+    gpu = get_gpu_metrics()
 
-    boot_time   = psutil.boot_time()
+    boot_time = psutil.boot_time()
     uptime_secs = time.time() - boot_time
-    uptime_h    = int(uptime_secs // 3600)
-    uptime_m    = int((uptime_secs % 3600) // 60)
+    uptime_h = int(uptime_secs // 3600)
+    uptime_m = int((uptime_secs % 3600) // 60)
+    gpu_usage = gpu.get("utilization_percent")
+    gpu_temp = gpu.get("temperature_c")
 
     return {
-        "cpu_percent":   round(cpu, 1),
-        "ram_percent":   round(ram.percent, 1),
-        "ram_used_gb":   round(ram.used   / 1024 ** 3, 1),
-        "ram_total_gb":  round(ram.total  / 1024 ** 3, 1),
-        "cpu_temp_c":    round(temp, 1) if temp > 0 else None,
-        "gpu_percent":   round(gpu,  1) if gpu  >= 0 else None,
-        "uptime":        f"{uptime_h}h {uptime_m}m",
+        "cpu_percent": round(cpu, 1),
+        "ram_percent": round(ram.percent, 1),
+        "ram_used_gb": round(ram.used / 1024 ** 3, 1),
+        "ram_total_gb": round(ram.total / 1024 ** 3, 1),
+        "cpu_temp_c": round(cpu_temp, 1) if cpu_temp > 0 else None,
+        "gpu_percent": round(float(gpu_usage), 1) if isinstance(gpu_usage, (int, float)) else None,
+        "gpu_temp_c": round(float(gpu_temp), 1) if isinstance(gpu_temp, (int, float)) else None,
+        "gpu_name": gpu.get("name") if isinstance(gpu.get("name"), str) else None,
+        "uptime": f"{uptime_h}h {uptime_m}m",
         "process_count": len(psutil.pids()),
     }
 
 
 class SystemMonitor:
-    """
-    Stateful monitor — cooldown state persists across session reconnections.
-    Call check() periodically; returns a [SYSTEM_ALERT] string or None.
-    """
+    """Stateful local monitor which returns an alert string only when needed."""
 
     def __init__(self, thresholds: dict | None = None):
-        self.thresholds   = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+        self.thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
         self._last_alert: dict[str, float] = {}
-        self._cpu_streak  = 0
+        self._cpu_streak = 0
 
     def _can_alert(self, key: str) -> bool:
         return (time.monotonic() - self._last_alert.get(key, 0)) > _COOLDOWN
 
-    def _record(self, key: str):
+    def _record(self, key: str) -> None:
         self._last_alert[key] = time.monotonic()
 
     def check(self) -> str | None:
-        if not _PSUTIL:
+        if not _PSUTIL or psutil is None:
             return None
         try:
-            cpu  = psutil.cpu_percent(interval=None)
-            ram  = psutil.virtual_memory().percent
-            temp = _get_cpu_temp()
-            gpu  = _get_gpu_usage()
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            cpu_temp = _get_cpu_temp()
+            gpu = get_gpu_metrics()
+            gpu_usage = gpu.get("utilization_percent")
+            gpu_temp = gpu.get("temperature_c")
         except Exception:
             return None
 
         alerts: list[str] = []
-
         if cpu >= self.thresholds["cpu"]:
             self._cpu_streak += 1
             if self._cpu_streak >= _CPU_STREAK and self._can_alert("cpu"):
                 alerts.append(
-                    f"[SYSTEM_ALERT] CPU usage has been critically high ({cpu:.0f}%) "
-                    "for several seconds. Warn the user in their language and suggest "
-                    "closing heavy applications."
+                    f"[SYSTEM_ALERT] CPU usage has been critically high ({cpu:.0f}%) for several seconds. "
+                    "Warn the user in their language and suggest closing heavy applications."
                 )
                 self._record("cpu")
                 self._cpu_streak = 0
@@ -191,19 +282,25 @@ class SystemMonitor:
             )
             self._record("ram")
 
-        if temp > 0 and temp >= self.thresholds["temp"] and self._can_alert("temp"):
+        if cpu_temp > 0 and cpu_temp >= self.thresholds["temp"] and self._can_alert("temp"):
             alerts.append(
-                f"[SYSTEM_ALERT] CPU temperature is {temp:.0f}°C — above the safe limit. "
-                "Warn the user in their language and advise reducing system load "
-                "or checking cooling."
+                f"[SYSTEM_ALERT] CPU temperature is {cpu_temp:.0f}°C — above the safe limit. "
+                "Warn the user in their language and advise reducing system load or checking cooling."
             )
             self._record("temp")
 
-        if gpu >= 0 and gpu >= self.thresholds["gpu"] and self._can_alert("gpu"):
+        if isinstance(gpu_usage, (int, float)) and gpu_usage >= self.thresholds["gpu"] and self._can_alert("gpu"):
             alerts.append(
-                f"[SYSTEM_ALERT] GPU load is at {gpu:.0f}%. "
-                "Briefly inform the user in their language."
+                f"[SYSTEM_ALERT] GPU load is at {gpu_usage:.0f}%. Briefly inform the user in their language."
             )
             self._record("gpu")
+
+        if isinstance(gpu_temp, (int, float)) and gpu_temp >= self.thresholds["gpu_temp"] and self._can_alert("gpu_temp"):
+            name = str(gpu.get("name") or "GPU")
+            alerts.append(
+                f"[SYSTEM_ALERT] {name} temperature is {gpu_temp:.0f}°C — above the safe limit. "
+                "Warn the user in their language and advise reducing game load or checking cooling."
+            )
+            self._record("gpu_temp")
 
         return " ".join(alerts) if alerts else None

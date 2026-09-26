@@ -24,6 +24,16 @@ class ApplicationCatalogueTests(unittest.TestCase):
         build.assert_called_once_with()
         self.assertIn("1 launchable entries", result)
 
+    def test_quick_list_reports_pinned_and_recent_apps_that_can_still_launch(self) -> None:
+        entries = {
+            "pinned": [AppEntry("Roblox", "exec", "Roblox.exe")],
+            "recent": [AppEntry("Discord", "exec", "Discord.exe")],
+        }
+        with patch.object(app_catalog, "quick_list", return_value=entries):
+            result = app_catalog.app_catalog({"action": "quick"})
+        self.assertIn("Pinned: Roblox", result)
+        self.assertIn("Recently opened: Discord", result)
+
 
 class NativeWindowRoutingTests(unittest.TestCase):
     def test_legacy_minimize_routes_to_window_manager_without_hotkeys(self) -> None:

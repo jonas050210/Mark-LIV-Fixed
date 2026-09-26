@@ -14,6 +14,7 @@ from core.app_index import (
     INDEX_FILE,
     build_index,
     load_index,
+    quick_list,
     resolve,
 )
 from core.user_paths import desktop_candidates, locations
@@ -88,6 +89,19 @@ def app_catalog(parameters: dict | None = None, player=None) -> str:
     if action in {"diagnose", "diagnostics", "why_missing"}:
         return _diagnose(str(p.get("app_name") or p.get("query") or ""))
 
+    if action in {"quick", "recent", "quick_list"}:
+        quick = quick_list()
+        pinned = [entry.name for entry in quick.get("pinned", [])]
+        recent = [entry.name for entry in quick.get("recent", [])]
+        if not pinned and not recent:
+            return "No pinned or recently opened indexed applications are available yet."
+        sections = []
+        if pinned:
+            sections.append("Pinned: " + ", ".join(pinned))
+        if recent:
+            sections.append("Recently opened: " + ", ".join(recent))
+        return " • ".join(sections) + "."
+
     if action in {"list", "list_apps", "installed"}:
         entries = load_index()
         if not entries:
@@ -100,15 +114,15 @@ def app_catalog(parameters: dict | None = None, player=None) -> str:
         suffix = f" (+{len(entries) - limit} more)" if len(entries) > limit else ""
         return f"Installed applications ({len(entries)}): {', '.join(names)}{suffix}."
 
-    return "Unknown application catalogue action. Use list, refresh, or diagnose."
+    return "Unknown application catalogue action. Use quick, list, refresh, or diagnose."
 
 
 TOOL = {
     "name": "app_catalog",
     "description": (
-        "Lists applications in MARK LIV's installed-app index, rescans the computer "
-        "after an application, game, or browser web app was installed or updated, or "
-        "diagnoses why a named application was not found. The diagnosis reports actual "
+        "Lists pinned/recent applications or applications in MARK LIV's installed-app index, "
+        "rescans the computer after an application, game, or browser web app was installed "
+        "or updated, or diagnoses why a named application was not found. The diagnosis reports actual "
         "scan sources, OneDrive Desktop discovery, aliases, and matching launch entries."
     ),
     "parameters": {
@@ -116,8 +130,8 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["list", "refresh", "diagnose"],
-                "description": "list | refresh | diagnose",
+                "enum": ["quick", "list", "refresh", "diagnose"],
+                "description": "quick | list | refresh | diagnose",
             },
             "limit": {
                 "type": "INTEGER",

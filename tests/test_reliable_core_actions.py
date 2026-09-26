@@ -140,6 +140,12 @@ class HudFrameRateTests(unittest.TestCase):
         self.assertFalse(hasattr(config_manager, "save_hud_max_fps"))
         self.assertFalse(hasattr(config_manager, "HUD_FPS_OPTIONS"))
 
+    def test_hud_monitor_uses_the_shared_gpu_temperature_reader(self) -> None:
+        source = Path(__file__).resolve().parents[1].joinpath("ui.py").read_text(encoding="utf-8")
+        self.assertIn("get_gpu_metrics as _read_gpu_metrics", source)
+        self.assertIn('MetricBar("GPU °C"', source)
+        self.assertNotIn('MetricBar("TMP"', source)
+
     def test_clipboard_detection_panel_is_removed(self) -> None:
         source = Path(__file__).resolve().parents[1].joinpath("ui.py").read_text(encoding="utf-8")
         self.assertNotIn("ClipboardPanel", source)

@@ -17,6 +17,8 @@ class PcStatusTests(unittest.TestCase):
             "ram_used_gb": 7.7,
             "ram_total_gb": 16.0,
             "gpu_percent": 34.0,
+            "gpu_temp_c": 56.0,
+            "gpu_name": "NVIDIA GeForce RTX 4060 Ti",
             "cpu_temp_c": 60.0,
             "uptime": "2h 15m",
             "process_count": 120,
@@ -30,6 +32,8 @@ class PcStatusTests(unittest.TestCase):
             result = pc_status.pc_status({"action": "status"})
         self.assertIn("CPU: 27.5%", result)
         self.assertIn("RAM: 7.7/16.0 GB (48.0%)", result)
+        self.assertIn("NVIDIA GeForce RTX 4060 Ti: 34.0%", result)
+        self.assertIn("GPU temperature: 56.0°C", result)
         self.assertIn("Uptime: 2h 15m", result)
         top.assert_not_called()
 

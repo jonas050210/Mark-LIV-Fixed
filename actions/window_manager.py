@@ -248,8 +248,8 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
         return f"Moved {label} to {left},{top} ({width}x{height})."
 
     return (
-        f"Unknown window action '{action}'. Use list_windows, list_monitors, "
-        "focus, minimize, maximize, restore, close, move_to_monitor, snap, or move."
+        f"Unknown window action '{action}'. Use list_windows, list_monitors, focus, "
+        "minimize, minimize_others, maximize, restore, close, move_to_monitor, snap, or move."
     )
 
 

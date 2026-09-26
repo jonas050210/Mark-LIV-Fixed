@@ -944,7 +944,7 @@ def find_files(name: str = "", extension: str = "",
         return f"Search error: {type(exc).__name__}"
 
 
-def get_recent_files(path: str = "downloads", count: int = 10) -> str:
+def get_recent_files(path: str = "downloads", count: int = 10, extension: str = "") -> str:
     """List the newest regular files directly inside a user folder.
 
     This deliberately does not recurse. For "my latest download" the immediate
@@ -954,6 +954,16 @@ def get_recent_files(path: str = "downloads", count: int = 10) -> str:
     or executes a downloaded file on its own.
     """
     count = max(1, min(int(count), 50))
+    requested_extension = str(extension or "").strip().casefold().lstrip("*")
+    if requested_extension and not requested_extension.startswith("."):
+        requested_extension = "." + requested_extension
+    if (
+        len(requested_extension) > 32
+        or any(ord(char) < 32 for char in requested_extension)
+        or "/" in requested_extension
+        or "\\" in requested_extension
+    ):
+        return "The file extension must be a short value such as .pdf or .zip."
     try:
         target = _resolve_path(path)
         if not _is_safe_path(target):
@@ -986,12 +996,15 @@ def get_recent_files(path: str = "downloads", count: int = 10) -> str:
                     continue
                 if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
                     continue
+                if requested_extension and not item.name.casefold().endswith(requested_extension):
+                    continue
                 newest.append((
                     int(details.st_mtime_ns), item.name.casefold(), int(details.st_size), item,
                 ))
 
         if not newest:
-            return f"No regular files found directly in {target.name}/."
+            suffix = f" matching {requested_extension}" if requested_extension else ""
+            return f"No regular files{suffix} found directly in {target.name}/."
 
         newest.sort(key=lambda row: (-row[0], row[1]))
         lines = [f"Most recent files in {target.name}/:"]
@@ -1292,6 +1305,7 @@ def file_controller(
             return get_recent_files(
                 path=path,
                 count=int(params.get("count", 10)),
+                extension=params.get("extension", ""),
             )
 
         elif action == "largest":
@@ -1374,7 +1388,7 @@ TOOL = {
             "extension": {
                 "type": "STRING",
                 "maxLength": 32,
-                "description": "File extension to search (e.g. .pdf)"
+                "description": "File extension to search or use with recent (e.g. .pdf)"
             },
             "count": {
                 "type": "INTEGER",

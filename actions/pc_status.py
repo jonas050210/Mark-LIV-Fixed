@@ -55,7 +55,10 @@ def _metric_line(status: dict) -> str:
     used = status.get("ram_used_gb")
     total = status.get("ram_total_gb")
     gpu = status.get("gpu_percent")
-    temp = status.get("cpu_temp_c")
+    gpu_temp = status.get("gpu_temp_c")
+    gpu_name = status.get("gpu_name")
+    cpu_temp = status.get("cpu_temp_c")
+    gpu_label = str(gpu_name or "GPU")[:80]
     parts = [
         f"CPU: {cpu}%" if isinstance(cpu, (int, float)) else "CPU: unavailable",
         (
@@ -63,9 +66,15 @@ def _metric_line(status: dict) -> str:
             if all(isinstance(value, (int, float)) for value in (used, total, ram))
             else "RAM: unavailable"
         ),
-        f"GPU: {gpu}%" if isinstance(gpu, (int, float)) else "GPU: unavailable",
-        f"CPU temperature: {temp}°C" if isinstance(temp, (int, float)) else "CPU temperature: unavailable",
+        f"{gpu_label}: {gpu}%" if isinstance(gpu, (int, float)) else f"{gpu_label}: unavailable",
+        (
+            f"GPU temperature: {gpu_temp}°C"
+            if isinstance(gpu_temp, (int, float))
+            else "GPU temperature: unavailable"
+        ),
     ]
+    if isinstance(cpu_temp, (int, float)):
+        parts.append(f"CPU temperature: {cpu_temp}°C")
     return " • ".join(parts)
 
 
@@ -74,15 +83,19 @@ def _lag_notes(status: dict) -> list[str]:
     cpu = status.get("cpu_percent")
     ram = status.get("ram_percent")
     gpu = status.get("gpu_percent")
-    temp = status.get("cpu_temp_c")
+    gpu_temp = status.get("gpu_temp_c")
+    cpu_temp = status.get("cpu_temp_c")
+    gpu_name = str(status.get("gpu_name") or "GPU")[:80]
     if isinstance(cpu, (int, float)) and cpu >= 85:
         notes.append(f"CPU usage is high ({cpu}%).")
     if isinstance(ram, (int, float)) and ram >= 85:
         notes.append(f"RAM usage is high ({ram}%).")
     if isinstance(gpu, (int, float)) and gpu >= 95:
         notes.append(f"GPU usage is very high ({gpu}%).")
-    if isinstance(temp, (int, float)) and temp >= 85:
-        notes.append(f"CPU temperature is high ({temp}°C).")
+    if isinstance(gpu_temp, (int, float)) and gpu_temp >= 85:
+        notes.append(f"{gpu_name} temperature is high ({gpu_temp}°C).")
+    if isinstance(cpu_temp, (int, float)) and cpu_temp >= 85:
+        notes.append(f"CPU temperature is high ({cpu_temp}°C).")
     return notes
 
 
@@ -143,10 +156,11 @@ def pc_status(parameters: dict | None = None, player=None) -> str:
 TOOL = {
     "name": "pc_status",
     "description": (
-        "Read-only PC performance check. Use lag_check when the user asks why their PC "
-        "or game is lagging: it reports real CPU, RAM, GPU and temperature readings plus "
-        "the largest RAM-using apps when there is pressure. Use top_apps to list RAM-heavy "
-        "apps, or status for a compact snapshot. It never closes, kills, or changes anything."
+        "Read-only PC performance check. Use lag_check for phrases such as 'why is my PC "
+        "lagging?' or German 'Warum laggt mein PC?': it reports real CPU, RAM, NVIDIA GPU "
+        "load and GPU temperature when available, plus the largest RAM-using apps when there "
+        "is pressure. Use top_apps to list RAM-heavy apps, or status for a compact snapshot. "
+        "It never closes, kills, or changes anything."
     ),
     "parameters": {
         "type": "OBJECT",

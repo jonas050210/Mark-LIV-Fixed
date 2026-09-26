@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 
 from core.path_policy import atomic_write_bytes, atomic_write_text, resolve_user_path
 from core.user_paths import location as _user_location
+from actions.system_monitor import get_gpu_metrics as _read_gpu_metrics
 
 # The floating panels live in ui_panels/ rather than in this file. ui.py was
 # 5600 lines and every panel added to it made the next one harder to place; the
@@ -200,71 +201,21 @@ def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
 
 
-# ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
-_nvml_lib: object = None   # cached ctypes DLL
-_nvml_ok:  object = None   # None=untested, True=works, False=unavailable
-
-
-def _nvml_gpu_windows() -> float:
-    """Return NVIDIA GPU utilisation % using nvml.dll directly — zero subprocess."""
-    global _nvml_lib, _nvml_ok
-    if _nvml_ok is False:
-        return -1.0
-    try:
-        import ctypes
-
-        class _Util(ctypes.Structure):
-            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
-
-        if _nvml_lib is None:
-            for dll_name in ("nvml", r"C:\Windows\System32\nvml.dll"):
-                try:
-                    lib = ctypes.WinDLL(dll_name)
-                    lib.nvmlInit_v2()
-                    _nvml_lib = lib
-                    break
-                except Exception:
-                    continue
-
-        if _nvml_lib is None:
-            import pynvml  # type: ignore
-            pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            _nvml_ok = True
-            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
-
-        dev = ctypes.c_void_p()
-        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
-        util = _Util()
-        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(util))
-        _nvml_ok = True
-        return float(util.gpu)
-    except Exception:
-        _nvml_ok = False
-        return -1.0
-
-
 class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
         self.mem  = 0.0
         self.net  = 0.0   
-        self.gpu  = -1.0  
-        self.tmp  = -1.0  
+        self.gpu  = -1.0
+        self.gpu_temp = -1.0
+        self.gpu_name = ""
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
         self._running = True
-        # Probe caches — GPU (NVML) and temperature (WMI) are the expensive
-        # queries; initialise their handles once and reuse them instead of
-        # rebuilding a connection on every poll.
-        self._slow_tick = 0            # gpu/temp refreshed every 3rd cycle
-        self._pynvml    = None         # cached pynvml module + device handle
-        self._pynvml_h  = None
-        self._pynvml_ok = None         # None=untested, False=unavailable here
-        self._nv_unix   = None         # cached (lib, dev) for Linux/macOS NVML
-        self._wmi_conn  = None         # cached WMI connection (creating one is slow)
-        self._wmi_ok    = None         # None=untested, False=unavailable here
+        # NVIDIA NVML reads are cached in actions.system_monitor so the HUD,
+        # spoken status and lag check all report the same real GPU values.
+        self._slow_tick = 0  # GPU metrics refresh every 3rd cycle (~6 seconds)
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
 
@@ -292,98 +243,38 @@ class _SysMetrics:
         self._last_net   = nc
         self._last_net_t = now
 
-        # GPU and temperature change slowly and are the most expensive probes
-        # (NVML / WMI) — refresh them every 3rd cycle (~6 s) instead of every
-        # cycle, reusing the previous reading in between.
+        # GPU load and temperature change slowly. Refresh the shared NVML
+        # reading every third cycle (~6 seconds), then reuse it between polls.
         self._slow_tick = (self._slow_tick + 1) % 3
         if self._slow_tick == 1:
-            gpu = self._get_gpu()
-            tmp = self._get_temp()
+            gpu, gpu_temp, gpu_name = self._get_gpu_metrics()
         else:
             gpu = self.gpu
-            tmp = self.tmp
+            gpu_temp = self.gpu_temp
+            gpu_name = self.gpu_name
 
         with self._lock:
             self.cpu = cpu
             self.mem = mem
             self.net = net
             self.gpu = gpu
-            self.tmp = tmp
+            self.gpu_temp = gpu_temp
+            self.gpu_name = gpu_name
 
-    def _get_gpu(self) -> float:
-        # pynvml — subprocess-free; initialise once and reuse the handle.
-        # Re-initialising NVML on every poll is slow, so cache it and stop
-        # retrying pynvml entirely once it proves unavailable here.
-        if self._pynvml_ok is not False:
-            try:
-                if self._pynvml_h is None:
-                    import pynvml  # type: ignore
-                    pynvml.nvmlInit()
-                    self._pynvml    = pynvml
-                    self._pynvml_h  = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    self._pynvml_ok = True
-                return float(self._pynvml.nvmlDeviceGetUtilizationRates(self._pynvml_h).gpu)
-            except Exception:
-                self._pynvml_ok = False
-
-        # Windows: nvml.dll via ctypes (already cached in _nvml_gpu_windows)
-        if _OS == "Windows":
-            return _nvml_gpu_windows()
-
-        # Linux / macOS: libnvidia-ml shared lib via ctypes — init once, reuse
+    def _get_gpu_metrics(self) -> tuple[float, float, str]:
+        """Read cached NVIDIA metrics shared with the PC-status action."""
         try:
-            import ctypes
-
-            class _Util(ctypes.Structure):
-                _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
-
-            if self._nv_unix is None:
-                _lib = "libnvidia-ml.so.1" if _OS == "Linux" else "libnvidia-ml.dylib"
-                nv = ctypes.CDLL(_lib)
-                nv.nvmlInit_v2()
-                dev = ctypes.c_void_p()
-                nv.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
-                self._nv_unix = (nv, dev)
-
-            nv, dev = self._nv_unix
-            u = _Util()
-            nv.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
-            return float(u.gpu)
+            metrics = _read_gpu_metrics()
+            usage = metrics.get("utilization_percent")
+            temperature = metrics.get("temperature_c")
+            name = str(metrics.get("name") or "")[:120]
+            return (
+                float(usage) if isinstance(usage, (int, float)) else -1.0,
+                float(temperature) if isinstance(temperature, (int, float)) else -1.0,
+                name,
+            )
         except Exception:
-            pass
-
-        return -1.0   # N/A — zero subprocess on all platforms
-
-    def _get_temp(self) -> float:
-        # psutil — works on Linux; occasionally Windows with driver support
-        try:
-            temps = psutil.sensors_temperatures()
-            for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
-                         "cpu-thermal", "zenpower", "it8688"]:
-                if name in temps and temps[name]:
-                    return temps[name][0].current
-            for entries in temps.values():
-                if entries:
-                    return entries[0].current
-        except Exception:
-            pass
-
-        # Windows: wmi module (pure Python COM, zero subprocess). Reuse a single
-        # connection — building a fresh wmi.WMI() on every poll spins up a COM
-        # connection each time and is very slow. Give up after one failure.
-        if _OS == "Windows" and self._wmi_ok is not False:
-            try:
-                if self._wmi_conn is None:
-                    import wmi  # type: ignore
-                    self._wmi_conn = wmi.WMI(namespace="root/wmi")
-                tz = self._wmi_conn.MSAcpi_ThermalZoneTemperature()
-                if tz:
-                    return (tz[0].CurrentTemperature / 10.0) - 273.15
-            except Exception:
-                self._wmi_ok   = False
-                self._wmi_conn = None
-
-        return -1.0   # N/A — zero subprocess on all platforms
+            return -1.0, -1.0, ""
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -392,7 +283,8 @@ class _SysMetrics:
                 "mem": self.mem,
                 "net": self.net,
                 "gpu": self.gpu,
-                "tmp": self.tmp,
+                "gpu_temp": self.gpu_temp,
+                "gpu_name": self.gpu_name,
             }
 
 
@@ -2135,13 +2027,15 @@ class MainWindow(QMainWindow):
         else:
             self._bar_gpu.set_value(0, "N/A")
 
-        # TMP
-        tmp = snap["tmp"]
-        if tmp >= 0:
-            tmp_pct = min(100, (tmp / 100) * 100)
-            self._bar_tmp.set_value(tmp_pct, f"{tmp:.0f}°C")
+        # GPU temperature — NVIDIA NVML provides this directly for cards such
+        # as the RTX 4060 Ti. CPU temperature remains unavailable on many
+        # Windows motherboards, so the panel deliberately shows the useful GPU
+        # reading instead of a permanent N/A CPU sensor.
+        gpu_temp = snap["gpu_temp"]
+        if gpu_temp >= 0:
+            self._bar_gpu_temp.set_value(min(100, gpu_temp), f"{gpu_temp:.0f}°C")
         else:
-            self._bar_tmp.set_value(0, "N/A")
+            self._bar_gpu_temp.set_value(0, "N/A")
 
         try:
             boot_t  = psutil.boot_time()
@@ -2247,10 +2141,10 @@ class MainWindow(QMainWindow):
         self._bar_mem = MetricBar("MEM", C.ACC2)
         self._bar_net = MetricBar("NET", C.GREEN)
         self._bar_gpu = MetricBar("GPU", C.ACC)
-        self._bar_tmp = MetricBar("TMP", "#ff6688")
+        self._bar_gpu_temp = MetricBar("GPU °C", "#ff6688")
 
         for bar in [self._bar_cpu, self._bar_mem, self._bar_net,
-                    self._bar_gpu, self._bar_tmp]:
+                    self._bar_gpu, self._bar_gpu_temp]:
             lay.addWidget(bar)
 
         lay.addSpacing(4)

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from core.window_manager import MonitorInfo, WindowInfo, find_window, place_window, snap_window
 from core import undo as undo_stack
+from actions import window_manager as window_manager_module
 from actions.window_manager import window_manager
 
 
@@ -95,6 +96,17 @@ class WindowManagerTests(unittest.TestCase):
     def test_minimize_others_requires_a_named_window_to_keep(self) -> None:
         result = window_manager({"action": "minimize_others"})
         self.assertIn("Name the application", result)
+
+    def test_tidy_undo_refuses_to_overwrite_a_window_changed_afterwards(self) -> None:
+        original = WindowInfo(2, "Discord", "discord.exe", 2, 20, 20, 900, 700)
+        changed = WindowInfo(2, "Discord", "discord.exe", 2, 20, 20, 900, 700)
+        with patch("actions.window_manager.refresh_window", return_value=changed), \
+             patch("actions.window_manager.operate") as operate:
+            with self.assertRaises(undo_stack.UndoRefused):
+                window_manager_module._restore_minimized_windows(
+                    ((original, window_manager_module._window_state(original)),)
+                )
+        operate.assert_not_called()
 
 
 if __name__ == "__main__":
