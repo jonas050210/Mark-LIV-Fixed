@@ -834,6 +834,32 @@ def open_app_result(
     return _open_app_core(parameters, response, player, session_memory, cancel_event)
 
 
+def _open_app_action(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+    cancel_event=None,
+) -> dict:
+    """Registry handler with an explicit success result for dashboard/runtime state.
+
+    The public ``open_app`` function intentionally remains a text convenience
+    wrapper for older callers.  Its honest failure text can start with "I
+    started … but no window appeared", though, which a generic string adapter
+    cannot reliably classify.  The action registry receives the boolean from
+    the verified launch pipeline directly instead of guessing from prose.
+    """
+    ok, message = open_app_result(
+        parameters, response, player, session_memory, cancel_event,
+    )
+    return {
+        "ok": ok,
+        "status": "succeeded" if ok else "failed",
+        "message": message,
+        "data": {},
+    }
+
+
 def _remember_launch(name: str, window) -> None:
     """Make an application launch reversible by closing the window it opened.
 
@@ -989,5 +1015,5 @@ TOOL = {
             "app_name"
         ]
     },
-    "handler": open_app,
+    "handler": _open_app_action,
 }

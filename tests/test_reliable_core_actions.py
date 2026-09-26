@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from actions import app_lifecycle, file_controller, window_manager
 from core import window_manager as core_windows
+from core.action_result import ActionResult
 from core.app_index import AppEntry
 from core.window_manager import WindowInfo
 from memory import config_manager
@@ -41,7 +43,21 @@ class ApplicationLifecycleTests(unittest.TestCase):
              patch.object(app_lifecycle, "operate") as operate:
             result = app_lifecycle._restart("Twitch")
         self.assertIn("cannot safely distinguish", result)
+        self.assertFalse(ActionResult.from_handler("app_lifecycle", result).ok)
         operate.assert_not_called()
+
+    def test_restart_leaves_an_unindexed_running_app_open(self) -> None:
+        window = _window(1, "Personal Editor")
+        with patch.object(app_lifecycle, "_snapshot", return_value=([window], [])), \
+             patch.object(app_lifecycle, "operate") as operate, \
+             patch.object(app_lifecycle, "open_app_result") as launch:
+            result = app_lifecycle._restart("Personal Editor")
+
+        self.assertIn("cannot find a verified launch entry", result)
+        self.assertIn("left its window open", result)
+        self.assertFalse(ActionResult.from_handler("app_lifecycle", result).ok)
+        operate.assert_not_called()
+        launch.assert_not_called()
 
 
     def test_diagnose_reports_every_window_even_when_pid_is_unknown(self) -> None:
@@ -104,7 +120,7 @@ class OpenWithApplicationTests(unittest.TestCase):
             target.write_bytes(b"pdf")
             with patch.object(file_controller, "_resolve_path", return_value=target), \
                  patch.object(file_controller, "_is_safe_path", return_value=True), \
-                 patch("actions.open_app.open_app", return_value="Opened Edge.") as launch:
+                 patch("actions.open_app.open_app_result", return_value=(True, "Opened Edge.")) as launch:
                 result = file_controller.open_with_application(str(target), "Edge")
         self.assertEqual(result, "Opened Edge.")
         launch.assert_called_once_with({"app_name": "Edge", "arguments": [str(target)]})
@@ -117,12 +133,43 @@ class OpenWithApplicationTests(unittest.TestCase):
             with patch.object(file_controller, "_resolve_path", return_value=root), \
                  patch.object(file_controller.explorer, "search", return_value=[target]), \
                  patch.object(file_controller, "_is_safe_path", side_effect=[True, False]), \
-                 patch("actions.open_app.open_app") as launch:
+                 patch("actions.open_app.open_app_result") as launch:
                 result = file_controller.open_with_application(
                     str(root), "Edge", name="report.pdf"
                 )
         self.assertIn("Access denied", result)
         launch.assert_not_called()
+
+    def test_open_with_keeps_an_unverified_application_launch_as_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "report.pdf"
+            target.write_bytes(b"pdf")
+            with patch.object(file_controller, "_resolve_path", return_value=target), \
+                 patch.object(file_controller, "_is_safe_path", return_value=True), \
+                 patch(
+                     "actions.open_app.open_app_result",
+                     return_value=(False, "I started Edge, but no window appeared."),
+                 ):
+                result = file_controller.open_with_application(str(target), "Edge")
+
+        self.assertTrue(result.startswith("Could not open 'report.pdf' with Edge:"))
+        self.assertFalse(ActionResult.from_handler("file_controller", result).ok)
+
+    def test_open_with_passes_runtime_cancellation_to_the_launcher(self) -> None:
+        cancel_event = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "report.pdf"
+            target.write_bytes(b"pdf")
+            with patch.object(file_controller, "_resolve_path", return_value=target), \
+                 patch.object(file_controller, "_is_safe_path", return_value=True), \
+                 patch("actions.open_app.open_app_result", return_value=(False, "cancelled")) as launch:
+                file_controller.open_with_application(
+                    str(target), "Edge", cancel_event=cancel_event
+                )
+
+        launch.assert_called_once_with(
+            {"app_name": "Edge", "arguments": [str(target)]}, cancel_event=cancel_event
+        )
 
 
 class HudFrameRateTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 """GPU telemetry must report real NVML temperature, not invent a CPU fallback."""
 from __future__ import annotations
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +32,37 @@ class GpuTelemetryTests(unittest.TestCase):
              patch.object(system_monitor, "_native_nvml_gpu_metrics", return_value=expected):
             result = system_monitor.get_gpu_metrics()
         self.assertEqual(result, expected)
+
+    def test_pynvml_failure_is_retried_after_a_short_cooldown(self) -> None:
+        """A temporary driver startup failure must not leave GPU temperature N/A forever."""
+        calls: list[str] = []
+        fake_nvml = SimpleNamespace(
+            NVML_TEMPERATURE_GPU=0,
+            nvmlInit=lambda: calls.append("init"),
+            nvmlDeviceGetHandleByIndex=lambda index: "gpu-0",
+            nvmlDeviceGetUtilizationRates=lambda handle: SimpleNamespace(gpu=37),
+            nvmlDeviceGetTemperature=lambda handle, sensor: 62,
+            nvmlDeviceGetName=lambda handle: b"NVIDIA GeForce RTX 4060 Ti",
+        )
+        with patch.multiple(
+            system_monitor,
+            _pynvml_ok=False,
+            _pynvml_retry_after=200.0,
+            _pynvml_module=None,
+            _pynvml_handle=None,
+        ), patch.dict(sys.modules, {"pynvml": fake_nvml}):
+            with patch.object(system_monitor.time, "monotonic", return_value=199.0):
+                self.assertEqual(
+                    system_monitor._pynvml_gpu_metrics(), system_monitor._blank_gpu_metrics()
+                )
+            self.assertEqual(calls, [])
+            with patch.object(system_monitor.time, "monotonic", return_value=200.0):
+                result = system_monitor._pynvml_gpu_metrics()
+
+        self.assertEqual(calls, ["init"])
+        self.assertEqual(result["utilization_percent"], 37.0)
+        self.assertEqual(result["temperature_c"], 62.0)
+        self.assertEqual(result["name"], "NVIDIA GeForce RTX 4060 Ti")
 
     def test_system_status_exposes_gpu_temperature_separately_from_cpu_temperature(self) -> None:
         fake_psutil = SimpleNamespace(

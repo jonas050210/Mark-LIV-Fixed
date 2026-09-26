@@ -1186,6 +1186,7 @@ def open_with_application(
     application: str,
     name: str = "",
     match_index: int | None = None,
+    cancel_event=None,
 ) -> str:
     """Resolve one safe file and pass it to an indexed application as argv."""
     app_name = str(application or "").strip()[:160]
@@ -1219,8 +1220,15 @@ def open_with_application(
         return f"Access denied: {target}"
     if not target.exists() or not target.is_file():
         return f"I could not find a file to open at {target}."
-    from actions.open_app import open_app
-    return open_app({"app_name": app_name, "arguments": [str(target)]})
+    from actions.open_app import open_app_result
+    launch_parameters = {"app_name": app_name, "arguments": [str(target)]}
+    if cancel_event is None:
+        opened, message = open_app_result(launch_parameters)
+    else:
+        opened, message = open_app_result(launch_parameters, cancel_event=cancel_event)
+    if not opened:
+        return f"Could not open '{target.name}' with {app_name}: {message}"
+    return message
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -1273,6 +1281,7 @@ def file_controller(
                 application=params.get("application", ""),
                 name=name,
                 match_index=match_index,
+                cancel_event=cancel_event,
             )
 
         elif action in {"select", "show_in_explorer", "reveal"}:

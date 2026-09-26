@@ -38,6 +38,13 @@ _nvml_ok: bool | None = None
 _pynvml_module: object | None = None
 _pynvml_handle: object | None = None
 _pynvml_ok: bool | None = None
+# A driver can be momentarily unavailable while Windows is waking, installing a
+# driver update, or recovering from a reset.  Cache a failed probe briefly so a
+# 180 FPS HUD does not repeatedly import/load NVML, but do not make one startup
+# failure permanent for the rest of MARK LIV's session.
+_NVML_RETRY_SECONDS = 30.0
+_nvml_retry_after = 0.0
+_pynvml_retry_after = 0.0
 _gpu_lock = threading.Lock()
 
 
@@ -58,8 +65,9 @@ def _clean_gpu_name(value) -> str | None:
 
 def _pynvml_gpu_metrics() -> dict:
     """Read the first NVIDIA GPU through maintained nvidia-ml-py bindings."""
-    global _pynvml_module, _pynvml_handle, _pynvml_ok
-    if _pynvml_ok is False:
+    global _pynvml_module, _pynvml_handle, _pynvml_ok, _pynvml_retry_after
+    now = time.monotonic()
+    if _pynvml_ok is False and now < _pynvml_retry_after:
         return _blank_gpu_metrics()
     try:
         if _pynvml_handle is None:
@@ -76,6 +84,7 @@ def _pynvml_gpu_metrics() -> dict:
         )
         name = module.nvmlDeviceGetName(handle)
         _pynvml_ok = True
+        _pynvml_retry_after = 0.0
         return {
             "utilization_percent": float(utilisation.gpu),
             "temperature_c": float(temperature),
@@ -85,13 +94,15 @@ def _pynvml_gpu_metrics() -> dict:
         _pynvml_ok = False
         _pynvml_module = None
         _pynvml_handle = None
+        _pynvml_retry_after = now + _NVML_RETRY_SECONDS
         return _blank_gpu_metrics()
 
 
 def _native_nvml_gpu_metrics() -> dict:
     """Read NVML directly when the optional Python binding is unavailable."""
-    global _nvml_lib, _nvml_ok
-    if _nvml_ok is False:
+    global _nvml_lib, _nvml_ok, _nvml_retry_after
+    now = time.monotonic()
+    if _nvml_ok is False and now < _nvml_retry_after:
         return _blank_gpu_metrics()
     try:
         if _nvml_lib is None:
@@ -115,6 +126,7 @@ def _native_nvml_gpu_metrics() -> dict:
 
         if _nvml_lib is None:
             _nvml_ok = False
+            _nvml_retry_after = now + _NVML_RETRY_SECONDS
             return _blank_gpu_metrics()
 
         device = ctypes.c_void_p()
@@ -140,6 +152,7 @@ def _native_nvml_gpu_metrics() -> dict:
         )
         name = _clean_gpu_name(name_buffer.value) if int(name_result) == 0 else None
         _nvml_ok = True
+        _nvml_retry_after = 0.0
         return {
             "utilization_percent": float(utilisation.gpu),
             "temperature_c": temp_value,
@@ -147,6 +160,7 @@ def _native_nvml_gpu_metrics() -> dict:
         }
     except Exception:
         _nvml_ok = False
+        _nvml_retry_after = now + _NVML_RETRY_SECONDS
         return _blank_gpu_metrics()
 
 

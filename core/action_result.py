@@ -106,8 +106,8 @@ class ActionResult:
         # classify common rejection forms until each action returns ActionResult.
         low = message.lstrip().casefold()
         failure_prefixes = (
-            "failed", "could not", "error:", "execution error", "access denied",
-            "permission denied", "not available", "not found", "timed out",
+            "failed", "could not", "i could not", "i cannot", "i can't", "error:",
+            "execution error", "access denied", "permission denied", "not available", "not found", "timed out",
             "action failed", "tool '", "unsupported", "not installed", "refused",
             "cannot ", "can't ", "invalid ", "unknown ", "no file path",
             "no path", "no source", "no destination", "archive rejected",

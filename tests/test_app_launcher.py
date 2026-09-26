@@ -402,6 +402,13 @@ class StructuredResultTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no window appeared", message)
 
+    def test_registry_handler_preserves_a_verified_launch_failure_status(self) -> None:
+        with patch.object(open_app, "open_app_result", return_value=(False, "I started Chrome, but no window appeared.")):
+            result = open_app._open_app_action({"app_name": "Chrome"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("no window appeared", result["message"])
+
     def test_a_partial_placement_failure_reports_ok_false(self) -> None:
         still_on_monitor_one = _window(handle=7, left=0, right=800)
         with patch.object(open_app, "_matching_windows", return_value=[]), \
