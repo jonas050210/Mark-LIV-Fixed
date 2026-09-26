@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from core.window_manager import MonitorInfo, WindowInfo, find_window, snap_window
+from core.window_manager import MonitorInfo, WindowInfo, find_window, place_window, snap_window
 from core import undo as undo_stack
 from actions.window_manager import window_manager
 
@@ -40,6 +40,27 @@ class WindowManagerTests(unittest.TestCase):
             calls = [call.args for call in operate.call_args_list]
             self.assertIn((window, "move", 960, 0, 960, 1040), calls)
             self.assertIn((window, "focus"), calls)
+
+    def test_spoken_fullscreen_uses_native_maximize_not_a_monitor_sized_move(self) -> None:
+        window = WindowInfo(1, "Test", "test.exe", 1, 50, 50, 850, 650)
+        monitor = MonitorInfo(1, "DISPLAY1", 0, 0, 1920, 1080, 0, 0, 1920, 1040)
+        with patch("core.window_manager.operate") as operate, \
+             patch("core.window_manager.refresh_window", return_value=window):
+            place_window(window, monitor, "fullscreen")
+        calls = [call.args for call in operate.call_args_list]
+        self.assertIn((window, "maximize"), calls)
+        self.assertNotIn((window, "move", 0, 0, 1920, 1080), calls)
+
+    def test_direct_fullscreen_action_uses_maximize_and_keeps_taskbar_available(self) -> None:
+        window = WindowInfo(1, "Editor", "editor.exe", 1, 50, 50, 850, 650)
+        undo_stack.clear()
+        with patch("actions.window_manager.find_window", return_value=window), \
+             patch("actions.window_manager.place_window", return_value=window) as place:
+            result = window_manager({"action": "fullscreen", "target": "Editor"})
+        place.assert_called_once_with(window, None, "maximized")
+        self.assertIn("maximized", result)
+        self.assertIn("taskbar", result)
+        undo_stack.clear()
 
 
 if __name__ == "__main__":

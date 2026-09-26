@@ -62,6 +62,8 @@ def _clean_steps(raw) -> list[dict]:
                 raise WorkspaceError(f"Workspace step {number} has an invalid monitor.")
             row["monitor"] = monitor
         state = str(item.get("state") or "").strip().casefold()
+        if state in {"fullscreen", "full_screen", "full screen", "full"}:
+            state = "maximized"
         if state:
             if state not in _ALLOWED_STATES:
                 raise WorkspaceError(f"Workspace step {number} has an invalid window state.")

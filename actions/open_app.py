@@ -554,6 +554,11 @@ def _placement_request(parameters: dict) -> tuple[int | str | None, str]:
     else:
         monitor_ref = None
     state = str(parameters.get("state") or "").casefold().strip()
+    # Voice "fullscreen" means the Windows maximise control for this app, not
+    # F11. The taskbar remains visible; core.window_manager handles the native
+    # operation by window handle.
+    if state in {"fullscreen", "full_screen", "full screen", "full"}:
+        state = "maximized"
     return monitor_ref, state
 
 
@@ -967,7 +972,7 @@ TOOL = {
                 "type": "STRING",
                 "enum": ["normal", "maximized", "fullscreen", "minimized", "left", "right", "top", "bottom"],
                 "maxLength": 16,
-                "description": "Window state after opening: fullscreen, maximized, minimized, or a snap side."
+                "description": "Window state after opening. fullscreen means native maximized with the taskbar visible; also supports maximized, minimized, or a snap side."
             },
             "arguments": {
                 "type": "ARRAY",

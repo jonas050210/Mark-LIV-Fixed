@@ -769,7 +769,9 @@ def computer_settings(
         "maximize": "maximize", "maximise": "maximize",
         "restore": "restore", "focus": "focus", "switch": "focus",
         "close_app": "close", "close_window": "close",
-        "full_screen": "fullscreen", "fullscreen": "fullscreen",
+        # Spoken fullscreen is the native maximise button, not F11. Keep the
+        # taskbar visible and target a real window through window_manager.
+        "full_screen": "maximize", "fullscreen": "maximize",
         "move_to_monitor": "move_to_monitor", "snap": "snap",
         "snap_left": "snap", "snap_right": "snap",
     }

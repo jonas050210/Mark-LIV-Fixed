@@ -46,6 +46,17 @@ class NativeWindowRoutingTests(unittest.TestCase):
             {"action": "close", "target": ""}, player=None
         )
 
+    def test_legacy_fullscreen_routes_to_native_maximize_without_a_hotkey(self) -> None:
+        with patch("actions.window_manager.window_manager", return_value="Maximized Editor.") as route, \
+             patch.object(computer_settings, "_PYAUTOGUI", False):
+            result = computer_settings.computer_settings(
+                {"action": "full_screen", "target": "Editor"}
+            )
+        self.assertEqual(result, "Maximized Editor.")
+        route.assert_called_once_with(
+            {"action": "maximize", "target": "Editor"}, player=None
+        )
+
     def test_unnamed_switch_refuses_alt_tab(self) -> None:
         result = computer_settings.computer_settings({"action": "switch_window"})
         self.assertIn("Alt+Tab was removed", result)

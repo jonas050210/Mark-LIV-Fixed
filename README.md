@@ -92,7 +92,7 @@ is reported instead of being silently skipped.
 
 Placement is part of the same request:
 
-- `Open Chrome on monitor 2 in fullscreen`
+- `Open Chrome on monitor 2 in fullscreen` (uses the normal Windows maximize button; taskbar stays visible, never F11)
 - `Open Spotify in the background` (focus stays where it is)
 - `Open Discord snapped left on monitor 1`
 

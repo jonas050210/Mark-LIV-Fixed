@@ -138,14 +138,17 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
                 "The application may be showing its own save prompt."
             )
         return f"Closed {_target_label(window)}."
-    if action in {"fullscreen", "full_screen", "full"}:
+    if action in {"fullscreen", "full_screen", "full", "maximize", "maximise"}:
+        # Spoken "fullscreen" deliberately means the native maximise button:
+        # it fills the usable desktop but keeps the Windows taskbar visible.
+        # It never sends F11 or a focus-dependent hotkey.
         monitor = monitor_for(p.get("monitor")) if p.get("monitor") else None
-        placed = place_window(window, monitor, "fullscreen")
+        placed = place_window(window, monitor, "maximized")
         _remember_window(window, label, before)
         if monitor is not None and not window_on_monitor(placed, monitor):
-            return f"I put {label} in fullscreen, but could not verify monitor {monitor.index}."
+            return f"I maximized {label}, but could not verify monitor {monitor.index}."
         where = f" on monitor {monitor.index}" if monitor is not None else ""
-        return f"{label} is now fullscreen{where}."
+        return f"{label} is now maximized{where}; the taskbar remains available."
     if action in {"move_to_monitor", "move_monitor", "send_to_monitor"}:
         monitor = monitor_for(p.get("monitor", 1))
         move_to_monitor(window, monitor)
@@ -190,7 +193,8 @@ TOOL = {
     "description": (
         "Controls a named desktop window and the user's monitors. Use this instead "
         "of a blind hotkey when the user names an app: list open windows, focus, "
-        "list all windows of one app, minimize or close one/all, maximize, fullscreen, "
+        "list all windows of one app, minimize or close one/all, maximize, or fullscreen "
+        "(which deliberately means native maximize with the taskbar still visible, never F11), "
         "restore, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "

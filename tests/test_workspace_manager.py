@@ -68,6 +68,16 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("invalid window state", result)
         self.assertEqual(workspace_manager._read()["workspaces"], {})
 
+    def test_saved_spoken_fullscreen_is_canonicalized_to_native_maximize(self) -> None:
+        result = workspace_manager.workspace_manager({
+            "action": "save", "name": "video", "steps": [
+                {"app_name": "Chrome", "state": "fullscreen"},
+            ],
+        })
+        self.assertIn("Saved workspace", result)
+        steps = workspace_manager._read()["workspaces"]["video"]["steps"]
+        self.assertEqual(steps, [{"app_name": "Chrome", "state": "maximized"}])
+
     def test_profile_capacity_and_unknown_run_are_reported(self) -> None:
         for index in range(workspace_manager.MAX_WORKSPACES):
             workspace_manager.workspace_manager({

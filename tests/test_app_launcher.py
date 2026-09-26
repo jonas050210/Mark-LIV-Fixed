@@ -205,7 +205,7 @@ class SelfHealingLaunchTests(unittest.TestCase):
 class PlacementTests(unittest.TestCase):
     """Monitor and window-state requests must be applied and verified."""
 
-    def test_open_on_second_monitor_in_fullscreen(self) -> None:
+    def test_open_on_second_monitor_with_spoken_fullscreen_uses_native_maximize(self) -> None:
         placed = _window(handle=7, left=1920, right=3840)
         with patch.object(open_app, "_matching_windows", return_value=[]), \
              patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
@@ -217,8 +217,8 @@ class PlacementTests(unittest.TestCase):
                 {"app_name": "Chrome", "monitor": 2, "state": "fullscreen"}
             )
         self.assertIn("monitor 2", result)
-        self.assertIn("fullscreen", result)
-        self.assertEqual(place.call_args[0][2], "fullscreen")
+        self.assertIn("maximised", result)
+        self.assertEqual(place.call_args[0][2], "maximized")
 
     def test_unverified_monitor_move_is_reported(self) -> None:
         still_on_monitor_one = _window(handle=7, left=0, right=800)
@@ -349,7 +349,7 @@ class SemanticMonitorTests(unittest.TestCase):
                 {"app_name": "Chrome", "monitor": "secondary", "state": "fullscreen"}
             )
         self.assertIn("monitor 2", result)
-        self.assertIn("fullscreen", result)
+        self.assertIn("maximised", result)
 
 
 class DirectShortcutLaunchTests(unittest.TestCase):
