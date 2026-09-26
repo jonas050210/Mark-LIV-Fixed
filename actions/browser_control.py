@@ -20,6 +20,33 @@ from core import browser_handoff
 from core.path_policy import move_no_replace, resolve_user_path
 from core.user_paths import location as _user_location
 
+def _site_label(url: str) -> str:
+    """The name a user would call a site: 'youtube' for youtube.com/watch."""
+    try:
+        host = urlsplit(str(url or "")).hostname or ""
+    except Exception:
+        return ""
+    parts = [p for p in host.casefold().split(".") if p not in ("www", "com", "de", "net", "org")]
+    return parts[0] if parts else ""
+
+
+def _remember_native_window(url: str) -> None:
+    """Track the window a native open produced, off the action thread.
+
+    The go_to path returns as soon as the OS accepts the URL; the browser
+    window appears a moment later with a title that only settles once the
+    page loads. Watching in the background and recording the result as the
+    most recent launch is what lets a following "make it fullscreen" find the
+    page even while its title still reads 'New Tab'.
+    """
+    try:
+        from core.window_manager import watch_launched_window
+
+        watch_launched_window(_site_label(url) or str(url or "")[:60], timeout=6.0)
+    except Exception:
+        pass
+
+
 # Playwright is optional: native URL navigation remains useful without it.
 # Import the automation package only when an interactive browser action is
 # requested, so startup and action discovery work on minimal installs.
@@ -1236,6 +1263,7 @@ def browser_control(
         result = _open_native(nav_url, browser)
         if result.startswith("Opened") and nav_url:
             _registry.note_native_url(_normalize_url(nav_url))
+            _remember_native_window(nav_url)
         _log(player, result)
         return result
 

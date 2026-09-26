@@ -3,22 +3,146 @@ from __future__ import annotations
 
 import time
 
+from core.text_match import partial_ratio
 from core.undo import push_undo, refuse
 from core.window_manager import (
+    backend_name,
     describe_monitors,
     describe_windows,
     find_window,
     find_windows,
     focus_window,
+    last_launched_window,
     list_windows,
     monitor_for,
     move_to_monitor,
     operate,
     place_window,
+    recent_launch_window_for,
     refresh_window,
     snap_window,
     window_on_monitor,
 )
+
+# How often a settling-title retry re-reads the desktop, and how long it keeps
+# trying. A browser tab that is still "New Tab" while YouTube loads typically
+# lands its real title well inside two seconds.
+_SETTLE_POLL_SECONDS = 0.25
+_SETTLE_TIMEOUT_SECONDS = 2.5
+
+
+def _strict_matches(target: str, *, timeout: float | None = None) -> list:
+    """Strict (min_score=80) matches, re-read briefly while a title settles.
+
+    Uses this module's ``find_windows`` so behaviour stays identical whether it
+    is the real desktop or a test double answering.
+    """
+    budget = _SETTLE_TIMEOUT_SECONDS if timeout is None else max(0.0, float(timeout))
+    deadline = time.monotonic() + budget
+    while True:
+        matches = find_windows(target, min_score=80)
+        if matches or time.monotonic() >= deadline:
+            return matches
+        time.sleep(_SETTLE_POLL_SECONDS)
+
+
+def _normalised(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else " " for ch in str(value or "")).strip()
+
+
+def _site_token(url: str) -> str:
+    """The name a user would use for a site URL, e.g. 'youtube' for youtube.com."""
+    try:
+        from urllib.parse import urlsplit
+
+        host = urlsplit(str(url or "")).hostname or ""
+    except Exception:
+        return ""
+    parts = [part for part in host.casefold().split(".") if part not in ("www", "com", "de", "net", "org")]
+    return parts[0] if parts else ""
+
+
+def _not_found_message(target: str) -> str:
+    """Tell the model what IS open, so it can correct itself in one turn.
+
+    "Could not find a window matching 'YouTube'" used to end the exchange; the
+    user said "it is open, look again" and the assistant had nothing new to
+    look at. Listing the windows that were actually seen turns the same
+    failure into a self-service answer: the model can pick the right title and
+    retry, or report honestly what the desktop shows.
+    """
+    label = target or "the active window"
+    try:
+        windows = list_windows()
+    except Exception:
+        windows = []
+    if not windows:
+        return (
+            f"I could not find a visible window matching '{label}', and no open "
+            f"windows could be read at all (window backend: '{backend_name()}'). "
+            "If windows are open, this desktop session may not expose them to me."
+        )
+    rows = []
+    for i, window in enumerate(windows[:12], 1):
+        process = f" [{window.process}]" if window.process else ""
+        rows.append(f"{i}. {window.title}{process}")
+    more = "" if len(windows) <= 12 else f" …and {len(windows) - 12} more"
+    return (
+        f"I could not find a visible window matching '{label}'. "
+        f"These windows are currently visible: " + "; ".join(rows) + more +
+        ". Retry with the exact title or process of the window the user means."
+    )
+
+
+def _named_window_candidates(target: str, *, wait: float | None = None,
+                             launch_fallback: bool = True) -> list:
+    """Resolve a spoken target to windows, surviving the two common races.
+
+    1. A just-opened page has not settled its title yet ("New Tab" while
+       YouTube loads) — answered by re-scoring for a few seconds.
+    2. The page lives in a tab whose title never contains the spoken name —
+       answered by the memory of the window this assistant launched (when the
+       remembered name agrees with the target), or by the last URL handed to
+       the browser when its site name agrees with the target.
+
+    Strictness is preserved: the launch-memory fallback only fires when the
+    target clearly names what was launched, and the URL fallback only when a
+    single browser window is in play or the remembered launch was a browser.
+    """
+    matches = find_windows(target, min_score=80)
+    if matches:
+        return matches
+    budget = _SETTLE_TIMEOUT_SECONDS if wait is None else wait
+    if budget > 0:
+        matches = _strict_matches(target, timeout=budget)
+        if matches:
+            return matches
+    if launch_fallback:
+        remembered = recent_launch_window_for(target)
+        if remembered is not None:
+            live = refresh_window(remembered)
+            if live is not None:
+                return [live]
+        # The site was just opened in the browser (handoff record), but its
+        # tab title does not carry the name the user said.
+        try:
+            from core import browser_handoff
+
+            last_url = browser_handoff.peek()
+        except Exception:
+            last_url = ""
+        site = _site_token(last_url)
+        if site and site in _normalised(target):
+            candidates = [w for w in find_windows("browser", min_score=80)]
+            if remembered is not None and any(
+                int(w.handle) == int(remembered.handle) for w in candidates
+            ):
+                live = refresh_window(remembered)
+                if live is not None:
+                    return [live]
+            if len(candidates) == 1:
+                return candidates
+    return []
 
 
 def _target_label(window) -> str:
@@ -108,9 +232,11 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     if action in {"list_app_windows", "app_windows", "close_all", "minimize_all"}:
         if not target:
             return f"A target application is required for {action}."
-        matches = find_windows(target, min_score=80)
+        # Wait for a settling title, but never guess: close/minimize_all act on
+        # every match, so only a confirmed title/process match is acceptable.
+        matches = _strict_matches(target)
         if not matches:
-            return f"I could not find a visible window matching '{target}'."
+            return _not_found_message(target)
         if action in {"list_app_windows", "app_windows"}:
             rows = [
                 f"{index}. {window.title} [{window.process}] HWND {window.handle}"
@@ -139,9 +265,9 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     if action in {"minimize_others", "tidy_desktop", "clear_desktop"}:
         if not target:
             return "Name the application or window to keep visible when tidying the desktop."
-        keep = find_windows(target, min_score=80)
+        keep = _strict_matches(target)
         if not keep:
-            return f"I could not find a visible window matching '{target}' to keep open."
+            return _not_found_message(target)
         keep_handles = {int(window.handle) for window in keep}
         snapshots = []
         failed = 0
@@ -177,14 +303,17 @@ def window_manager(parameters: dict | None = None, player=None) -> str:
     # close/quit. A weak fuzzy match is not an acceptable target for moving,
     # minimising, or focusing somebody's windows either: acting on Visual
     # Studio Code because the user said Chrome is still the wrong operation.
+    # _named_window_candidates adds only two tightly-scoped escapes to that
+    # bar: a settling title gets a few seconds to load, and the window this
+    # assistant itself just launched can stand in when the user names it.
     # With no target, retain the intentional "active window" behaviour.
     if target:
-        strict_matches = find_windows(target, min_score=80)
-        window = strict_matches[0] if strict_matches else None
+        named = _named_window_candidates(target)
+        window = named[0] if named else None
     else:
         window = find_window()
     if window is None:
-        return f"I could not find a visible window matching '{target or 'the active window'}'."
+        return _not_found_message(target)
 
     label = _target_label(window)
     before = _window_state(window)
@@ -278,6 +407,11 @@ TOOL = {
         "restore, move an app to a "
         "monitor, snap it left/right/top/bottom, or move and resize it. It can also "
         "report monitor resolution, position, primary status, and refresh rate. "
+        "The target may be an application name or part of a window title; the generic "
+        "word 'browser' matches any browser window (Chrome, Edge, Firefox, …). A window "
+        "the user just asked to open is remembered, so a following 'make it fullscreen' "
+        "finds it even while its title is still loading. If no window matches, the "
+        "currently visible windows are listed back — retry with the exact title. "
         "If no target is supplied, use the currently active window."
     ),
     "parameters": {

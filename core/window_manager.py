@@ -12,6 +12,7 @@ import hashlib
 import platform
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +110,36 @@ def _process_name(pid: int) -> str:
         return name or str(pid)
     except Exception:
         return str(pid)
+
+
+# ── Spoken "browser" versus the process that actually owns the window ────────
+#
+# A user who says "make the Browser fullscreen" is naming an application by its
+# job, not by its executable. Chrome's window is owned by chrome.exe, Edge's by
+# msedge.exe, and none of those strings resembles the word "browser", so the
+# old scorer could not connect the request to any window at all. Matching a
+# generic browser word against any known browser process closes that gap
+# without loosening matching for anything else: the alias only fires when the
+# *user's own target* is one of these generic words.
+_BROWSER_PROCESS_STEMS = {
+    "chrome", "googlechrome", "chromium", "chromehtml", "msedge", "microsoftedge",
+    "edge", "edgehtml", "firefox", "brave", "bravebrowser", "opera", "operagx",
+    "operabrowser", "vivaldi", "vivaldistable", "thorium", "librewolf",
+    "waterfox", "palemoon", "safari", "browser", "webbrowser",
+}
+_GENERIC_BROWSER_WORDS = {
+    "browser", "web browser", "webbrowser", "internet", "internet browser",
+    "browser window", "the browser", "my browser",
+}
+
+
+def _is_browser_process(name: str) -> bool:
+    stem = _normalise(Path(str(name or "")).stem).replace(" ", "")
+    return stem in _BROWSER_PROCESS_STEMS
+
+
+def _is_generic_browser_target(target: str) -> bool:
+    return _normalise(target) in _GENERIC_BROWSER_WORDS
 
 
 _DESKTOP_BACKEND: object | None = None
@@ -482,6 +513,11 @@ def _score_window(window: WindowInfo, target: str) -> tuple[int, WindowInfo]:
         return (100, window)
     if wanted in title or wanted in process:
         return (80, window)
+    # "Make the browser fullscreen" names the application by its job. The
+    # generic word only ever matches a real browser process, never a title —
+    # a document called "Browser Comparison.xlsx" is not what was asked for.
+    if _is_generic_browser_target(wanted) and _is_browser_process(window.process):
+        return (85, window)
     words = set(wanted.split())
     overlap = len(words & set(title.split())) + len(words & set(process.split()))
     if overlap:
@@ -509,6 +545,146 @@ def find_windows(target: str, *, min_score: int = 1) -> list[WindowInfo]:
         key=lambda item: item[0], reverse=True,
     )
     return [window for score, window in scored if score >= threshold]
+
+
+# ── Memory of the window the assistant itself put on screen ─────────────────
+#
+# "Open YouTube" followed by "make it fullscreen" is the most common
+# multi-step window request there is, and the second step must not depend on
+# the first step's page having finished loading its title. open_app records
+# every window it verifiably launches here, so a later window command has a
+# fallback identity ("the window I just opened as X") when title matching
+# alone finds nothing.
+_LAUNCH_MEMORY_LOCK = threading.Lock()
+_LAST_LAUNCH: tuple[float, str, WindowInfo] | None = None
+LAUNCH_MEMORY_SECONDS = 15 * 60.0
+
+
+def remember_last_window(name: str, window) -> None:
+    """Record the window a launch produced, with the name it was asked for."""
+    handle = int(getattr(window, "handle", 0) or 0)
+    if not handle:
+        return
+    global _LAST_LAUNCH
+    with _LAUNCH_MEMORY_LOCK:
+        _LAST_LAUNCH = (time.time(), str(name or "").strip(), window)
+
+
+def last_launch_label() -> str:
+    with _LAUNCH_MEMORY_LOCK:
+        return _LAST_LAUNCH[1] if _LAST_LAUNCH else ""
+
+
+def last_launched_window(max_age_seconds: float = LAUNCH_MEMORY_SECONDS) -> WindowInfo | None:
+    """The remembered launch window, when it is still recent enough to matter."""
+    with _LAUNCH_MEMORY_LOCK:
+        entry = _LAST_LAUNCH
+    if entry is None:
+        return None
+    opened_at, _label, window = entry
+    if time.time() - opened_at > max(0.0, float(max_age_seconds)):
+        return None
+    return window
+
+
+def clear_launch_memory() -> None:
+    """Drop the remembered launch (used by tests and session teardown)."""
+    global _LAST_LAUNCH
+    with _LAUNCH_MEMORY_LOCK:
+        _LAST_LAUNCH = None
+
+
+# Words that carry no identity; a shared one of these must never make two
+# different names "agree".
+_LABEL_NOISE_WORDS = {
+    "the", "a", "an", "app", "application", "please", "open", "opened",
+    "launch", "launched", "start", "started", "window", "and", "on", "in",
+}
+
+
+def _launch_labels_agree(target: str, label: str) -> bool:
+    """Whether a spoken target plausibly names a remembered launch.
+
+    Deliberately stricter than the window scorer: this decision hands over a
+    specific window that title matching could NOT confirm, so a weak
+    resemblance must not be enough.
+    """
+    wanted = _normalise(target)
+    known = _normalise(label)
+    if not wanted or not known:
+        return False
+    if wanted == known or wanted in known or known in wanted:
+        return True
+    wanted_words = set(wanted.split()) - _LABEL_NOISE_WORDS
+    known_words = set(known.split()) - _LABEL_NOISE_WORDS
+    if wanted_words and known_words and wanted_words & known_words:
+        return True
+    return partial_ratio(wanted, known) >= 0.75
+
+
+def recent_launch_window_for(target: str) -> WindowInfo | None:
+    """The remembered launch window when ``target`` plausibly names it.
+
+    This is the identity that survives a page whose title has not loaded yet
+    ("New Tab" while YouTube starts): the assistant knows which window it put
+    on screen and under which spoken name, so "open YouTube … now fullscreen
+    it" and "open YouTube (again)" both resolve to that window instead of
+    starting a second instance or reporting nothing found.
+    """
+    with _LAUNCH_MEMORY_LOCK:
+        entry = _LAST_LAUNCH
+    if entry is None:
+        return None
+    opened_at, label, window = entry
+    if time.time() - opened_at > LAUNCH_MEMORY_SECONDS:
+        return None
+    if not _launch_labels_agree(target, label):
+        return None
+    return window
+
+
+def _window_key(window: WindowInfo) -> tuple[int, int, str]:
+    return (int(window.handle or 0), int(window.pid or 0), str(window.title))
+
+
+def watch_launched_window(label: str, timeout: float = 6.0) -> None:
+    """Remember the first window that appears after a native launch, in the
+    background.
+
+    A URL handed to the OS opens the default browser with no pid and — until
+    the page loads — no name-bearing title, so there is nothing to match a
+    later "make it fullscreen" against. This watches for a new (or re-titled)
+    window for a few seconds and records it as the most recent launch. Best
+    effort by design: on failure the next window command simply falls back to
+    title matching, exactly as before.
+    """
+    def _watch() -> None:
+        try:
+            before = {_window_key(w) for w in list_windows()}
+            deadline = time.monotonic() + max(1.0, float(timeout))
+            settled_since: float | None = None
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                windows = list_windows()
+                new = [w for w in windows if _window_key(w) not in before]
+                browser_new = [w for w in new if _is_browser_process(w.process)]
+                if browser_new:
+                    remember_last_window(label, browser_new[-1])
+                    return
+                if len(new) == 1:
+                    if settled_since is None:
+                        settled_since = time.monotonic()
+                    elif time.monotonic() - settled_since >= 0.75:
+                        remember_last_window(label, new[0])
+                        return
+                else:
+                    settled_since = None
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_watch, daemon=True, name="window-launch-watch"
+    ).start()
 
 
 def find_window(target: str = "") -> WindowInfo | None:
@@ -767,13 +943,21 @@ def monitor_for(index: int | str | None) -> MonitorInfo:
 def describe_windows() -> str:
     windows = list_windows()
     if not windows:
-        return "No visible windows were found."
+        # An empty list is worth explaining: on a machine where no window
+        # backend answers, "no windows" reads like "nothing is open" when the
+        # real story is "the desktop could not be queried".
+        return (
+            "No visible windows were found. If windows are definitely open, the "
+            f"window backend on this system reported '{backend_name()}' and may "
+            "not be able to see the desktop."
+        )
     lines = []
     for i, window in enumerate(windows, 1):
         process = f" [{window.process}]" if window.process else ""
         state = " minimized" if window.minimized else " maximized" if window.maximized else ""
         lines.append(f"{i}. {window.title}{process} ({window.width}x{window.height}){state}")
-    return "Open windows:\n" + "\n".join(lines[:40])
+    summary = "" if len(windows) <= 40 else f" …and {len(windows) - 40} more"
+    return f"Open windows ({len(windows)}):\n" + "\n".join(lines[:40]) + summary
 
 
 def describe_monitors() -> str:

@@ -929,7 +929,7 @@ def computer_settings(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "system_control",
-    "description": "Controls system and active-window settings: volume, brightness, keyboard shortcuts, fullscreen, dark mode, WiFi, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload, and confirmed power actions. Use window_manager for a named application/window such as minimizing Chrome or moving Discord to monitor 2. Restart, shutdown, and WiFi changes require confirmation; never claim they are complete before the user confirms. Volume, brightness, and dark mode can be reversed with undo.",
+    "description": "Controls system and active-window settings: volume, brightness, keyboard shortcuts, fullscreen, dark mode, WiFi, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload, and confirmed power actions. Use window_manager for a named application/window such as minimizing Chrome or moving Discord to monitor 2. Restart, shutdown, and WiFi changes require confirmation; never claim they are complete before the user confirms. Volume, brightness, and dark mode can be reversed with undo. The restart/shutdown actions power off or reboot the whole COMPUTER — only use them when the user explicitly names the computer/PC (e.g. 'shut down the PC', 'fahre den Rechner herunter'). A bare 'shutdown'/'close yourself'/'beende dich' about the assistant means shutdown_jarvis, which closes the assistant immediately.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

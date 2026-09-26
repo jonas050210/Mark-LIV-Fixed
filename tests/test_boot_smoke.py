@@ -146,6 +146,40 @@ class AssemblySmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(main, "JarvisLive"))
         self.assertTrue(hasattr(main, "main"))
 
+    def test_shutdown_jarvis_is_declared_immediate_while_pc_power_stays_gated(self) -> None:
+        """The assistant closes on command with no prompt; the computer does not.
+
+        Closing the assistant is reversible, so it may happen straight away.
+        Powering off the machine is not reversible, so the same word used about
+        the PC must keep its confirmation — the two contracts live side by side
+        and a regression in either direction would be a user-visible surprise.
+        """
+        main = _main_module
+        declarations = {d["name"]: d for d in main.TOOL_DECLARATIONS}
+        self.assertIn("IMMEDIATELY", declarations["shutdown_jarvis"]["description"])
+        self.assertIn("not the computer", declarations["shutdown_jarvis"]["description"])
+
+        from actions import computer_settings
+
+        self.assertIn("shutdown", computer_settings.TOOL["confirmation_actions"])
+        self.assertIn("restart", computer_settings.TOOL["confirmation_actions"])
+
+    def test_immediate_shutdown_saves_the_session_and_quits_the_ui(self) -> None:
+        """request_immediate_shutdown marshals one background close onto the
+        live loop — no confirm gate, no second ask."""
+        main = _main_module
+        live = main.JarvisLive.__new__(main.JarvisLive)
+        spawned = []
+
+        class _Loop:
+            def call_soon_threadsafe(self, fn):
+                fn()
+
+        live._loop = _Loop()
+        live._spawn_background = lambda coro: (spawned.append(coro), coro.close())
+        live.request_immediate_shutdown()
+        self.assertEqual(len(spawned), 1)
+
     def test_the_background_scheduler_is_wired_with_both_jobs(self) -> None:
         main = _main_module
 
