@@ -87,6 +87,88 @@ class ActionRuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.as_text(), "hello")
 
+    def test_discovery_defers_module_side_effects_until_first_execution(self) -> None:
+        with TemporaryDirectory() as temp:
+            marker = Path(temp) / "loaded"
+            path = Path(temp) / "lazy_demo.py"
+            path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('loaded')\n"
+                "def handler(parameters): return 'ready'\n"
+                "TOOL = {'name': 'lazy_demo', 'description': 'lazy', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            self.assertFalse(marker.exists())
+            self.assertFalse(registry.is_loaded("lazy_demo"))
+
+            result = registry.execute("lazy_demo", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "ready")
+            self.assertTrue(marker.exists())
+            self.assertTrue(registry.is_loaded("lazy_demo"))
+
+    def test_lazy_execution_uses_the_checked_startup_source_snapshot(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "snapshot_demo.py"
+            path.write_text(
+                "def handler(parameters): return 'checked version'\n"
+                "TOOL = {'name': 'snapshot_demo', 'description': 'snapshot', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            path.write_text(
+                "def handler(parameters): return 'changed after discovery'\n"
+                "TOOL = {'name': 'snapshot_demo', 'description': 'snapshot', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            # Simulate another import path loading the modified on-disk module
+            # before the registry sees its first tool call. The registry must
+            # still execute the trusted snapshot it registered at startup.
+            import importlib.util
+            import sys
+            spec = importlib.util.spec_from_file_location("actions.snapshot_demo", path)
+            external = importlib.util.module_from_spec(spec)
+            sys.modules["actions.snapshot_demo"] = external
+            self.assertIsNotNone(spec.loader)
+            spec.loader.exec_module(external)
+            self.assertEqual(external.handler({}), "changed after discovery")
+
+            result = registry.execute("snapshot_demo", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "checked version")
+
+    def test_lazy_action_dependencies_use_their_own_checked_snapshots(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            dependency = root / "lazy_dependency.py"
+            dependency.write_text(
+                "def dependency(parameters): return 'checked dependency'\n"
+                "TOOL = {'name': 'lazy_dependency', 'description': 'dependency', 'handler': dependency}\n",
+                encoding="utf-8",
+            )
+            (root / "lazy_parent.py").write_text(
+                "from actions.lazy_dependency import dependency\n"
+                "def parent(parameters): return dependency(parameters)\n"
+                "TOOL = {'name': 'lazy_parent', 'description': 'parent', 'handler': parent}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(root, logger=lambda _msg: None)
+            dependency.write_text(
+                "def dependency(parameters): return 'changed dependency'\n"
+                "TOOL = {'name': 'lazy_dependency', 'description': 'dependency', 'handler': dependency}\n",
+                encoding="utf-8",
+            )
+
+            result = registry.execute("lazy_parent", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "checked dependency")
+            self.assertTrue(registry.is_loaded("lazy_dependency"))
+            self.assertTrue(registry.is_loaded("lazy_parent"))
+
     def test_confirmation_is_not_a_model_parameter(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "danger.py"
@@ -189,7 +271,7 @@ class ActionRuntimeTests(unittest.TestCase):
             result = registry.execute("admin_only", {}, {})
             self.assertEqual(result.status, "forbidden")
 
-    def test_optional_import_is_exposed_as_unavailable_capability(self) -> None:
+    def test_optional_import_loads_only_when_its_action_is_called(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "optional_action.py"
             path.write_text(
@@ -201,8 +283,11 @@ class ActionRuntimeTests(unittest.TestCase):
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
             record = registry.record("optional_action")
             self.assertIsNotNone(record)
-            self.assertFalse(record.available)
+            self.assertTrue(record.available)
+            self.assertFalse(callable(record.handler))
             self.assertEqual(registry.execute("optional_action", {}, {}).status, "unavailable")
+            self.assertFalse(record.available)
+            self.assertIn("missing optional dependency", record.error)
 
     def test_cancellation_event_stops_a_cooperative_handler(self) -> None:
         with TemporaryDirectory() as temp:

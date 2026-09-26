@@ -1,27 +1,29 @@
-"""
-Action discovery, validation, and dispatch — the built-in twin of plugin_loader.
+"""Safe lazy action discovery, validation, and dispatch.
 
-Every actions/*.py that exposes a module-level ``TOOL`` dict is auto-discovered
-here, exactly like a drop-in plugin, so main.py never has to hardcode a tool
-declaration or a dispatch branch for it. Adding a new bundled action is then the
-same one-file operation as writing a plugin: define ``TOOL`` and a handler.
+Every ``actions/*.py`` file with a module-level ``TOOL`` dictionary is exposed
+to the model without importing its implementation at startup. Discovery reads
+and validates only the literal tool manifest, while the trusted source snapshot
+is compiled on the first real call to that action and then kept cached. MARK
+LIV therefore still knows every capability, but inactive browser, file, media,
+and optional-native-dependency actions do not spend startup time or memory.
 
-``TOOL`` shape (see actions/open_app.py for a live example):
+``TOOL`` shape (see ``actions/open_app.py`` for a live example)::
 
     TOOL = {
         "name":        "open_app",              # unique, ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$
         "description":  "...",                   # what Gemini reads to route the call
         "parameters":  {"type": "OBJECT", ...}, # Gemini function-declaration schema
-        "handler":      open_app,                # the callable to run
+        "handler":      open_app,                 # the callable to run
     }
 
 The handler is invoked through signature introspection: it receives ``parameters``
 plus whichever of ``player`` / ``speak`` / ``response`` / ``session_memory`` it
 actually declares — so existing action signatures work unchanged.
 
-Discovery runs once at startup; import errors, validation errors, and name
-collisions are logged and the offending file is skipped — they NEVER raise out
-of discover_actions() and never abort the scan of the remaining files.
+The source is validated with no-follow, ownership, permission, and size checks
+before its metadata is registered, then the exact validated source text is what
+executes later. A changed on-disk action cannot silently replace the declared
+capability until MARK LIV is restarted.
 """
 from __future__ import annotations
 
@@ -248,6 +250,9 @@ class ActionRecord:
     name: str
     description: str = ""
     parameters: dict = field(default_factory=lambda: dict(_DEFAULT_PARAMS))
+    # ``handler`` deliberately remains empty until this exact action is called.
+    # The registry retains a checked source snapshot below, so this is a real
+    # lazy import rather than a second untrusted file read at call time.
     handler: Optional[Callable] = None
     file: str = ""
     valid: bool = False
@@ -265,11 +270,24 @@ class ActionRecord:
     requires_admin: bool = False
     undoable: bool = False
     timeout_seconds: float = 60.0
+    source: str = field(default="", repr=False)
+    source_path: str = field(default="", repr=False)
+    module_name: str = field(default="", repr=False)
+    _load_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 class ActionRegistry:
     def __init__(self, actions: dict[str, ActionRecord], logger: Callable[[str], None]):
         self._actions = actions          # name -> ActionRecord, VALID entries only
+        self._actions_by_module = {
+            record.module_name: record
+            for record in actions.values() if record.module_name
+        }
+        # Serializing first-time source execution avoids duplicate dependency
+        # imports and cross-action loader deadlocks. Actual handlers still use
+        # the normal bounded eight-worker execution pool afterwards.
+        self._lazy_load_lock = threading.RLock()
+        self._loading_local = threading.local()
         self._all_records: list[ActionRecord] = []
         self._logger = logger
 
@@ -327,6 +345,82 @@ class ActionRegistry:
     def timeout(self, name: str) -> float:
         rec = self._actions.get(name)
         return rec.timeout_seconds if rec else 60.0
+
+    def is_loaded(self, name: str) -> bool:
+        """Whether an action implementation, rather than just its manifest, is resident."""
+        rec = self._actions.get(name)
+        return bool(rec and callable(rec.handler))
+
+    def _ensure_handler(self, rec: ActionRecord) -> str:
+        """Load exactly one registered action from its checked startup snapshot.
+
+        Metadata is enough for schemas, policy, and the model's tool list. The
+        implementation is intentionally delayed until after validation and any
+        required confirmation. A runtime import must describe the *same* tool
+        as the snapshot; otherwise the action is disabled rather than allowing
+        a changed module to run under an old policy declaration.
+        """
+        if callable(rec.handler):
+            return ""
+        with self._lazy_load_lock, rec._load_lock:
+            if callable(rec.handler):
+                return ""
+            if not rec.source or not rec.module_name or not rec.source_path:
+                rec.available = False
+                rec.error = "no trusted source snapshot is available"
+                return rec.error
+            loading = getattr(self._loading_local, "names", None)
+            if loading is None:
+                loading = set()
+                self._loading_local.names = loading
+            if rec.name in loading:
+                return "cyclic action dependency detected"
+            loading.add(rec.name)
+            try:
+                # If a lazy action imports another discoverable action, make
+                # that dependency use its own checked snapshot too. This keeps
+                # multi-action helpers (workspace → sequence → open/media)
+                # coherent without eagerly importing unrelated actions.
+                for dependency_name in _action_module_dependencies(rec.source):
+                    dependency = self._actions_by_module.get(dependency_name)
+                    if dependency is not None and dependency is not rec:
+                        dependency_error = self._ensure_handler(dependency)
+                        if dependency_error:
+                            raise ImportError(
+                                f"required action '{dependency.name}' is unavailable: "
+                                f"{dependency_error}"
+                            )
+
+                # Do not reuse an arbitrary module that happened to be imported
+                # after discovery: it may have come from a changed file. Replace
+                # it with the startup snapshot exactly once; later calls use the
+                # cached callable above and never execute source again.
+                sys.modules.pop(rec.module_name, None)
+                spec = importlib.util.spec_from_file_location(rec.module_name, rec.source_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError("could not build import spec")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[rec.module_name] = module
+                try:
+                    code = compile(rec.source, rec.source_path, "exec", dont_inherit=True)
+                    exec(code, module.__dict__)
+                except BaseException:
+                    sys.modules.pop(rec.module_name, None)
+                    raise
+                loaded = _validate(module, rec.file)
+                if not loaded.valid or not callable(loaded.handler):
+                    raise RuntimeError(loaded.error or "TOOL handler is invalid")
+                if not _same_declared_contract(rec, loaded):
+                    raise RuntimeError("runtime TOOL metadata does not match the checked manifest")
+            except Exception as exc:
+                rec.available = False
+                rec.error = _load_error_reason(exc)
+                self._logger(f"Action unavailable: {rec.name} ({rec.file}) — {rec.error}")
+                return rec.error
+            finally:
+                loading.discard(rec.name)
+            rec.handler = loaded.handler
+            return ""
 
     def _needs_confirmation(self, rec: ActionRecord, parameters: dict) -> bool:
         if rec.confirmation_actions:
@@ -390,6 +484,13 @@ class ActionRegistry:
         if cancel.is_set():
             return ActionResult.failure(
                 rec.name, f"Action '{rec.name}' was cancelled.", status="cancelled"
+            )
+        load_error = self._ensure_handler(rec)
+        if load_error:
+            return ActionResult.failure(
+                rec.name,
+                f"Action '{rec.name}' is unavailable: {load_error}",
+                status="unavailable",
             )
         worker_slots = _ACTION_WORKER_SLOTS
         if not worker_slots.acquire(blocking=False):
@@ -607,9 +708,8 @@ def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> Any:
     return fn(parameters=parameters, **kwargs)
 
 
-def _validate(module, filename: str) -> ActionRecord:
-    """Returns an ActionRecord; .valid=False + .error set on any problem. Never raises."""
-    tool = getattr(module, "TOOL", None)
+def _validate_tool(tool: object, filename: str, *, require_handler: bool) -> ActionRecord:
+    """Validate a static manifest or a fully imported ``TOOL`` dictionary."""
     if not isinstance(tool, dict):
         return ActionRecord(name=Path(filename).stem, file=filename,
                             error="No module-level TOOL dict (not a discoverable action).")
@@ -640,14 +740,13 @@ def _validate(module, filename: str) -> ActionRecord:
                             error=f"Invalid TOOL parameter schema: {exc}")
 
     handler = tool.get("handler")
-    if not callable(handler):
+    if require_handler and not callable(handler):
         return ActionRecord(name=name, file=filename,
                             error="TOOL['handler'] missing or not callable.")
 
     # Confirmation is explicit policy, not a model-supplied ``confirmed``
-    # parameter.  Keep only genuinely high-impact defaults here; actions that
-    # combine safe and destructive operations declare ``confirmation_actions``
-    # in their TOOL metadata below.
+    # parameter. Keep only genuinely high-impact defaults here; actions that
+    # combine safe and irreversible operations declare ``confirmation_actions``.
     inferred_confirmation = False
     inferred_admin = name in {"system_control"}
     raw_confirm_actions = tool.get("confirmation_actions", ())
@@ -689,23 +788,53 @@ def _validate(module, filename: str) -> ActionRecord:
     category = str(tool.get("category") or "computer").strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", category):
         return ActionRecord(name=name, file=filename, error="TOOL['category'] is invalid.")
-    return ActionRecord(name=name, description=description.strip(), parameters=copy.deepcopy(parameters),
-                        handler=handler, file=filename, valid=True, error="",
-                        behavior=behavior,
-                        scheduling=scheduling,
-                        category=category,
-                        risk=risk,
-                        requires_confirmation=requires_confirmation,
-                        confirmation_actions=confirm_actions,
-                        requires_admin=requires_admin,
-                        undoable=undoable,
-                        timeout_seconds=timeout_seconds)
+    return ActionRecord(
+        name=name, description=description.strip(), parameters=copy.deepcopy(parameters),
+        handler=handler if callable(handler) else None, file=filename, valid=True, error="",
+        behavior=behavior, scheduling=scheduling, category=category, risk=risk,
+        requires_confirmation=requires_confirmation, confirmation_actions=confirm_actions,
+        requires_admin=requires_admin, undoable=undoable, timeout_seconds=timeout_seconds,
+    )
 
 
-def _unavailable_handler(parameters: dict | None = None, **_ctx) -> str:
-    # Replaced per-record with a closure below; this fallback exists so a
-    # malformed optional action can never make discovery crash.
-    return "This action is unavailable because an optional dependency is missing."
+def _validate(module, filename: str) -> ActionRecord:
+    """Validate an imported action, including its now-callable handler."""
+    return _validate_tool(getattr(module, "TOOL", None), filename, require_handler=True)
+
+
+def _validate_manifest(metadata: object, filename: str) -> ActionRecord:
+    """Validate the startup AST manifest without evaluating its handler."""
+    return _validate_tool(metadata, filename, require_handler=False)
+
+
+def _same_declared_contract(expected: ActionRecord, loaded: ActionRecord) -> bool:
+    """Ensure a delayed import cannot change its previously checked policy."""
+    return (
+        expected.name == loaded.name
+        and expected.description == loaded.description
+        and expected.parameters == loaded.parameters
+        and expected.behavior == loaded.behavior
+        and expected.scheduling == loaded.scheduling
+        and expected.category == loaded.category
+        and expected.risk == loaded.risk
+        and expected.requires_confirmation == loaded.requires_confirmation
+        and expected.confirmation_actions == loaded.confirmation_actions
+        and expected.requires_admin == loaded.requires_admin
+        and expected.undoable == loaded.undoable
+        and expected.timeout_seconds == loaded.timeout_seconds
+    )
+
+
+def _load_error_reason(error: Exception) -> str:
+    if isinstance(error, ModuleNotFoundError):
+        missing = str(getattr(error, "name", "") or "optional dependency")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", missing):
+            missing = "optional dependency"
+        return f"missing optional dependency '{missing}' (install it and restart MARK LIV)"
+    if isinstance(error, (ImportError, PermissionError, SyntaxError)):
+        return f"import failed ({type(error).__name__})"
+    message = " ".join(str(error).split())[:240]
+    return message or f"load failed ({type(error).__name__})"
 
 
 def _is_reparse_point(details) -> bool:
@@ -762,178 +891,280 @@ def _trusted_action_source(path: Path, actions_dir: Path) -> str:
     return content.decode("utf-8-sig")
 
 
-def _metadata_without_import(path: Path, source: str | None = None) -> dict | None:
-    """Read safe TOOL metadata from a module that could not be imported.
+class _StaticManifestError(ValueError):
+    """An AST manifest used an expression that would need code execution."""
 
-    Optional native packages often fail at import time.  Literal AST parsing
-    lets the registry expose the action and return an actionable install message
-    instead of silently deleting the capability from the model's vocabulary.
-    The handler is intentionally never evaluated.
+
+def _action_module_dependencies(source: str) -> set[str]:
+    """Discover direct bundled-action imports without executing source.
+
+    Only modules that the importing action genuinely needs at module import
+    time are prepared. Helpers with no action record stay ordinary imports.
     """
     try:
-        if source is None:
-            return None
-        tree = ast.parse(source, filename=str(path))
-        for node in tree.body:
-            if isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Name) and target.id == "TOOL" for target in node.targets
-            ):
-                if not isinstance(node.value, ast.Dict):
-                    return None
-                value = {}
-                for key_node, value_node in zip(node.value.keys, node.value.values):
-                    try:
-                        key = ast.literal_eval(key_node)
-                        if key == "handler":
-                            continue
-                        value[key] = ast.literal_eval(value_node)
-                    except Exception:
-                        # A dynamic optional field is not needed to expose the
-                        # action; skip only that field.
-                        continue
-                return value if isinstance(value, dict) else None
-    except Exception:
-        return None
-    return None
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    dependencies: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if re.fullmatch(r"actions\.[A-Za-z_][A-Za-z0-9_]*", node.module):
+                dependencies.add(node.module)
+            elif node.module == "actions":
+                for alias in node.names:
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias.name):
+                        dependencies.add(f"actions.{alias.name}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if re.fullmatch(r"actions\.[A-Za-z_][A-Za-z0-9_]*", alias.name):
+                    dependencies.add(alias.name)
+    return dependencies
 
 
-def _unavailable_record(
-    path: Path, error: Exception, source: str | None = None
-) -> ActionRecord | None:
-    meta = _metadata_without_import(path, source)
-    if not isinstance(meta, dict):
+def _assignment_map(tree: ast.Module) -> dict[str, ast.AST]:
+    assignments: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            assignments[node.target.id] = node.value
+    return assignments
+
+
+def _tool_imports(tree: ast.Module) -> dict[str, str]:
+    """Return only ``from actions.foo import TOOL as alias`` imports.
+
+    This permits app_sequence to reuse media_control's static parameter schema
+    without importing either implementation. All other imports are deliberately
+    absent from the static evaluator.
+    """
+    imports: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        if not re.fullmatch(r"actions\.[A-Za-z_][A-Za-z0-9_]*", node.module):
+            continue
+        for alias in node.names:
+            if alias.name == "TOOL":
+                imports[alias.asname or alias.name] = node.module
+    return imports
+
+
+def _metadata_without_import(
+    path: Path,
+    source: str | None = None,
+    *,
+    _cache: dict[str, dict | None] | None = None,
+    _stack: set[str] | None = None,
+) -> dict | None:
+    """Read a complete, execution-free ``TOOL`` manifest from trusted source.
+
+    The evaluator accepts literals, module-level literal constants, ``sorted``
+    over those constants, and static ``TOOL`` schema references from a sibling
+    action. It never imports or executes action code. Refusing any other
+    expression is intentional: an action with a dynamic manifest must be made
+    declarative before it can be registered lazily.
+    """
+    try:
+        resolved = str(path.resolve())
+    except OSError:
         return None
-    name = meta.get("name")
-    description = meta.get("description")
-    parameters = meta.get("parameters", _DEFAULT_PARAMS)
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    cache = _cache if _cache is not None else {}
+    if resolved in cache:
+        return copy.deepcopy(cache[resolved])
+    stack = _stack if _stack is not None else set()
+    if resolved in stack:
         return None
-    if (
-        not isinstance(description, str)
-        or not description.strip()
-        or len(description) > 4_000
-        or any(ord(char) < 32 and char not in "\n\t" for char in description)
-    ):
-        return None
-    if not isinstance(parameters, dict) or parameters.get("type") != "OBJECT":
-        parameters = copy.deepcopy(_DEFAULT_PARAMS)
-    else:
+    if source is None:
         try:
-            validate_parameter_schema(parameters)
-        except (TypeError, ValueError):
-            parameters = copy.deepcopy(_DEFAULT_PARAMS)
-        else:
-            parameters = copy.deepcopy(parameters)
-    reason = f"import failed ({type(error).__name__})"
-    if isinstance(error, ModuleNotFoundError):
-        missing = str(getattr(error, "name", "") or "optional dependency")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", missing):
-            missing = "optional dependency"
-        reason = f"missing optional dependency '{missing}'"
-    def _missing_handler(parameters: dict | None = None, **_ctx) -> str:
-        return f"Action '{name}' is unavailable: {reason}. Install the dependency and restart MARK LIV."
-    return ActionRecord(
-        name=name, description=description.strip(), parameters=parameters,
-        handler=_missing_handler, file=path.name, valid=True, available=False,
-        error=reason, behavior=_opt_upper(meta.get("behavior"), _BEHAVIORS),
-        scheduling=_opt_upper(meta.get("scheduling"), _SCHEDULING),
-        category=str(meta.get("category") or "computer"),
-        risk=str(meta.get("risk") or "low"),
-        requires_confirmation=bool(meta.get("requires_confirmation", False)),
-        requires_admin=bool(meta.get("requires_admin", False)),
-        undoable=bool(meta.get("undoable", False)),
-        timeout_seconds=60.0,
+            source = _trusted_action_source(path, path.parent)
+        except Exception:
+            cache[resolved] = None
+            return None
+    try:
+        tree = ast.parse(source, filename=str(path))
+        assignments = _assignment_map(tree)
+        tool_imports = _tool_imports(tree)
+        stack.add(resolved)
+        resolving: set[str] = set()
+
+        def resolve_name(name: str) -> object:
+            if name in resolving:
+                raise _StaticManifestError(f"cyclic static constant {name!r}")
+            if name in assignments:
+                resolving.add(name)
+                try:
+                    return evaluate(assignments[name])
+                finally:
+                    resolving.remove(name)
+            module_name = tool_imports.get(name)
+            if module_name:
+                sibling = path.parent / (module_name.rsplit(".", 1)[-1] + ".py")
+                if sibling.parent != path.parent or not sibling.exists():
+                    raise _StaticManifestError("static TOOL import is outside the actions directory")
+                child = _metadata_without_import(sibling, _cache=cache, _stack=stack)
+                if not isinstance(child, dict):
+                    raise _StaticManifestError(f"could not read static TOOL from {module_name}")
+                return child
+            raise _StaticManifestError(f"non-static name {name!r}")
+
+        def evaluate(node: ast.AST) -> object:
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, ast.Name):
+                return resolve_name(node.id)
+            if isinstance(node, ast.List):
+                return [evaluate(item) for item in node.elts]
+            if isinstance(node, ast.Tuple):
+                return tuple(evaluate(item) for item in node.elts)
+            if isinstance(node, ast.Set):
+                return {evaluate(item) for item in node.elts}
+            if isinstance(node, ast.Dict):
+                if any(key is None for key in node.keys):
+                    raise _StaticManifestError("dictionary unpacking is not static metadata")
+                return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values)}
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                value = evaluate(node.operand)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise _StaticManifestError("unary static value must be numeric")
+                return -value if isinstance(node.op, ast.USub) else value
+            if isinstance(node, ast.Subscript):
+                container = evaluate(node.value)
+                key = evaluate(node.slice)
+                if not isinstance(container, (dict, list, tuple)):
+                    raise _StaticManifestError("static subscript has an invalid container")
+                return container[key]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "sorted"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                value = evaluate(node.args[0])
+                if not isinstance(value, (list, tuple, set)):
+                    raise _StaticManifestError("sorted static value must be a sequence")
+                return sorted(value)
+            raise _StaticManifestError(f"unsupported static expression {type(node).__name__}")
+
+        tool_node = next(
+            (
+                node.value
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "TOOL" for target in node.targets)
+            ),
+            None,
+        )
+        if not isinstance(tool_node, ast.Dict):
+            cache[resolved] = None
+            return None
+        value: dict = {}
+        has_handler = False
+        for key_node, value_node in zip(tool_node.keys, tool_node.values):
+            key = evaluate(key_node)
+            if not isinstance(key, str):
+                raise _StaticManifestError("TOOL keys must be strings")
+            if key == "handler":
+                # The symbol itself is validated as callable after the one-time
+                # lazy import. Evaluating it here would defeat the whole loader.
+                if not isinstance(value_node, ast.Name):
+                    raise _StaticManifestError("TOOL handler must be a named function")
+                has_handler = True
+                continue
+            value[key] = evaluate(value_node)
+        if not has_handler:
+            raise _StaticManifestError("TOOL handler is missing")
+        cache[resolved] = value
+        return copy.deepcopy(value)
+    except Exception:
+        cache[resolved] = None
+        return None
+    finally:
+        stack.discard(resolved)
+
+
+def _declares_tool(source: str, filename: str) -> bool:
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return "TOOL" in source
+    return any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == "TOOL"
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+        for node in tree.body
     )
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
                      logger: Callable[[str], None] = print) -> ActionRegistry:
-    """
-    Scans actions_dir for *.py files (skips files starting with '_'). A file is
-    only treated as an action if it exposes a module-level TOOL dict; files
-    without one (shared helpers, capture-only modules) are silently ignored.
-    Import/validation errors and name collisions are logged and the file is
-    skipped — they NEVER raise out of this function.
+    """Register declarative action manifests without executing action modules.
+
+    Helper modules without ``TOOL`` remain invisible. Every discoverable action
+    retains the exact trusted source snapshot that supplied its manifest, then
+    imports only if it is actually selected by the model/dashboard.
     """
     reserved = reserved_names or set()
     actions_dir.mkdir(parents=True, exist_ok=True)
     valid: dict[str, ActionRecord] = {}
     all_records: list[ActionRecord] = []
+    metadata_cache: dict[str, dict | None] = {}
 
     files = sorted(actions_dir.glob("*.py"), key=lambda p: p.name)  # deterministic order
     for path in files:
         if path.name.startswith("_"):
             continue
-        source: str | None = None
         try:
             source = _trusted_action_source(path, actions_dir)
-            module_name = f"actions.{path.stem}"
-            # Reuse the already-imported module when it came from this exact
-            # file so handlers are the same objects the rest of the app holds.
-            # Test registries and plugin reloads can scan another directory
-            # with the same filename, though; reusing that stale module would
-            # silently expose the previous TOOL metadata.
-            module = sys.modules.get(module_name)
-            loaded_from = getattr(module, "__file__", "") if module is not None else ""
-            try:
-                same_file = bool(loaded_from) and Path(loaded_from).resolve() == path.resolve()
-            except OSError:
-                same_file = False
-            if module is not None and not same_file:
-                sys.modules.pop(module_name, None)
-                module = None
-            if module is None:
-                spec = importlib.util.spec_from_file_location(module_name, path)
-                if spec is None or spec.loader is None:
-                    raise ImportError("could not build import spec")
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                try:
-                    code = compile(source, str(path), "exec", dont_inherit=True)
-                    exec(code, module.__dict__)
-                except Exception:
-                    sys.modules.pop(module_name, None)
-                    raise
-
-            if getattr(module, "TOOL", None) is None:
-                continue   # not an action file — a helper/capture-only module
-
-            rec = _validate(module, path.name)
-
-            if rec.valid and rec.name in reserved:
-                rec = ActionRecord(name=rec.name, file=path.name,
-                                   error=f"Name '{rec.name}' collides with a reserved core tool — rejected.")
-            elif rec.valid and rec.name in valid:
-                other = valid[rec.name].file
-                rec = ActionRecord(name=rec.name, file=path.name,
-                                   error=f"Name '{rec.name}' already used by action '{other}' — rejected.")
-
-        except Exception as e:
-            rec = _unavailable_record(path, e, source)
-            if rec is None:
+        except Exception as exc:
+            # Do not try to parse an unchecked source merely to produce a nicer
+            # message. A source that fails trust validation is never a tool.
+            rec = ActionRecord(
+                name=path.stem, file=path.name,
+                error=f"Failed trust validation ({type(exc).__name__}).",
+            )
+        else:
+            if not _declares_tool(source, str(path)):
+                continue
+            metadata = _metadata_without_import(path, source, _cache=metadata_cache)
+            if metadata is None:
                 rec = ActionRecord(
-                    name=path.stem,
-                    file=path.name,
-                    error=f"Failed to load ({type(e).__name__}). See the console for details.",
+                    name=path.stem, file=path.name,
+                    error=("TOOL metadata must use only static literals or supported "
+                           "module constants for lazy discovery."),
                 )
-            # Optional dependency failures are expected on minimal installs;
-            # keep the traceback on the console for diagnostics without making
-            # the whole application fail to start.
-            if not (rec.valid and not rec.available) and not isinstance(e, PermissionError):
-                traceback.print_tb(e.__traceback__)
+            else:
+                rec = _validate_manifest(metadata, path.name)
+                if rec.valid:
+                    rec.source = source
+                    rec.source_path = str(path.resolve())
+                    rec.module_name = f"actions.{path.stem}"
+                    if rec.name in reserved:
+                        rec = ActionRecord(
+                            name=rec.name, file=path.name,
+                            error=(f"Name '{rec.name}' collides with a reserved core tool — "
+                                   "rejected."),
+                        )
+                    elif rec.name in valid:
+                        other = valid[rec.name].file
+                        rec = ActionRecord(
+                            name=rec.name, file=path.name,
+                            error=f"Name '{rec.name}' already used by action '{other}' — rejected.",
+                        )
 
         all_records.append(rec)
         if rec.valid:
             valid[rec.name] = rec
-            if rec.available:
-                logger(f"Action loaded: {rec.name} ({path.name})")
-            else:
-                logger(f"Action unavailable: {rec.name} ({path.name}) — {rec.error}")
+            logger(f"Action ready (lazy): {rec.name} ({path.name})")
         else:
-            # Only log a rejection if the file actually tried to be an action.
             logger(f"Action rejected: {path.name} — {rec.error}")
 
     registry = ActionRegistry(valid, logger)
     registry._all_records = all_records
-    logger(f"Action discovery complete: {len(valid)} active.")
+    logger(f"Action discovery complete: {len(valid)} active; implementations load on first use.")
     return registry

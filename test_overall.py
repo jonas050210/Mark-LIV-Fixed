@@ -138,11 +138,16 @@ def _discover_actions() -> str:
             bad.append(f"{record.name}: parameters must be an OBJECT schema")
         elif not isinstance(params.get("properties", {}), dict):
             bad.append(f"{record.name}: properties must be an object")
-        if not callable(record.handler):
-            bad.append(f"{record.name}: handler is not callable")
+        # Bundled action handlers are intentionally lazy: only their checked
+        # manifest/source snapshot belongs in startup memory. The registry loads
+        # and revalidates the callable on the first real invocation.
+        if callable(record.handler):
+            bad.append(f"{record.name}: handler was imported during lazy discovery")
+        if not record.source or not record.source_path or not record.module_name:
+            bad.append(f"{record.name}: trusted lazy source snapshot is missing")
     if bad:
         raise RuntimeError("; ".join(bad))
-    return f"{len(names)} active actions; {len(records)} records inspected"
+    return f"{len(names)} active lazy actions; {len(records)} records inspected"
 
 
 def _subprocess_safety() -> str:

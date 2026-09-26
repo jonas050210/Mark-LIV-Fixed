@@ -68,14 +68,22 @@ class RegistrySmokeTests(unittest.TestCase):
     def test_actions_are_discovered(self) -> None:
         self.assertGreaterEqual(len(self.tools), 10)
 
-    def test_every_tool_has_a_callable_handler(self) -> None:
+    def test_every_tool_has_a_trusted_lazy_source_snapshot(self) -> None:
+        # Discovery must describe all capabilities without importing every
+        # implementation. The actual handler is verified on its first call.
         for tool in self.tools:
             record = self.records[tool["name"]]
-            self.assertTrue(callable(record.handler), tool["name"])
+            self.assertFalse(callable(record.handler), tool["name"])
+            self.assertTrue(record.source, tool["name"])
+            self.assertTrue(record.source_path, tool["name"])
+            self.assertTrue(record.module_name, tool["name"])
 
-    def test_every_handler_accepts_at_least_one_argument(self) -> None:
+    def test_imported_action_handlers_accept_at_least_one_argument(self) -> None:
+        # This is a source-module contract, intentionally separate from the
+        # lazy registry's startup path above.
         for tool in self.tools:
-            handler = self.records[tool["name"]].handler
+            module = __import__(f"actions.{_module_for(tool['name'])}", fromlist=["TOOL"])
+            handler = module.TOOL["handler"]
             signature = inspect.signature(handler)
             self.assertTrue(signature.parameters, tool["name"])
 

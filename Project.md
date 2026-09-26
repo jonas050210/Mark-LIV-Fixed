@@ -121,13 +121,15 @@ User voice / GUI / remote dashboard
 
 ### 4.2 Action discovery
 
-`core/action_loader.py` scans `actions/*.py` for a module-level `TOOL` dictionary. Each valid tool supplies:
+`core/action_loader.py` scans `actions/*.py` for a module-level `TOOL` dictionary. Startup reads and validates each tool's declarative AST manifest, but does **not** import every action implementation. MARK LIV can therefore advertise every capability to Gemini while inactive browser, file, media, and optional-native-dependency actions consume no import work until they are actually called. Each valid tool supplies:
 
 - a unique name;
 - a description for Gemini and the dashboard;
 - a Gemini-compatible parameter schema;
-- a callable handler;
+- a named callable handler, loaded and checked on first use;
 - optional risk, confirmation, admin, undo, timeout, behavior, and scheduling metadata.
+
+The loader keeps the exact source snapshot that passed the no-follow, ownership, permission, and size checks at startup. On first use it imports that snapshot once, verifies that its runtime `TOOL` policy still matches the registered manifest, and caches the handler. Direct bundled-action dependencies are initialized from their own snapshots first. A changed on-disk action cannot silently replace its declared capability until MARK LIV is restarted.
 
 The registry is the policy boundary. It normalizes legacy string-returning handlers into `ActionResult` values and applies confirmation, admin, cancellation, timeout, and availability rules in one place.
 
