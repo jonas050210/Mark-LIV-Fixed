@@ -9,7 +9,7 @@ def shortcut_manager(parameters: dict | None = None, player=None) -> str:
     p = parameters if isinstance(parameters, dict) else {}
     action = str(p.get("action") or "list")[:24].casefold().strip().replace(" ", "_")
     alias = str(p.get("alias") or p.get("name") or "")[:40].strip()
-    target = str(p.get("target") or p.get("app") or p.get("value") or "")[:240].strip()
+    target = str(p.get("target") or p.get("app") or p.get("value") or "")[:1024].strip()
 
     try:
         if action in {"set", "save", "remember", "add"}:
@@ -70,8 +70,8 @@ TOOL = {
         "type": "OBJECT",
         "properties": {
             "action": {"type": "STRING", "enum": ["set", "remove", "resolve", "list"], "maxLength": 16, "description": "set | remove | resolve | list"},
-            "alias": {"type": "STRING", "maxLength": 40, "description": "Short name such as gd, roblox, or school."},
-            "target": {"type": "STRING", "maxLength": 240, "description": "Application name, path, folder, or URL to open."},
+            "alias": {"type": "STRING", "maxLength": 40, "description": "Name such as gd, school mode, or my code."},
+            "target": {"type": "STRING", "maxLength": 1024, "description": "Application name, OneDrive path, folder, or URL to open."},
         },
         "required": ["action"],
     },

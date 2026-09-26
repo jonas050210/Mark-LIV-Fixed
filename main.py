@@ -141,6 +141,8 @@ from core.action_loader        import (
     validate_parameters,
 )
 from core.action_runtime       import runtime as action_runtime
+from core.action_dispatch      import run_dashboard_action
+from core.action_batch         import partition_tool_batch
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -272,9 +274,10 @@ TOOL_DECLARATIONS = [
     {
         "name": "system_status",
         "description": (
-            "Returns real-time system metrics: CPU usage, RAM, GPU load, CPU temperature, "
-            "uptime, and process count. Use when the user asks about computer performance, "
-            "temperature, memory, or resource usage."
+            "Returns real-time system metrics: CPU usage, RAM, NVIDIA GPU load and GPU temperature "
+            "when its driver exposes NVML (including RTX 4060 Ti), optional CPU temperature, uptime, "
+            "and process count. Use when the user asks about computer performance, temperature, memory, "
+            "or resource usage."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -949,21 +952,24 @@ class JarvisLive:
         return inline + self._action_registry.admin_manifest()
 
     def _run_dashboard_action(self, name: str, parameters: dict) -> str:
-        """Run one registered action for a dashboard panel button.
+        """Run one authenticated dashboard action through the live registry.
 
-        Panels go through the same registry as the voice layer, so schema
-        validation, the confirmation gate, the live run list, and undo all
-        apply exactly as they do for a spoken command.  Only actions that are
-        actually registered can be reached.
+        Dashboard routes authenticate before this callback is reachable.  The
+        shared dispatcher records a cancellable dashboard run and supplies the
+        trusted-control context without accepting any model/user confirmation
+        flag as authority.
         """
         if not self._action_registry.has(name):
             return f"'{name}' is not an available action."
-        ctx = {
-            "player": self.ui,
-            "speak": self.speak,
-            "session_memory": None,
-        }
-        return self._action_registry.run(name, parameters, ctx)
+        _action_id, result = run_dashboard_action(
+            self._action_registry,
+            name,
+            parameters,
+            player=self.ui,
+            speak=self.speak,
+            session_memory=None,
+        )
+        return result.as_text()
 
     def _admin_desktop(self) -> dict:
         """Read-only snapshot used by the admin panel; never executes a command."""
@@ -1285,6 +1291,50 @@ class JarvisLive:
 
         return out
 
+    def _is_parallel_read_only_tool_call(self, fc) -> bool:
+        """Whether a call can share one provider tool batch without reordering work.
+
+        Only explicitly read-only calls qualify. Desktop/file/browser mutations
+        are still performed in their original order; the action registry also
+        enforces resource leases for requests arriving concurrently from the
+        dashboard or another channel.
+        """
+        name = str(getattr(fc, "name", "") or "")
+        args = getattr(fc, "args", {}) or {}
+        if not isinstance(args, dict):
+            return False
+        if self._action_registry.is_parallel_safe(name, args):
+            return True
+        if name == "system_status":
+            return True
+        if name == "manage_monitor":
+            return str(args.get("action") or "").strip().casefold() == "list"
+        return False
+
+    async def _execute_tool_batch(self, function_calls) -> list[types.FunctionResponse]:
+        """Run adjacent independent read-only calls together, preserving all writes.
+
+        The provider can return several calls in one message. Running every one
+        in parallel would let an open/move/close sequence race itself. We only
+        batch consecutive calls whose fixed resource policy is shared/read-only,
+        and wait for that batch before every mutation, preserving response order.
+        """
+        responses: list[types.FunctionResponse] = []
+        groups = partition_tool_batch(
+            function_calls or (), self._is_parallel_read_only_tool_call
+        )
+        for read_only, calls in groups:
+            if read_only and len(calls) > 1:
+                responses.extend(await asyncio.gather(
+                    *(self._execute_tool(call) for call in calls)
+                ))
+            else:
+                # A read-only group of one and every mutating group retain the
+                # old simple await path, which keeps exceptions/cancellation
+                # behavior identical to the former sequential dispatcher.
+                responses.append(await self._execute_tool(calls[0]))
+        return responses
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         """Track every inline, discovered, and plugin tool call uniformly."""
         if self._readonly_turns_pending > 0:
@@ -1440,10 +1490,21 @@ class JarvisLive:
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                        # Open the visible feed first, then take the image from
+                        # that same stream after it has warmed up. This avoids a
+                        # second VideoCapture racing the preview and prevents
+                        # Gemini from receiving a dark first webcam frame.
                         self.ui.start_camera_stream()
                         self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                        img_b = await loop.run_in_executor(
+                            None, self.ui.wait_for_camera_snapshot, 4.0,
+                        )
+                        if not img_b:
+                            raise RuntimeError(
+                                "The camera preview did not produce a usable frame within 4 seconds."
+                            )
+                        mime_t = "image/jpeg"
+                        print(f"[Vision] 📷 Camera (settled): {len(img_b):,} bytes")
                         _stall = "camera"
                     else:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
@@ -1665,12 +1726,19 @@ class JarvisLive:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
+            if name == "screen_process" and self._vision_cam_active:
+                # A failed warm-up must not leave the camera indicator/feed on.
+                self.ui.stop_camera_stream()
+                self._vision_cam_active = False
             kind = type(e).__name__
             result = f"Tool '{name}' failed ({kind})."
             traceback.print_tb(e.__traceback__)
             self.speak_error(name, kind)
 
-        if not self.ui.muted:
+        # Parallel read-only calls share a provider batch. Keep THINKING visible
+        # until the last tracked call returns instead of flickering to LISTENING
+        # as soon as the first diagnostic finishes.
+        if not self.ui.muted and len(self._active_action_ids) <= 1:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} completed ({len(str(result))} result characters)")
@@ -2038,11 +2106,10 @@ class JarvisLive:
                                 self._spawn_background(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
+                        function_calls = list(response.tool_call.function_calls or ())
+                        for fc in function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
+                        fn_responses = await self._execute_tool_batch(function_calls)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )

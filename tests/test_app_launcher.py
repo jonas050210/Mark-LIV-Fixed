@@ -205,7 +205,7 @@ class SelfHealingLaunchTests(unittest.TestCase):
 class PlacementTests(unittest.TestCase):
     """Monitor and window-state requests must be applied and verified."""
 
-    def test_open_on_second_monitor_in_fullscreen(self) -> None:
+    def test_open_on_second_monitor_with_spoken_fullscreen_uses_native_maximize(self) -> None:
         placed = _window(handle=7, left=1920, right=3840)
         with patch.object(open_app, "_matching_windows", return_value=[]), \
              patch.object(open_app, "_resolve_candidates", return_value=([_entry("Chrome")], False)), \
@@ -214,11 +214,11 @@ class PlacementTests(unittest.TestCase):
              patch("core.window_manager.monitor_for", return_value=_MONITORS[1]), \
              patch("core.window_manager.place_window", return_value=placed) as place:
             result = open_app.open_app(
-                {"app_name": "Chrome", "monitor": 2, "state": "fullscreen"}
+                {"app_name": "Chrome", "monitor": 2, "state": "fulscreen"}
             )
         self.assertIn("monitor 2", result)
-        self.assertIn("fullscreen", result)
-        self.assertEqual(place.call_args[0][2], "fullscreen")
+        self.assertIn("maximised", result)
+        self.assertEqual(place.call_args[0][2], "maximized")
 
     def test_unverified_monitor_move_is_reported(self) -> None:
         still_on_monitor_one = _window(handle=7, left=0, right=800)
@@ -349,7 +349,7 @@ class SemanticMonitorTests(unittest.TestCase):
                 {"app_name": "Chrome", "monitor": "secondary", "state": "fullscreen"}
             )
         self.assertIn("monitor 2", result)
-        self.assertIn("fullscreen", result)
+        self.assertIn("maximised", result)
 
 
 class DirectShortcutLaunchTests(unittest.TestCase):
@@ -402,6 +402,13 @@ class StructuredResultTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no window appeared", message)
 
+    def test_registry_handler_preserves_a_verified_launch_failure_status(self) -> None:
+        with patch.object(open_app, "open_app_result", return_value=(False, "I started Chrome, but no window appeared.")):
+            result = open_app._open_app_action({"app_name": "Chrome"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("no window appeared", result["message"])
+
     def test_a_partial_placement_failure_reports_ok_false(self) -> None:
         still_on_monitor_one = _window(handle=7, left=0, right=800)
         with patch.object(open_app, "_matching_windows", return_value=[]), \
@@ -420,6 +427,13 @@ class StructuredResultTests(unittest.TestCase):
             ok, message = open_app.open_app_result({"app_name": "Chrome"})
         self.assertTrue(ok)
         self.assertIn("already open", message)
+
+    def test_existing_app_focus_that_cannot_be_verified_is_not_a_success(self) -> None:
+        with patch.object(open_app, "_matching_windows", return_value=[_window()]), \
+             patch.object(open_app, "_focus_window", return_value=False):
+            ok, message = open_app.open_app_result({"app_name": "Chrome"})
+        self.assertFalse(ok)
+        self.assertIn("could not focus", message)
 
     def test_open_app_and_open_app_result_agree_on_the_message(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[]), \

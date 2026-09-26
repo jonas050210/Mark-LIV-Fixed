@@ -112,6 +112,24 @@ class OpenAppTests(unittest.TestCase):
             matches = open_app._matching_windows("Roblox", "RobloxPlayerBeta.exe")
         self.assertEqual(matches, [process_window])
 
+    def test_multiword_editor_request_does_not_match_a_browser_tab_on_one_word(self) -> None:
+        browser_tab = WindowInfo(
+            handle=303, title="Code Search - Google Chrome", process="chrome.exe", pid=33,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch("core.window_manager.list_windows", return_value=[browser_tab]):
+            matches = open_app._matching_windows("Visual Studio Code", "code")
+        self.assertEqual(matches, [])
+
+    def test_short_platform_alias_can_still_match_the_real_process(self) -> None:
+        editor = WindowInfo(
+            handle=304, title="Untitled document", process="code.exe", pid=34,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch("core.window_manager.list_windows", return_value=[editor]):
+            matches = open_app._matching_windows("Visual Studio Code", "code")
+        self.assertEqual(matches, [editor])
+
     def test_normal_open_focuses_existing_window_without_launching(self) -> None:
         with patch.object(open_app, "_matching_windows", return_value=[self.window]), \
              patch.object(open_app, "_focus_window", return_value=True) as focus, \
@@ -119,6 +137,20 @@ class OpenAppTests(unittest.TestCase):
             result = open_app.open_app({"app_name": "Roblox"})
         self.assertIn("already open", result)
         focus.assert_called_once_with(self.window)
+        launch.assert_not_called()
+
+    def test_opening_a_minimized_app_restores_and_focuses_its_existing_window(self) -> None:
+        minimized = WindowInfo(
+            handle=101, title="YouTube", process="chrome.exe", pid=11,
+            left=0, top=0, right=800, bottom=600, minimized=True,
+        )
+        with patch.object(open_app, "_matching_windows", return_value=[minimized]), \
+             patch.object(open_app, "_browser_title_match_may_be_a_web_app", return_value=False), \
+             patch.object(open_app, "_focus_window", return_value=True) as focus, \
+             patch.object(open_app, "_launch_resolved") as launch:
+            result = open_app.open_app({"app_name": "YouTube"})
+        self.assertIn("already open", result)
+        focus.assert_called_once_with(minimized)
         launch.assert_not_called()
 
     def test_explicit_second_roblox_is_moved_and_verified(self) -> None:
@@ -147,6 +179,26 @@ class OpenAppTests(unittest.TestCase):
             result = open_app.open_app({"app_name": "Roblox", "new_instance": True})
         self.assertIn("did not open a second", result)
         self.assertNotIn("Opened a second", result)
+
+    def test_spoken_roblox_again_forms_request_a_second_instance(self) -> None:
+        for phrase in ("Roblox again", "Roblox nochmal", "Roblox erneut"):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(open_app._explicit_second_instance({}, phrase))
+
+    def test_again_launches_the_first_roblox_normally_when_none_is_open(self) -> None:
+        first = WindowInfo(
+            handle=303, title="Roblox", process="RobloxPlayerBeta.exe", pid=33,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_ROBLOX_ENTRY], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 33, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=first), \
+             patch.object(open_app, "_second_roblox_instance") as second:
+            result = open_app.open_app({"app_name": "Roblox again"})
+        self.assertIn("Opened Roblox", result)
+        self.assertNotIn("second Roblox", result)
+        second.assert_not_called()
 
 
 if __name__ == "__main__":

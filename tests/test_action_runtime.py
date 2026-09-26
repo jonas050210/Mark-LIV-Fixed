@@ -87,6 +87,88 @@ class ActionRuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.as_text(), "hello")
 
+    def test_discovery_defers_module_side_effects_until_first_execution(self) -> None:
+        with TemporaryDirectory() as temp:
+            marker = Path(temp) / "loaded"
+            path = Path(temp) / "lazy_demo.py"
+            path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('loaded')\n"
+                "def handler(parameters): return 'ready'\n"
+                "TOOL = {'name': 'lazy_demo', 'description': 'lazy', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            self.assertFalse(marker.exists())
+            self.assertFalse(registry.is_loaded("lazy_demo"))
+
+            result = registry.execute("lazy_demo", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "ready")
+            self.assertTrue(marker.exists())
+            self.assertTrue(registry.is_loaded("lazy_demo"))
+
+    def test_lazy_execution_uses_the_checked_startup_source_snapshot(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "snapshot_demo.py"
+            path.write_text(
+                "def handler(parameters): return 'checked version'\n"
+                "TOOL = {'name': 'snapshot_demo', 'description': 'snapshot', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            path.write_text(
+                "def handler(parameters): return 'changed after discovery'\n"
+                "TOOL = {'name': 'snapshot_demo', 'description': 'snapshot', 'handler': handler}\n",
+                encoding="utf-8",
+            )
+            # Simulate another import path loading the modified on-disk module
+            # before the registry sees its first tool call. The registry must
+            # still execute the trusted snapshot it registered at startup.
+            import importlib.util
+            import sys
+            spec = importlib.util.spec_from_file_location("actions.snapshot_demo", path)
+            external = importlib.util.module_from_spec(spec)
+            sys.modules["actions.snapshot_demo"] = external
+            self.assertIsNotNone(spec.loader)
+            spec.loader.exec_module(external)
+            self.assertEqual(external.handler({}), "changed after discovery")
+
+            result = registry.execute("snapshot_demo", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "checked version")
+
+    def test_lazy_action_dependencies_use_their_own_checked_snapshots(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            dependency = root / "lazy_dependency.py"
+            dependency.write_text(
+                "def dependency(parameters): return 'checked dependency'\n"
+                "TOOL = {'name': 'lazy_dependency', 'description': 'dependency', 'handler': dependency}\n",
+                encoding="utf-8",
+            )
+            (root / "lazy_parent.py").write_text(
+                "from actions.lazy_dependency import dependency\n"
+                "def parent(parameters): return dependency(parameters)\n"
+                "TOOL = {'name': 'lazy_parent', 'description': 'parent', 'handler': parent}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(root, logger=lambda _msg: None)
+            dependency.write_text(
+                "def dependency(parameters): return 'changed dependency'\n"
+                "TOOL = {'name': 'lazy_dependency', 'description': 'dependency', 'handler': dependency}\n",
+                encoding="utf-8",
+            )
+
+            result = registry.execute("lazy_parent", {}, {"trusted": True})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.as_text(), "checked dependency")
+            self.assertTrue(registry.is_loaded("lazy_dependency"))
+            self.assertTrue(registry.is_loaded("lazy_parent"))
+
     def test_confirmation_is_not_a_model_parameter(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "danger.py"
@@ -189,7 +271,7 @@ class ActionRuntimeTests(unittest.TestCase):
             result = registry.execute("admin_only", {}, {})
             self.assertEqual(result.status, "forbidden")
 
-    def test_optional_import_is_exposed_as_unavailable_capability(self) -> None:
+    def test_optional_import_loads_only_when_its_action_is_called(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "optional_action.py"
             path.write_text(
@@ -201,8 +283,11 @@ class ActionRuntimeTests(unittest.TestCase):
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
             record = registry.record("optional_action")
             self.assertIsNotNone(record)
-            self.assertFalse(record.available)
+            self.assertTrue(record.available)
+            self.assertFalse(callable(record.handler))
             self.assertEqual(registry.execute("optional_action", {}, {}).status, "unavailable")
+            self.assertFalse(record.available)
+            self.assertIn("missing optional dependency", record.error)
 
     def test_cancellation_event_stops_a_cooperative_handler(self) -> None:
         with TemporaryDirectory() as temp:
@@ -237,30 +322,85 @@ class ActionRuntimeTests(unittest.TestCase):
                 "gate = threading.Event()\n"
                 "entered = threading.Event()\n"
                 "def handler(parameters): entered.set(); gate.wait(5); return 'done'\n"
-                "TOOL = {'name': 'blocked', 'description': 'blocked', 'handler': handler, 'timeout_seconds': 2}\n",
+                "TOOL = {'name': 'pc_status', 'description': 'blocked', 'handler': handler, 'timeout_seconds': 2}\n",
                 encoding="utf-8",
             )
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
-            record = registry.record("blocked")
+            record = registry.record("pc_status")
+            self.assertIsNotNone(record)
+            self.assertEqual(registry._ensure_handler(record), "")
+            handler = record.handler
+            self.assertTrue(callable(handler))
             original = action_loader._ACTION_WORKER_SLOTS
             action_loader._ACTION_WORKER_SLOTS = threading.BoundedSemaphore(1)
             results = []
             worker = threading.Thread(
-                target=lambda: results.append(registry.execute("blocked", {}))
+                target=lambda: results.append(registry.execute("pc_status", {}))
             )
             try:
                 worker.start()
-                self.assertTrue(record.handler.__globals__["entered"].wait(1))
+                self.assertTrue(handler.__globals__["entered"].wait(1))
                 started = time.monotonic()
-                busy = registry.execute("blocked", {})
+                busy = registry.execute("pc_status", {})
                 self.assertEqual(busy.status, "busy")
                 self.assertLess(time.monotonic() - started, 0.2)
             finally:
-                record.handler.__globals__["gate"].set()
+                handler.__globals__["gate"].set()
                 worker.join(2)
                 action_loader._ACTION_WORKER_SLOTS = original
             self.assertTrue(results)
             self.assertEqual(results[0].status, "succeeded")
+
+    def test_resource_scheduler_serializes_conflicting_desktop_actions(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "desktop_writer.py"
+            path.write_text(
+                "import threading\n"
+                "gate = threading.Event()\n"
+                "first_entered = threading.Event()\n"
+                "calls = []\n"
+                "def handler(parameters):\n"
+                "    calls.append(parameters.get('action'))\n"
+                "    first_entered.set()\n"
+                "    gate.wait(2)\n"
+                "    return 'done'\n"
+                "TOOL = {'name': 'window_manager', 'description': 'writer', "
+                "'parameters': {'type': 'OBJECT', 'properties': {'action': {'type': 'STRING'}}}, "
+                "'handler': handler, 'timeout_seconds': 5}\n",
+                encoding="utf-8",
+            )
+            registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            record = registry.record("window_manager")
+            self.assertIsNotNone(record)
+            self.assertEqual(registry._ensure_handler(record), "")
+            handler = record.handler
+            self.assertTrue(callable(handler))
+            results = []
+            first = threading.Thread(
+                target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
+            )
+            first.start()
+            self.assertTrue(handler.__globals__["first_entered"].wait(1))
+
+            second = threading.Thread(
+                target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
+            )
+            second.start()
+            time.sleep(0.08)
+            self.assertEqual(handler.__globals__["calls"], ["move"])
+            handler.__globals__["gate"].set()
+            first.join(2)
+            second.join(2)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result.ok for result in results))
+            self.assertEqual(handler.__globals__["calls"], ["move", "move"])
+
+    def test_resource_policy_marks_diagnostics_read_only_and_window_moves_exclusive(self) -> None:
+        from core.action_loader import _resource_claims
+
+        self.assertEqual(_resource_claims("pc_status", {"action": "lag_check"}), {"diagnostics": "shared"})
+        self.assertEqual(_resource_claims("window_manager", {"action": "list_windows"}), {"desktop": "shared"})
+        self.assertEqual(_resource_claims("window_manager", {"action": "move"}), {"desktop": "exclusive"})
 
     def test_legacy_handler_gets_a_deadline(self) -> None:
         with TemporaryDirectory() as temp:

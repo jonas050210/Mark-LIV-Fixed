@@ -7,27 +7,18 @@ or changes files and never interpolates user text into a shell command.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import platform
 import shutil
 import subprocess
 import time
-import uuid
 from pathlib import Path
 
 from core.path_policy import PathPolicyError, resolve_user_path
+from core.user_paths import KNOWN_FOLDER_GUIDS as _KNOWN_FOLDER_GUIDS
+from core.user_paths import locations as _user_locations
 
 _OS = platform.system()
-
-_KNOWN_FOLDER_GUIDS = {
-    "desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
-    "documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
-    "downloads": "374DE290-123F-4565-9164-39C4925E467B",
-    "pictures": "33E28130-4E1E-4676-835A-98395C3BC3BB",
-    "music": "4BD8D571-6D19-48D3-BE97-422220080E43",
-    "videos": "18989B1D-99B5-455B-841C-AB7C74E4DDFC",
-}
 _LOCATION_ALIASES = {
     "desktop": "desktop", "downloads": "downloads", "download": "downloads",
     "documents": "documents", "document": "documents", "docs": "documents",
@@ -41,45 +32,14 @@ _SKIP_DIRS = {
 }
 
 
-def _known_folder_windows(guid_text: str) -> Path | None:
-    if _OS != "Windows":
-        return None
-    try:
-        class GUID(ctypes.Structure):
-            _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
-                        ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
-        guid = GUID()
-        raw = uuid.UUID(guid_text).bytes_le
-        ctypes.memmove(ctypes.byref(guid), raw, ctypes.sizeof(guid))
-        pointer = ctypes.c_wchar_p()
-        shell32 = ctypes.windll.shell32
-        result = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(pointer))
-        if result != 0 or not pointer.value:
-            return None
-        value = Path(pointer.value)
-        ctypes.windll.ole32.CoTaskMemFree(pointer)
-        return value
-    except Exception:
-        return None
-
-
 def locations() -> dict[str, Path]:
-    home = Path.home()
-    out: dict[str, Path] = {"home": home}
-    for name, guid in _KNOWN_FOLDER_GUIDS.items():
-        native = _known_folder_windows(guid)
-        if native is not None:
-            out[name] = native
-            continue
-        if name == "desktop":
-            fallback = os.environ.get("XDG_DESKTOP_DIR")
-            out[name] = Path(fallback) if fallback else home / "Desktop"
-        elif name == "downloads":
-            fallback = os.environ.get("XDG_DOWNLOAD_DIR")
-            out[name] = Path(fallback) if fallback else home / "Downloads"
-        else:
-            out[name] = home / name.capitalize()
-    return out
+    """Return the canonical user folders shared by file and launcher actions.
+
+    On Windows this reads Known Folders rather than constructing ``~/Desktop``;
+    therefore OneDrive Folder Backup and a redirected Documents folder work in
+    the explorer, dashboard and voice actions alike.
+    """
+    return _user_locations()
 
 
 def resolve_location(value: str | Path, *, allow_missing: bool = True) -> Path:

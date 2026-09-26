@@ -18,6 +18,7 @@ from urllib.parse import quote_plus, urlsplit
 
 from core import browser_handoff
 from core.path_policy import move_no_replace, resolve_user_path
+from core.user_paths import location as _user_location
 
 # Playwright is optional: native URL navigation remains useful without it.
 # Import the automation package only when an interactive browser action is
@@ -989,7 +990,7 @@ class _BrowserSession:
         page = await self._get_page()
         staging = None
         try:
-            default_parent = Path.home() / "Desktop"
+            default_parent = _user_location("desktop")
             if not default_parent.is_dir():
                 default_parent = Path.home()
             target = resolve_user_path(

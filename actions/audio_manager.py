@@ -12,6 +12,44 @@ from memory.config_manager import (
 )
 
 
+def _selected_device_name(value: str, kind: str) -> tuple[str | None, str]:
+    """Map one spoken device name to a currently selectable endpoint.
+
+    Saving a misspelled or disconnected microphone used to look successful, but
+    only failed later when MARK LIV reopened its audio stream and silently fell
+    back to the system default.  Resolve exact names first and tolerate one
+    unambiguous partial name; never guess between several headsets or webcams.
+    """
+    label = "microphone" if kind == "input" else "speaker"
+    try:
+        devices = audio_devices.list_devices(kind)
+    except Exception as exc:
+        return None, f"Could not check available {label}s ({type(exc).__name__})."
+    if not devices:
+        return None, f"No selectable {label}s are available right now."
+    wanted = " ".join(str(value or "").casefold().split())
+    exact = [item for item in devices if " ".join(item.casefold().split()) == wanted]
+    if exact:
+        return exact[0], ""
+    candidates = [
+        item for item in devices
+        if wanted and wanted in " ".join(item.casefold().split())
+    ]
+    if len(candidates) == 1:
+        return candidates[0], ""
+    if len(candidates) > 1:
+        return (
+            None,
+            f"'{value}' matches more than one {label}: {', '.join(candidates[:4])}. "
+            "Use the exact name from list audio devices.",
+        )
+    return (
+        None,
+        f"I could not find a selectable {label} called '{value}'. "
+        "Say list audio devices to check the exact name.",
+    )
+
+
 def audio_manager(parameters: dict | None = None, player=None) -> str:
     p = parameters if isinstance(parameters, dict) else {}
     action = str(p.get("action") or "list")[:32].casefold().strip().replace(" ", "_")
@@ -68,11 +106,19 @@ def audio_manager(parameters: dict | None = None, player=None) -> str:
 
         if not value:
             return "Tell me the microphone name, or say list audio devices."
+        resolved, error = _selected_device_name(value, "input")
+        if resolved is None:
+            return error
+        value = resolved
         save_input_device(value)
         selected = "microphone"
     elif action in {"output", "speakers", "set_output", "set_speakers"}:
         if not value:
             return "Tell me the speaker name, or say list audio devices."
+        resolved, error = _selected_device_name(value, "output")
+        if resolved is None:
+            return error
+        value = resolved
         save_output_device(value)
         selected = "speakers"
     elif action in {"default", "system_default"}:

@@ -283,8 +283,46 @@ def _is_roblox(value: str) -> bool:
     return "roblox" in _normalised_window_text(value)
 
 
+def _window_query_terms(value: str) -> set[str]:
+    return {
+        term for term in _normalised_window_text(value).split()
+        if len(term) >= 3 and term not in {"open", "launch", "start", "application", "app"}
+    }
+
+
+def _window_match_score(window, query: str, *, allow_title: bool = True) -> int:
+    """Score one window against a requested app without one-word false matches."""
+    text = _normalised_window_text(query)
+    terms = _window_query_terms(query)
+    if not text or not terms:
+        return 0
+    title = _normalised_window_text(getattr(window, "title", ""))
+    process = _normalised_window_text(getattr(window, "process", ""))
+
+    # A process match is strongest: browser page titles are arbitrary and often
+    # include a word such as "code", "word", or "steam" without being that
+    # desktop application at all.
+    if text in process:
+        return 120
+    if allow_title and text in title:
+        return 110
+    if all(term in process for term in terms):
+        return 100
+    if allow_title and all(term in title for term in terms):
+        return 90
+    return 0
+
+
 def _matching_windows(requested: str, normalized: str):
-    """Return visible windows belonging to an application, without launching it."""
+    """Return confidently matched app windows, ordered by identity strength.
+
+    A previous any-word match treated a Chrome tab named "Code Search" as Visual
+    Studio Code, then focused or restarted the browser when the user asked for
+    their editor.  Multi-word spoken names must now match as a whole (or all
+    meaningful words). A shorter platform alias like ``code`` can still match
+    an executable's process name, but is deliberately not allowed to match an
+    unrelated page title by itself.
+    """
     try:
         from core.window_manager import list_windows
         windows = list_windows()
@@ -294,22 +332,34 @@ def _matching_windows(requested: str, normalized: str):
 
     requested_text = _normalised_window_text(requested)
     normalized_text = _normalised_window_text(normalized)
-    terms = {
-        term for value in (requested_text, normalized_text)
-        for term in value.split()
-        if len(term) >= 3 and term not in {"open", "launch", "start", "application", "app"}
-    }
-    matches = []
+    requested_terms = _window_query_terms(requested)
+    normalized_terms = _window_query_terms(normalized)
+    weaker_normalized_name = (
+        normalized_text != requested_text
+        and (
+            len(normalized_terms) <= 1
+            or (requested_terms and normalized_terms < requested_terms)
+        )
+    )
+    scored = []
     for window in windows:
-        title = _normalised_window_text(getattr(window, "title", ""))
-        process = _normalised_window_text(getattr(window, "process", ""))
         if _is_roblox(requested) or _is_roblox(normalized):
-            matched = "roblox" in title or "roblox" in process
+            title = _normalised_window_text(getattr(window, "title", ""))
+            process = _normalised_window_text(getattr(window, "process", ""))
+            score = 120 if "roblox" in process else 110 if "roblox" in title else 0
         else:
-            matched = any(term in title or term in process for term in terms)
-        if matched:
-            matches.append(window)
-    return matches
+            score = _window_match_score(window, requested_text)
+            if normalized_text != requested_text:
+                score = max(
+                    score,
+                    _window_match_score(
+                        window, normalized_text, allow_title=not weaker_normalized_name,
+                    ),
+                )
+        if score:
+            scored.append((score, window))
+    scored.sort(key=lambda row: (-row[0], int(getattr(row[1], "handle", 0) or 0)))
+    return [window for _score, window in scored]
 
 
 def _browser_title_match_may_be_a_web_app(existing, *queries: str) -> bool:
@@ -342,9 +392,8 @@ def _browser_title_match_may_be_a_web_app(existing, *queries: str) -> bool:
 
 def _focus_window(window) -> bool:
     try:
-        from core.window_manager import operate
-        operate(window, "focus")
-        return True
+        from core.window_manager import focus_window
+        return focus_window(window)
     except Exception as exc:
         print(f"[open_app] could not focus existing window ({type(exc).__name__}).")
         return False
@@ -424,6 +473,11 @@ def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
     phrases = (
         "another roblox", "second roblox", "new roblox", "roblox instance",
         "another instance of roblox", "second instance of roblox",
+        # The tool call can preserve part of the spoken request in app_name.
+        # Treat English and German "again" forms as an explicit request for a
+        # second client, never as a normal idempotent open/focus request.
+        "roblox again", "open roblox again", "launch roblox again", "start roblox again",
+        "roblox nochmal", "roblox noch mal", "roblox erneut", "roblox wieder",
     )
     return any(phrase in text for phrase in phrases)
 
@@ -466,6 +520,13 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
     started_at = time.monotonic()
     deadline = started_at + max(1.0, timeout)
     single_new_since: float | None = None
+    # A window matching the requested name may already have existed just before
+    # the launch snapshot (or appear while cancellation is being requested).
+    # Give a new process a tiny settling interval before accepting a title-only
+    # match; PID ownership remains immediate above. This also makes a cancelled
+    # wait deterministic instead of sometimes returning an unrelated Chrome
+    # window before its cancellation event can be observed.
+    title_match_not_before = started_at + 0.20
     while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             return None
@@ -505,7 +566,7 @@ def _await_launched_window(app_name: str, normalized: str, pid: int | None,
         matching_new = [
             window for window in matching_all if _window_key(window) not in existing_keys
         ]
-        if matching_new:
+        if matching_new and time.monotonic() >= title_match_not_before:
             return matching_new[-1]
 
         if allow_focused_existing and time.monotonic() - started_at >= 0.75:
@@ -547,6 +608,11 @@ def _placement_request(parameters: dict) -> tuple[int | str | None, str]:
     else:
         monitor_ref = None
     state = str(parameters.get("state") or "").casefold().strip()
+    # Voice "fullscreen" means the Windows maximise control for this app, not
+    # F11. The taskbar remains visible; core.window_manager handles the native
+    # operation by window handle.
+    if state in {"fullscreen", "fulscreen", "full_screen", "full screen", "full"}:
+        state = "maximized"
     return monitor_ref, state
 
 
@@ -738,7 +804,10 @@ def _open_app_core(
                 f"{failure or 'the launch was refused'}."
             )
 
-        if is_roblox and explicit_second:
+        # "Again" means a second Roblox client only when one was already
+        # present. If the first client is not running, launch it normally rather
+        # than calling it a second instance or moving it to a surprising monitor.
+        if is_roblox and explicit_second and existing:
             return _second_roblox_instance(
                 app_name, normalized, existing, existing_keys, cancel_event=cancel_event,
             )
@@ -820,6 +889,32 @@ def open_app_result(
     retry without re-parsing English sentences that are free to be reworded.
     """
     return _open_app_core(parameters, response, player, session_memory, cancel_event)
+
+
+def _open_app_action(
+    parameters=None,
+    response=None,
+    player=None,
+    session_memory=None,
+    cancel_event=None,
+) -> dict:
+    """Registry handler with an explicit success result for dashboard/runtime state.
+
+    The public ``open_app`` function intentionally remains a text convenience
+    wrapper for older callers.  Its honest failure text can start with "I
+    started … but no window appeared", though, which a generic string adapter
+    cannot reliably classify.  The action registry receives the boolean from
+    the verified launch pipeline directly instead of guessing from prose.
+    """
+    ok, message = open_app_result(
+        parameters, response, player, session_memory, cancel_event,
+    )
+    return {
+        "ok": ok,
+        "status": "succeeded" if ok else "failed",
+        "message": message,
+        "data": {},
+    }
 
 
 def _remember_launch(name: str, window) -> None:
@@ -960,7 +1055,7 @@ TOOL = {
                 "type": "STRING",
                 "enum": ["normal", "maximized", "fullscreen", "minimized", "left", "right", "top", "bottom"],
                 "maxLength": 16,
-                "description": "Window state after opening: fullscreen, maximized, minimized, or a snap side."
+                "description": "Window state after opening. fullscreen means native maximized with the taskbar visible; also supports maximized, minimized, or a snap side."
             },
             "arguments": {
                 "type": "ARRAY",
@@ -970,12 +1065,12 @@ TOOL = {
             },
             "new_instance": {
                 "type": "BOOLEAN",
-                "description": "Only set true when the user explicitly asks for another or second instance."
+                "description": "Only set true when the user explicitly asks for another, second, or 'again' instance (for example 'open Roblox again' / 'Roblox nochmal')."
             }
         },
         "required": [
             "app_name"
         ]
     },
-    "handler": open_app,
+    "handler": _open_app_action,
 }

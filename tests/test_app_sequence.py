@@ -110,7 +110,7 @@ class SequentialExecutionTests(unittest.TestCase):
                 {"app_name": "Arena AI", "monitor": "2", "state": "left"},
             ]})
         self.assertEqual(calls[0]["monitor"], "primary")
-        self.assertEqual(calls[0]["state"], "fullscreen")
+        self.assertEqual(calls[0]["state"], "maximized")
         self.assertEqual(calls[1]["monitor"], "2")
         self.assertEqual(calls[1]["state"], "left")
 

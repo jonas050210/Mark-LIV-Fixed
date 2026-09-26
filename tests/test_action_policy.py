@@ -93,6 +93,14 @@ class ActionSchemaTests(unittest.TestCase):
         self.assertEqual(invalid.status, "invalid_result")
         self.assertFalse(invalid.ok)
 
+    def test_legacy_i_could_not_messages_are_not_reported_as_success(self) -> None:
+        """Many established actions use this human-friendly failure phrasing."""
+        result = ActionResult.from_handler(
+            "file_controller", "I could not copy it: permission was denied."
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+
 
 class BrowserInputTests(unittest.TestCase):
     def test_url_normalization_accepts_web_urls_and_rejects_local_protocols(self) -> None:

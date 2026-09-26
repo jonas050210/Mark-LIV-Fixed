@@ -4,7 +4,12 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from actions.open_app import _alias_target, _matching_windows, open_app
+from actions.open_app import (
+    _alias_target,
+    _confident_match,
+    _matching_windows,
+    open_app_result,
+)
 from core.app_index import load_index, resolve
 from core.window_manager import operate
 
@@ -69,9 +74,31 @@ def _status(name: str, *, detailed: bool = False) -> str:
 
 
 def _restart(name: str) -> str:
+    """Gracefully restart one app only when its relaunch target is trustworthy.
+
+    A visible window alone is not enough to make restart safe.  Earlier code
+    closed an unindexed app and only then discovered that it had no launch entry
+    with which to bring it back.  Keep that app open instead: closing a program
+    containing unsaved work without being able to relaunch it is worse than
+    declining a restart request.
+    """
     windows, entries = _snapshot(name)
     if not windows and not entries:
         return f"I could not find an installed application called '{name}'."
+
+    normalized = _alias_target(name)
+    if windows and not entries:
+        return (
+            f"Could not safely restart '{name}': it is running, but I cannot find a "
+            "verified launch entry for it. I left its window open. Use diagnose or rescan "
+            "applications first."
+        )
+    if windows and not _confident_match(entries, normalized, name):
+        choices = ", ".join(entry.name for entry in entries[:4])
+        return (
+            f"Could not safely restart '{name}': it matches more than one launch target "
+            f"({choices}). I left the current window open; name the exact application."
+        )
 
     if entries and entries[0].source == "webapp" and windows:
         browser_processes = ("chrome", "msedge", "brave", "vivaldi", "opera")
@@ -80,28 +107,31 @@ def _restart(name: str) -> str:
             for window in windows
         ):
             return (
-                f"I found the {name} web-app shortcut, but Windows exposes its window "
-                "as a browser process. I cannot safely distinguish that app window from "
-                "an ordinary browser tab, so I did not close either one."
+                f"Could not safely restart '{name}': Windows exposes its web-app window "
+                "as a browser process, so I cannot safely distinguish it from an ordinary "
+                "browser tab. I did not close either one."
             )
 
     for window in windows:
         try:
             operate(window, "close")
         except Exception as exc:
-            return f"I could not close {window.title or name} ({type(exc).__name__})."
+            return f"Could not close {window.title or name} ({type(exc).__name__})."
 
     deadline = time.monotonic() + 10.0
-    normalized = _alias_target(name)
     while windows and time.monotonic() < deadline:
         time.sleep(0.2)
         windows = _matching_windows(name, normalized)
     if windows:
         return (
-            f"{name} did not close within 10 seconds, so I did not force-kill it or "
-            "start a duplicate."
+            f"Could not restart '{name}': it did not close within 10 seconds, so I did "
+            "not force-kill it or start a duplicate."
         )
-    return open_app({"app_name": entries[0].name if entries else name})
+
+    started, message = open_app_result({"app_name": entries[0].name if entries else name})
+    if not started:
+        return f"Could not restart '{name}': {message}"
+    return message
 
 
 def app_lifecycle(parameters: dict | None = None, player=None) -> str:

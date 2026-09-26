@@ -132,6 +132,10 @@ def _validate_steps(raw) -> tuple[list[dict], str]:
         if not app_name:
             return [], f"Step {index} is missing an app_name or a media action."
         state = str(item.get("state") or "").strip().casefold()
+        # Keep spoken fullscreen consistent with open_app/window_manager: use
+        # the native maximize button and preserve access to the taskbar.
+        if state in {"fullscreen", "fulscreen", "full_screen", "full screen", "full"}:
+            state = "maximized"
         if state and state not in _ALLOWED_STATES:
             return [], f"Step {index}: state must be one of {', '.join(sorted(_ALLOWED_STATES))}."
         steps.append({
@@ -327,7 +331,7 @@ TOOL = {
                             "type": "STRING",
                             "enum": sorted(_ALLOWED_STATES),
                             "maxLength": 16,
-                            "description": "Window state after opening: fullscreen, maximized, minimized, or a snap side.",
+                            "description": "Window state after opening. Spoken fullscreen uses native maximized mode with the taskbar visible; also supports maximized, minimized, or a snap side.",
                         },
                         "arguments": {
                             "type": "ARRAY",

@@ -17,6 +17,7 @@ except ImportError:
 
 from core.undo import push_undo, refuse
 from core import explorer
+from core.user_paths import location as _user_location
 from core.path_policy import (
     FileFingerprint,
     PathPolicyError,
@@ -223,47 +224,31 @@ def _read_regular_bytes(path: Path, limit: int) -> tuple[bytes, FileFingerprint]
     return content, captured
 
 
+# All file actions share the Shell/XDG location resolver with Explorer. On
+# Windows that means "desktop" refers to a redirected OneDrive Desktop rather
+# than the often-missing C:\\Users\\name\\Desktop fallback.
 def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
+    return _user_location("desktop")
+
 
 def _get_downloads() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Downloads"
+    return _user_location("downloads")
+
 
 def _get_documents() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Documents"
+    return _user_location("documents")
+
 
 def _get_pictures() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_PICTURES_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Pictures"
+    return _user_location("pictures")
+
 
 def _get_music() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_MUSIC_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Music"
+    return _user_location("music")
+
 
 def _get_videos() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_VIDEOS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Videos"
+    return _user_location("videos")
 
 
 def _resolve_path(raw: str) -> Path:
@@ -959,6 +944,160 @@ def find_files(name: str = "", extension: str = "",
         return f"Search error: {type(exc).__name__}"
 
 
+class _RecentFilesError(ValueError):
+    """A clear, user-facing refusal while reading recently modified files."""
+
+
+# Browser and download-manager temporary suffixes. These entries are useful to
+# report (they explain why a requested download is not ready), but must not win
+# a plain "show my latest download" selection over a completed file.
+_INCOMPLETE_DOWNLOAD_SUFFIXES = (
+    ".crdownload", ".part", ".partial", ".download", ".tmp",
+)
+
+
+def _incomplete_download(path: Path) -> bool:
+    return path.name.casefold().endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
+
+
+def _recent_extension(value: str) -> str:
+    extension = str(value or "").strip().casefold().lstrip("*")
+    if extension and not extension.startswith("."):
+        extension = "." + extension
+    if (
+        len(extension) > 32
+        or any(ord(char) < 32 for char in extension)
+        or "/" in extension
+        or "\\" in extension
+    ):
+        raise _RecentFilesError(
+            "The file extension must be a short value such as .pdf or .zip."
+        )
+    return extension
+
+
+def _recent_file_rows(
+    path: str = "downloads", count: int = 10, extension: str = "",
+) -> tuple[Path, list[tuple[int, str, int, Path]], bool, str]:
+    """Return bounded recent regular-file candidates without opening them."""
+    count = max(1, min(int(count), 50))
+    requested_extension = _recent_extension(extension)
+    target = _resolve_path(path)
+    if not _is_safe_path(target):
+        raise _RecentFilesError(f"Access denied: {target}")
+    if not target.exists():
+        raise _RecentFilesError(f"Path not found: {target}")
+    if not target.is_dir():
+        raise _RecentFilesError(f"Not a directory: {target}")
+
+    # A Downloads folder can contain a surprising number of entries. Bound the
+    # work just as list_files does, then make the limit visible instead of
+    # silently claiming the result covered the whole folder. Do not recurse:
+    # the immediate Downloads folder is predictable and avoids surfacing files
+    # from unrelated private locations.
+    newest: list[tuple[int, str, int, Path]] = []
+    scanned = 0
+    scan_capped = False
+    with os.scandir(target) as entries:
+        for entry in entries:
+            scanned += 1
+            if scanned > 10_000:
+                scan_capped = True
+                break
+            if entry.name.startswith(".") or _entry_is_link(entry):
+                continue
+            item = Path(entry.path)
+            if not _is_safe_path(item):
+                continue
+            try:
+                details = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(details.st_mode) or _is_reparse(details):
+                continue
+            if requested_extension and not item.name.casefold().endswith(requested_extension):
+                continue
+            newest.append((
+                int(details.st_mtime_ns), item.name.casefold(), int(details.st_size), item,
+            ))
+
+    newest.sort(key=lambda row: (-row[0], row[1]))
+    return target, newest[:count], scan_capped, requested_extension
+
+
+def get_recent_files(path: str = "downloads", count: int = 10, extension: str = "") -> str:
+    """List recent user files without opening or executing a downloaded file."""
+    try:
+        target, newest, scan_capped, requested_extension = _recent_file_rows(
+            path, count, extension
+        )
+        if not newest:
+            suffix = f" matching {requested_extension}" if requested_extension else ""
+            return f"No regular files{suffix} found directly in {target.name}/."
+
+        lines = [f"Most recent files in {target.name}/:"]
+        for index, (modified_ns, _name, size, item) in enumerate(newest, 1):
+            modified = datetime.fromtimestamp(modified_ns / 1_000_000_000).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            incomplete = " [still downloading]" if _incomplete_download(item) else ""
+            lines.append(f"{index}. {item.name} ({_format_size(size)}, {modified}){incomplete}")
+        if scan_capped:
+            lines.append("[Stopped after scanning 10,000 directory entries.]")
+        return "\n".join(lines)
+    except _RecentFilesError as exc:
+        return str(exc)
+    except Exception as e:
+        return f"Could not list recent files: {_why(e)}."
+
+
+def get_download_status(path: str = "downloads", count: int = 10) -> str:
+    """Report recent completed and still-downloading files without opening either."""
+    try:
+        target, newest, scan_capped, _extension = _recent_file_rows(path, count, "")
+        if not newest:
+            return f"No regular files found directly in {target.name}/."
+
+        incomplete = [row for row in newest if _incomplete_download(row[3])]
+        completed = [row for row in newest if not _incomplete_download(row[3])]
+        lines = [f"Download check in {target.name}/:"]
+        if incomplete:
+            lines.append("Still downloading or temporary (not opened):")
+            lines.extend(f"- {item.name}" for _mtime, _name, _size, item in incomplete)
+        if completed:
+            lines.append("Recent completed files:")
+            lines.extend(f"- {item.name}" for _mtime, _name, _size, item in completed)
+        if scan_capped:
+            lines.append("[Stopped after scanning 10,000 directory entries.]")
+        return "\n".join(lines)
+    except _RecentFilesError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"Could not check downloads: {_why(exc)}."
+
+
+def reveal_recent_file(path: str = "downloads", extension: str = "") -> str:
+    """Reveal one explicitly requested latest file in Explorer, never execute it."""
+    try:
+        # Keep enough newest candidates to skip a temporary browser download
+        # and reveal the newest completed file instead. The scanner remains
+        # bounded to one direct folder and at most 10,000 entries.
+        target, newest, _scan_capped, requested_extension = _recent_file_rows(
+            path, 50, extension
+        )
+        if not requested_extension:
+            newest = [row for row in newest if not _incomplete_download(row[3])]
+        if not newest:
+            if requested_extension:
+                return f"No regular files matching {requested_extension} found directly in {target.name}/."
+            return f"No completed regular files found directly in {target.name}/."
+        return explorer.open_in_explorer(newest[0][3], select=True)
+    except _RecentFilesError as exc:
+        return str(exc)
+    except Exception as e:
+        return f"Could not reveal the most recent file: {_why(e)}."
+
+
 def get_largest_files(path: str = "downloads", count: int = 10) -> str:
     count = max(1, min(int(count), 50))
     try:
@@ -1091,6 +1230,7 @@ def open_with_application(
     application: str,
     name: str = "",
     match_index: int | None = None,
+    cancel_event=None,
 ) -> str:
     """Resolve one safe file and pass it to an indexed application as argv."""
     app_name = str(application or "").strip()[:160]
@@ -1124,8 +1264,15 @@ def open_with_application(
         return f"Access denied: {target}"
     if not target.exists() or not target.is_file():
         return f"I could not find a file to open at {target}."
-    from actions.open_app import open_app
-    return open_app({"app_name": app_name, "arguments": [str(target)]})
+    from actions.open_app import open_app_result
+    launch_parameters = {"app_name": app_name, "arguments": [str(target)]}
+    if cancel_event is None:
+        opened, message = open_app_result(launch_parameters)
+    else:
+        opened, message = open_app_result(launch_parameters, cancel_event=cancel_event)
+    if not opened:
+        return f"Could not open '{target.name}' with {app_name}: {message}"
+    return message
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -1153,7 +1300,11 @@ def file_controller(
 ) -> str:
     params = parameters if isinstance(parameters, dict) else {}
     action = str(params.get("action") or "").lower().strip()
-    path = str(params.get("path") or ("home" if action == "find" else "desktop"))
+    default_path = "home" if action == "find" else "downloads" if action in {
+        "recent", "recent_files", "latest", "download_status", "downloads_check",
+        "reveal_recent", "show_latest"
+    } else "desktop"
+    path = str(params.get("path") or default_path)
     name = str(params.get("name") or "")
     match_index = params.get("match_index")
     if match_index is not None:
@@ -1175,6 +1326,7 @@ def file_controller(
                 application=params.get("application", ""),
                 name=name,
                 match_index=match_index,
+                cancel_event=cancel_event,
             )
 
         elif action in {"select", "show_in_explorer", "reveal"}:
@@ -1237,6 +1389,25 @@ def file_controller(
                 max_results=min(int(params.get("max_results", 20)), 50),
             )
 
+        elif action in {"recent", "recent_files", "latest"}:
+            return get_recent_files(
+                path=path,
+                count=int(params.get("count", 10)),
+                extension=params.get("extension", ""),
+            )
+
+        elif action in {"download_status", "downloads_check"}:
+            return get_download_status(
+                path=path,
+                count=int(params.get("count", 10)),
+            )
+
+        elif action in {"reveal_recent", "show_latest"}:
+            return reveal_recent_file(
+                path=path,
+                extension=params.get("extension", ""),
+            )
+
         elif action == "largest":
             return get_largest_files(
                 path=path,
@@ -1266,20 +1437,20 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Reliable Explorer and file control: open a file normally or with a named installed application, open folders, reveal exact files, search known folders, list, create, delete, move, copy, rename, read, write, and inspect disk usage.",
+    "description": "Reliable Explorer and file control: open a file normally or with a named installed application, open folders, reveal exact files, search known folders, list recent Downloads or other folder files without opening them, check incomplete browser downloads separately from completed files, or safely reveal the single latest completed requested file in Explorer without executing it. Also create, delete, move, copy, rename, read, write, and inspect disk usage.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "info"],
+                "enum": ["open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "recent", "download_status", "reveal_recent", "largest", "disk_usage", "info"],
                 "maxLength": 32,
-                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | info"
+                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | recent | download_status | reveal_recent | largest | disk_usage | info"
             },
             "path": {
                 "type": "STRING",
                 "maxLength": 500,
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "File/folder path or shortcut: desktop, downloads, documents, home. recent, download_status, and reveal_recent default to downloads when omitted."
             },
             "application": {
                 "type": "STRING",
@@ -1317,13 +1488,13 @@ TOOL = {
             "extension": {
                 "type": "STRING",
                 "maxLength": 32,
-                "description": "File extension to search (e.g. .pdf)"
+                "description": "File extension to search, list with recent, or filter reveal_recent (e.g. .pdf)"
             },
             "count": {
                 "type": "INTEGER",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Number of results for largest"
+                "description": "Number of results for recent, download_status, or largest"
             },
             "max_results": {
                 "type": "INTEGER",

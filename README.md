@@ -38,23 +38,25 @@ The assistant now has named window and monitor control. Examples:
 - `List my open windows and monitors`
 - `Restart MARK LIV`
 
-The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing a named application is immediate and does not add a MARK LIV confirmation; the application can still present its own native save prompt when it genuinely has unsaved work. The `app_lifecycle` action reports installation/process/window state and performs graceful app restarts without hotkeys or force-killing unsaved work. Power actions and Windows administrator/UAC operations are never silently bypassed.
+The restart command saves the current session, stops audio/wake-word workers, launches a fresh MARK LIV process, and then exits the old one. Closing a named application is immediate and does not add a MARK LIV confirmation; the application can still present its own native save prompt when it genuinely has unsaved work. The `app_lifecycle` action reports installation/process/window state and performs graceful app restarts without hotkeys or force-killing unsaved work. Say `why is my PC lagging?` for a read-only CPU/RAM/GPU/temperature check; an NVIDIA card such as an RTX 4060 Ti reports its actual GPU temperature through the local NVIDIA driver when NVML is available. It can show the biggest RAM-using apps but never closes anything automatically. Power actions and Windows administrator/UAC operations are never silently bypassed.
 
 The phone dashboard's **CONTROL** panel uses the same action registry as voice commands. It is the primary control surface rather than a hotkey collection: press **Ctrl/Cmd-K** for the command palette, use quick cards for windows, monitors, audio, Explorer, Task Manager, and relaunch, and use the per-window FOCUS/MIN/MAX/CLOSE controls. The FILE EXPLORER panel searches Home, Desktop, Downloads, Documents, or Pictures and offers separate OPEN and SELECT actions for each verified result. It shows live action IDs, progress, cancellation, confirmations, named-window occupancy, monitor tiles, audio health, and undo history. It is a control surface, not an unrestricted way around Windows security.
 
 MARK LIV launches applications from a real index of what is installed on the
 machine — Windows `App Paths` and Roblox protocol registry entries, Start-menu
-shortcuts (including generic Chrome/Edge web apps such as Arena, Twitch, and
-YouTube), versioned Roblox installations, `shell:AppsFolder` package ids, macOS
-application bundles, and Linux desktop entries. Web apps keep their original
-profile and app-id switches, so they open as standalone apps instead of ordinary
-browser tabs. It never presses the Windows key and types a name into the Start menu,
+shortcuts, personal Desktop shortcuts (including a OneDrive-redirected Desktop),
+generic Chrome/Edge web apps such as Arena, Twitch, and YouTube, versioned Roblox
+installations, `shell:AppsFolder` package ids, macOS application bundles, and Linux
+desktop entries. Web apps keep their original profile and app-id switches, so they
+open as standalone apps instead of ordinary browser tabs. It never presses the Windows key and types a name into the Start menu,
 so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming
 success. A stale executable or shortcut triggers one automatic index rebuild
 and one bounded retry; slow shortcuts and Store apps are verified with an
 adaptive before/after window check. Say `rescan my apps` after installing
-something new if you want to refresh proactively.
+something new if you want to refresh proactively. Say `diagnose my app <name>`
+when something is missing: it reports the real scan sources, OneDrive Desktop
+path, aliases, and matching entries rather than asking you to guess.
 
 The launcher also remembers what you actually use: the dashboard's **APP
 LAUNCHER** panel shows pinned and recently opened applications as icon buttons,
@@ -77,11 +79,24 @@ A layout stores each window's monitor, position, size and state, matched by
 process name rather than by window handle, so it survives a restart. Windows
 that are not running are reported, never launched behind your back.
 
+For repeatable app sets, workspaces save the launch plan separately from a window
+layout:
+
+- `Save a school workspace with Chrome and Word`
+- `Run my school workspace`
+- `List my workspaces` / `Delete workspace gaming`
+
+A workspace holds up to eight apps and optional monitor/state choices. It opens
+and verifies them sequentially through the normal app launcher, so a missing app
+is reported instead of being silently skipped.
+
 Placement is part of the same request:
 
-- `Open Chrome on monitor 2 in fullscreen`
+- `Open Chrome on monitor 2 in fullscreen` (also accepts the common voice-transcript spelling `fulscreen`; uses the normal Windows maximize button; taskbar stays visible, never F11)
 - `Open Spotify in the background` (focus stays where it is)
 - `Open Discord snapped left on monitor 1`
+- `Keep Roblox open and minimize the other windows` (one reversible tidy action; say `undo` to put the other windows back)
+- `Show my latest downloads` (lists recent files safely without opening them)
 
 Closing, minimising and switching are always done by window handle. Focus-
 dependent key combinations — `alt+f4`, `command+q`, `ctrl+w`, `alt+tab`, and the
@@ -99,7 +114,7 @@ and state.
 
 Application and Explorer control are deliberately conservative. `open Chrome` or `open Roblox` focuses an existing window instead of silently creating another one. A second Roblox client is only attempted for an explicit request such as `open another Roblox`; MARK LIV verifies the new window and moves it to the opposite monitor when a second display is available, otherwise it reports the limitation. File searches resolve Windows known folders, search the user's home folder by default, use Everything when installed, and show numbered candidates when more than one file matches. `open` and `select` only act on a unique exact or search result, so MARK LIV does not guess between similarly named files.
 
-The settings drawer includes a live HUD maximum frame-rate selector for 30, 60, 120, 240, or unlimited FPS. This changes MARK LIV's own software-rendered HUD, not game frame rates. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
+MARK LIV's own software-rendered HUD uses a fixed 180 FPS target; this never changes game frame rates. The frame-rate selector has been removed from settings. Clipboard-change detection and its pop-up panel have been removed; explicit copy/paste commands remain available.
 
 Audio can also be controlled by voice or the dashboard: say `list audio devices`, then `use JBL Quantum 400 microphone` or `use JBL Quantum 400 speakers`. The saved device name is resolved again after reconnects, so changing USB device indices does not silently select the wrong device. The admin panel reports selected input/output, connected/fallback state, host API, and sample rate. A reconnect request rebuilds both streams while keeping the conversation resumption handle.
 
@@ -119,7 +134,7 @@ Saved sessions live in the private transactional `memory/sessions.json` store. T
 
 ## Optional capabilities
 
-Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. Native browser opening and the rest of desktop control remain available.
+Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. `camera_manager` can report the configured webcam, scan usable camera indexes, test one, and save the selected index. A live webcam request starts the visible preview first and sends a later settled frame from that same stream. Native browser opening and the rest of desktop control remain available.
 
 ## Action safety and reliability
 

@@ -12,6 +12,7 @@ import hashlib
 import platform
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -579,13 +580,36 @@ def foreground_window() -> WindowInfo | None:
     return None
 
 
+def focus_window(window: WindowInfo, *, timeout: float = 0.75) -> bool:
+    """Focus a known window and verify it owns input on Windows.
+
+    ``SetForegroundWindow`` may be refused by Windows' foreground-lock rules
+    without raising an exception. Returning a successful call as "switched"
+    in that situation tells the user the wrong thing. Native Windows can report
+    the actual foreground HWND, so poll it briefly after the request. Other
+    desktop backends do not expose equivalent reliable focus state; there a
+    successful backend call remains the strongest honest result available.
+    """
+    operate(window, "focus")
+    if _OS != "Windows":
+        return True
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        current = foreground_window()
+        if current is not None and int(current.handle) == int(window.handle):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def restore_foreground(window: WindowInfo | None) -> bool:
     """Give focus back to a window that was in front before a launch."""
     if window is None:
         return False
     try:
-        operate(window, "focus")
-        return True
+        return focus_window(window)
     except Exception:
         return False
 
@@ -797,9 +821,14 @@ def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
     one, so the result can be verified instead of assumed.
     """
     state = str(state or "normal").casefold().strip()
-    if state in {"full", "full_screen", "full screen"}:
-        state = "fullscreen"
-    if state in {"maximize", "maximised"}:
+    # In ordinary speech, "fullscreen" almost always means the Windows
+    # maximise button (the square at top-right), not F11/video-game fullscreen.
+    # Maximising through the native window manager keeps the taskbar visible and
+    # avoids sending a focus-dependent key to the wrong application. Keep the
+    # legacy spelling accepted, but give it that safer, expected meaning.
+    if state in {"full", "full_screen", "full screen", "fullscreen", "fulscreen"}:
+        state = "maximized"
+    if state in {"maximize", "maximised", "maximise"}:
         state = "maximized"
     if state in {"minimize", "minimised"}:
         state = "minimized"
@@ -813,9 +842,7 @@ def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
     if monitor is not None:
         # Maximised or snapped windows ignore MoveWindow, so restore first.
         operate(window, "restore")
-        if state == "fullscreen":
-            operate(window, "move", monitor.left, monitor.top, monitor.width, monitor.height)
-        elif state in {"left", "right", "top", "bottom"}:
+        if state in {"left", "right", "top", "bottom"}:
             snap_window(window, monitor, state)
         else:
             move_to_monitor(window, monitor)
@@ -824,10 +851,6 @@ def place_window(window: WindowInfo, monitor: MonitorInfo | None = None,
     else:
         if state == "maximized":
             operate(window, "maximize")
-        elif state == "fullscreen":
-            target = monitor_of(window) or list_monitors()[0]
-            operate(window, "restore")
-            operate(window, "move", target.left, target.top, target.width, target.height)
         elif state in {"left", "right", "top", "bottom"}:
             target = monitor_of(window) or list_monitors()[0]
             snap_window(window, target, state)
