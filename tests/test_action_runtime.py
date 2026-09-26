@@ -327,6 +327,10 @@ class ActionRuntimeTests(unittest.TestCase):
             )
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
             record = registry.record("pc_status")
+            self.assertIsNotNone(record)
+            self.assertEqual(registry._ensure_handler(record), "")
+            handler = record.handler
+            self.assertTrue(callable(handler))
             original = action_loader._ACTION_WORKER_SLOTS
             action_loader._ACTION_WORKER_SLOTS = threading.BoundedSemaphore(1)
             results = []
@@ -335,13 +339,13 @@ class ActionRuntimeTests(unittest.TestCase):
             )
             try:
                 worker.start()
-                self.assertTrue(record.handler.__globals__["entered"].wait(1))
+                self.assertTrue(handler.__globals__["entered"].wait(1))
                 started = time.monotonic()
                 busy = registry.execute("pc_status", {})
                 self.assertEqual(busy.status, "busy")
                 self.assertLess(time.monotonic() - started, 0.2)
             finally:
-                record.handler.__globals__["gate"].set()
+                handler.__globals__["gate"].set()
                 worker.join(2)
                 action_loader._ACTION_WORKER_SLOTS = original
             self.assertTrue(results)
@@ -366,31 +370,30 @@ class ActionRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             registry = discover_actions(Path(temp), logger=lambda _msg: None)
+            record = registry.record("window_manager")
+            self.assertIsNotNone(record)
+            self.assertEqual(registry._ensure_handler(record), "")
+            handler = record.handler
+            self.assertTrue(callable(handler))
             results = []
             first = threading.Thread(
                 target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
             )
             first.start()
-            deadline = time.monotonic() + 1
-            record = registry.record("window_manager")
-            while time.monotonic() < deadline:
-                handler = record.handler
-                if handler and handler.__globals__["first_entered"].wait(0.02):
-                    break
-            self.assertTrue(record.handler.__globals__["first_entered"].is_set())
+            self.assertTrue(handler.__globals__["first_entered"].wait(1))
 
             second = threading.Thread(
                 target=lambda: results.append(registry.execute("window_manager", {"action": "move"}))
             )
             second.start()
             time.sleep(0.08)
-            self.assertEqual(record.handler.__globals__["calls"], ["move"])
-            record.handler.__globals__["gate"].set()
+            self.assertEqual(handler.__globals__["calls"], ["move"])
+            handler.__globals__["gate"].set()
             first.join(2)
             second.join(2)
             self.assertEqual(len(results), 2)
             self.assertTrue(all(result.ok for result in results))
-            self.assertEqual(record.handler.__globals__["calls"], ["move", "move"])
+            self.assertEqual(handler.__globals__["calls"], ["move", "move"])
 
     def test_resource_policy_marks_diagnostics_read_only_and_window_moves_exclusive(self) -> None:
         from core.action_loader import _resource_claims
