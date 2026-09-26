@@ -5,7 +5,7 @@ opencv-python>=4.8,<5
 mss>=9,<11
 python-pptx
 openpyxl
-ddgs>=9,<10
+ddgs>=9.16.0,<10
 pdfplumber
 pypdf>=6,<7
 python-docx
