@@ -78,6 +78,44 @@ class RecentFilesTests(unittest.TestCase):
         self.assertEqual(result, "Selected newest.pdf")
         reveal.assert_called_once_with(newest, select=True)
 
+    def test_reveal_recent_skips_an_incomplete_download_for_plain_latest_requests(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            completed = root / "setup.exe"
+            incomplete = root / "setup.exe.crdownload"
+            completed.write_bytes(b"complete")
+            incomplete.write_bytes(b"still downloading")
+            now = time.time()
+            os.utime(completed, (now - 30, now - 30))
+            os.utime(incomplete, (now, now))
+            with patch.object(file_controller.explorer, "open_in_explorer", return_value="selected") as reveal:
+                result = file_controller.reveal_recent_file(str(root))
+
+        self.assertEqual(result, "selected")
+        reveal.assert_called_once_with(completed, select=True)
+
+    def test_download_status_separates_incomplete_and_completed_files(self) -> None:
+        with TemporaryDirectory(dir=Path.home()) as directory:
+            root = Path(directory)
+            completed = root / "lesson.pdf"
+            incomplete = root / "video.mp4.part"
+            completed.write_bytes(b"pdf")
+            incomplete.write_bytes(b"part")
+
+            result = file_controller.get_download_status(str(root))
+
+        self.assertIn("Still downloading or temporary", result)
+        self.assertIn("video.mp4.part", result)
+        self.assertIn("Recent completed files", result)
+        self.assertIn("lesson.pdf", result)
+        self.assertIn("not opened", result)
+
+    def test_download_status_action_defaults_to_downloads(self) -> None:
+        with patch.object(file_controller, "get_download_status", return_value="download status") as status:
+            result = file_controller.file_controller({"action": "download_status"})
+        self.assertEqual(result, "download status")
+        status.assert_called_once_with(path="downloads", count=10)
+
     def test_reveal_recent_action_defaults_to_downloads(self) -> None:
         with patch.object(file_controller, "reveal_recent_file", return_value="Selected note.txt") as reveal:
             result = file_controller.file_controller({"action": "reveal_recent"})

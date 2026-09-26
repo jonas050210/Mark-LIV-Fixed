@@ -948,6 +948,18 @@ class _RecentFilesError(ValueError):
     """A clear, user-facing refusal while reading recently modified files."""
 
 
+# Browser and download-manager temporary suffixes. These entries are useful to
+# report (they explain why a requested download is not ready), but must not win
+# a plain "show my latest download" selection over a completed file.
+_INCOMPLETE_DOWNLOAD_SUFFIXES = (
+    ".crdownload", ".part", ".partial", ".download", ".tmp",
+)
+
+
+def _incomplete_download(path: Path) -> bool:
+    return path.name.casefold().endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
+
+
 def _recent_extension(value: str) -> str:
     extension = str(value or "").strip().casefold().lstrip("*")
     if extension and not extension.startswith("."):
@@ -1028,7 +1040,8 @@ def get_recent_files(path: str = "downloads", count: int = 10, extension: str = 
             modified = datetime.fromtimestamp(modified_ns / 1_000_000_000).strftime(
                 "%Y-%m-%d %H:%M"
             )
-            lines.append(f"{index}. {item.name} ({_format_size(size)}, {modified})")
+            incomplete = " [still downloading]" if _incomplete_download(item) else ""
+            lines.append(f"{index}. {item.name} ({_format_size(size)}, {modified}){incomplete}")
         if scan_capped:
             lines.append("[Stopped after scanning 10,000 directory entries.]")
         return "\n".join(lines)
@@ -1038,15 +1051,46 @@ def get_recent_files(path: str = "downloads", count: int = 10, extension: str = 
         return f"Could not list recent files: {_why(e)}."
 
 
+def get_download_status(path: str = "downloads", count: int = 10) -> str:
+    """Report recent completed and still-downloading files without opening either."""
+    try:
+        target, newest, scan_capped, _extension = _recent_file_rows(path, count, "")
+        if not newest:
+            return f"No regular files found directly in {target.name}/."
+
+        incomplete = [row for row in newest if _incomplete_download(row[3])]
+        completed = [row for row in newest if not _incomplete_download(row[3])]
+        lines = [f"Download check in {target.name}/:"]
+        if incomplete:
+            lines.append("Still downloading or temporary (not opened):")
+            lines.extend(f"- {item.name}" for _mtime, _name, _size, item in incomplete)
+        if completed:
+            lines.append("Recent completed files:")
+            lines.extend(f"- {item.name}" for _mtime, _name, _size, item in completed)
+        if scan_capped:
+            lines.append("[Stopped after scanning 10,000 directory entries.]")
+        return "\n".join(lines)
+    except _RecentFilesError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"Could not check downloads: {_why(exc)}."
+
+
 def reveal_recent_file(path: str = "downloads", extension: str = "") -> str:
     """Reveal one explicitly requested latest file in Explorer, never execute it."""
     try:
+        # Keep enough newest candidates to skip a temporary browser download
+        # and reveal the newest completed file instead. The scanner remains
+        # bounded to one direct folder and at most 10,000 entries.
         target, newest, _scan_capped, requested_extension = _recent_file_rows(
-            path, 1, extension
+            path, 50, extension
         )
+        if not requested_extension:
+            newest = [row for row in newest if not _incomplete_download(row[3])]
         if not newest:
-            suffix = f" matching {requested_extension}" if requested_extension else ""
-            return f"No regular files{suffix} found directly in {target.name}/."
+            if requested_extension:
+                return f"No regular files matching {requested_extension} found directly in {target.name}/."
+            return f"No completed regular files found directly in {target.name}/."
         return explorer.open_in_explorer(newest[0][3], select=True)
     except _RecentFilesError as exc:
         return str(exc)
@@ -1257,7 +1301,8 @@ def file_controller(
     params = parameters if isinstance(parameters, dict) else {}
     action = str(params.get("action") or "").lower().strip()
     default_path = "home" if action == "find" else "downloads" if action in {
-        "recent", "recent_files", "latest", "reveal_recent", "show_latest"
+        "recent", "recent_files", "latest", "download_status", "downloads_check",
+        "reveal_recent", "show_latest"
     } else "desktop"
     path = str(params.get("path") or default_path)
     name = str(params.get("name") or "")
@@ -1351,6 +1396,12 @@ def file_controller(
                 extension=params.get("extension", ""),
             )
 
+        elif action in {"download_status", "downloads_check"}:
+            return get_download_status(
+                path=path,
+                count=int(params.get("count", 10)),
+            )
+
         elif action in {"reveal_recent", "show_latest"}:
             return reveal_recent_file(
                 path=path,
@@ -1386,20 +1437,20 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Reliable Explorer and file control: open a file normally or with a named installed application, open folders, reveal exact files, search known folders, list recent Downloads or other folder files without opening them, or safely reveal the single latest requested file in Explorer without executing it. Also create, delete, move, copy, rename, read, write, and inspect disk usage.",
+    "description": "Reliable Explorer and file control: open a file normally or with a named installed application, open folders, reveal exact files, search known folders, list recent Downloads or other folder files without opening them, check incomplete browser downloads separately from completed files, or safely reveal the single latest completed requested file in Explorer without executing it. Also create, delete, move, copy, rename, read, write, and inspect disk usage.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "recent", "reveal_recent", "largest", "disk_usage", "info"],
+                "enum": ["open", "open_with", "open_folder", "explorer", "select", "show_in_explorer", "reveal", "list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "recent", "download_status", "reveal_recent", "largest", "disk_usage", "info"],
                 "maxLength": 32,
-                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | recent | reveal_recent | largest | disk_usage | info"
+                "description": "open | select | list | create_file | create_folder | delete | move | copy | rename | read | write | find | recent | download_status | reveal_recent | largest | disk_usage | info"
             },
             "path": {
                 "type": "STRING",
                 "maxLength": 500,
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home. recent and reveal_recent default to downloads when omitted."
+                "description": "File/folder path or shortcut: desktop, downloads, documents, home. recent, download_status, and reveal_recent default to downloads when omitted."
             },
             "application": {
                 "type": "STRING",
@@ -1443,7 +1494,7 @@ TOOL = {
                 "type": "INTEGER",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Number of results for recent or largest"
+                "description": "Number of results for recent, download_status, or largest"
             },
             "max_results": {
                 "type": "INTEGER",

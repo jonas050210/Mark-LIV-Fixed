@@ -473,6 +473,11 @@ def _explicit_second_instance(parameters: dict, app_name: str) -> bool:
     phrases = (
         "another roblox", "second roblox", "new roblox", "roblox instance",
         "another instance of roblox", "second instance of roblox",
+        # The tool call can preserve part of the spoken request in app_name.
+        # Treat English and German "again" forms as an explicit request for a
+        # second client, never as a normal idempotent open/focus request.
+        "roblox again", "open roblox again", "launch roblox again", "start roblox again",
+        "roblox nochmal", "roblox noch mal", "roblox erneut", "roblox wieder",
     )
     return any(phrase in text for phrase in phrases)
 
@@ -799,7 +804,10 @@ def _open_app_core(
                 f"{failure or 'the launch was refused'}."
             )
 
-        if is_roblox and explicit_second:
+        # "Again" means a second Roblox client only when one was already
+        # present. If the first client is not running, launch it normally rather
+        # than calling it a second instance or moving it to a surprising monitor.
+        if is_roblox and explicit_second and existing:
             return _second_roblox_instance(
                 app_name, normalized, existing, existing_keys, cancel_event=cancel_event,
             )
@@ -1057,7 +1065,7 @@ TOOL = {
             },
             "new_instance": {
                 "type": "BOOLEAN",
-                "description": "Only set true when the user explicitly asks for another or second instance."
+                "description": "Only set true when the user explicitly asks for another, second, or 'again' instance (for example 'open Roblox again' / 'Roblox nochmal')."
             }
         },
         "required": [

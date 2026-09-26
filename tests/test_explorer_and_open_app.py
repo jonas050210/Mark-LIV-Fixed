@@ -139,6 +139,20 @@ class OpenAppTests(unittest.TestCase):
         focus.assert_called_once_with(self.window)
         launch.assert_not_called()
 
+    def test_opening_a_minimized_app_restores_and_focuses_its_existing_window(self) -> None:
+        minimized = WindowInfo(
+            handle=101, title="YouTube", process="chrome.exe", pid=11,
+            left=0, top=0, right=800, bottom=600, minimized=True,
+        )
+        with patch.object(open_app, "_matching_windows", return_value=[minimized]), \
+             patch.object(open_app, "_browser_title_match_may_be_a_web_app", return_value=False), \
+             patch.object(open_app, "_focus_window", return_value=True) as focus, \
+             patch.object(open_app, "_launch_resolved") as launch:
+            result = open_app.open_app({"app_name": "YouTube"})
+        self.assertIn("already open", result)
+        focus.assert_called_once_with(minimized)
+        launch.assert_not_called()
+
     def test_explicit_second_roblox_is_moved_and_verified(self) -> None:
         monitors = [
             MonitorInfo(1, "primary", 0, 0, 1920, 1080, 0, 0, 1920, 1040, primary=True),
@@ -165,6 +179,26 @@ class OpenAppTests(unittest.TestCase):
             result = open_app.open_app({"app_name": "Roblox", "new_instance": True})
         self.assertIn("did not open a second", result)
         self.assertNotIn("Opened a second", result)
+
+    def test_spoken_roblox_again_forms_request_a_second_instance(self) -> None:
+        for phrase in ("Roblox again", "Roblox nochmal", "Roblox erneut"):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(open_app._explicit_second_instance({}, phrase))
+
+    def test_again_launches_the_first_roblox_normally_when_none_is_open(self) -> None:
+        first = WindowInfo(
+            handle=303, title="Roblox", process="RobloxPlayerBeta.exe", pid=33,
+            left=0, top=0, right=800, bottom=600,
+        )
+        with patch.object(open_app, "_matching_windows", return_value=[]), \
+             patch.object(open_app, "_resolve_candidates", return_value=([_ROBLOX_ENTRY], False)), \
+             patch.object(open_app, "_launch_resolved", return_value=(True, 33, "")), \
+             patch.object(open_app, "_await_launched_window", return_value=first), \
+             patch.object(open_app, "_second_roblox_instance") as second:
+            result = open_app.open_app({"app_name": "Roblox again"})
+        self.assertIn("Opened Roblox", result)
+        self.assertNotIn("second Roblox", result)
+        second.assert_not_called()
 
 
 if __name__ == "__main__":
