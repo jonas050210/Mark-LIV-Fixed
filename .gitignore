@@ -46,8 +46,9 @@ memory/sessions.json
 memory/*.json.*
 # hidden private-store sidecars
 memory/.*.json.*
-# saved desktop window arrangements
+# saved desktop window arrangements and app workspaces
 memory/layouts.json
+memory/workspaces.json
 memory/*.db
 
 # ── Python build noise ────────────────────────────────────────────────────────

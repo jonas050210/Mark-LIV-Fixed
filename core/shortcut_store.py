@@ -8,19 +8,35 @@ from core.json_store import JsonStore, JsonStoreCorruptError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SHORTCUTS_FILE = BASE_DIR / "config" / "shortcuts.json"
-_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+# A spoken alias is often more than one word ("school mode", "my code").
+# Keep it human-friendly while excluding control characters and path separators;
+# aliases are dictionary keys, never paths.
+_ALIAS_RE = re.compile(r"^[^\\/][^\\/]{0,39}$")
 
 
 def _clean_alias(value: str) -> str:
     alias = " ".join(str(value or "").strip().casefold().split())
-    if not alias or len(alias) > 40 or not _ALIAS_RE.fullmatch(alias):
-        raise ValueError("shortcut names may contain only letters, numbers, dots, hyphens, and underscores")
+    valid = (
+        bool(alias)
+        and len(alias) <= 40
+        and bool(_ALIAS_RE.fullmatch(alias))
+        and alias[0].isalnum()
+        and all(char.isalnum() or char in " ._-" for char in alias)
+    )
+    if not valid:
+        raise ValueError(
+            "shortcut names may contain letters, numbers, spaces, dots, hyphens, and underscores"
+        )
     return alias
 
 
 def _clean_target(value: str) -> str:
     target = str(value or "").strip()
-    if not target or len(target) > 240 or any(ord(char) < 32 for char in target):
+    # OneDrive business folders and nested project shortcuts regularly exceed
+    # the old 240-character limit, even though Windows and the launcher accept
+    # the path. Keep a defensive upper bound, but do not make cloud-synced
+    # desktop aliases impossible to save.
+    if not target or len(target) > 1_024 or any(ord(char) < 32 for char in target):
         raise ValueError("shortcut target is empty or invalid")
     return target
 

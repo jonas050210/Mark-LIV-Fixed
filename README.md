@@ -44,17 +44,19 @@ The phone dashboard's **CONTROL** panel uses the same action registry as voice c
 
 MARK LIV launches applications from a real index of what is installed on the
 machine — Windows `App Paths` and Roblox protocol registry entries, Start-menu
-shortcuts (including generic Chrome/Edge web apps such as Arena, Twitch, and
-YouTube), versioned Roblox installations, `shell:AppsFolder` package ids, macOS
-application bundles, and Linux desktop entries. Web apps keep their original
-profile and app-id switches, so they open as standalone apps instead of ordinary
-browser tabs. It never presses the Windows key and types a name into the Start menu,
+shortcuts, personal Desktop shortcuts (including a OneDrive-redirected Desktop),
+generic Chrome/Edge web apps such as Arena, Twitch, and YouTube, versioned Roblox
+installations, `shell:AppsFolder` package ids, macOS application bundles, and Linux
+desktop entries. Web apps keep their original profile and app-id switches, so they
+open as standalone apps instead of ordinary browser tabs. It never presses the Windows key and types a name into the Start menu,
 so a launch cannot land in a search box, and it reports honestly when an
 application is not installed or when no window appeared instead of claiming
 success. A stale executable or shortcut triggers one automatic index rebuild
 and one bounded retry; slow shortcuts and Store apps are verified with an
 adaptive before/after window check. Say `rescan my apps` after installing
-something new if you want to refresh proactively.
+something new if you want to refresh proactively. Say `diagnose my app <name>`
+when something is missing: it reports the real scan sources, OneDrive Desktop
+path, aliases, and matching entries rather than asking you to guess.
 
 The launcher also remembers what you actually use: the dashboard's **APP
 LAUNCHER** panel shows pinned and recently opened applications as icon buttons,
@@ -76,6 +78,17 @@ Window arrangements can be saved and restored by name:
 A layout stores each window's monitor, position, size and state, matched by
 process name rather than by window handle, so it survives a restart. Windows
 that are not running are reported, never launched behind your back.
+
+For repeatable app sets, workspaces save the launch plan separately from a window
+layout:
+
+- `Save a school workspace with Chrome and Word`
+- `Run my school workspace`
+- `List my workspaces` / `Delete workspace gaming`
+
+A workspace holds up to eight apps and optional monitor/state choices. It opens
+and verifies them sequentially through the normal app launcher, so a missing app
+is reported instead of being silently skipped.
 
 Placement is part of the same request:
 
@@ -119,7 +132,7 @@ Saved sessions live in the private transactional `memory/sessions.json` store. T
 
 ## Optional capabilities
 
-Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. Native browser opening and the rest of desktop control remain available.
+Browser automation (Playwright), screen/camera capture (NumPy/OpenCV/MSS/Pillow), and system metrics (psutil) are optional. MARK LIV starts without them: imports are lazy, the action registry keeps a capability record, and the dashboard/voice result identifies the missing package instead of rejecting the whole application. `camera_manager` can report the configured webcam, scan usable camera indexes, test one, and save the selected index. A live webcam request starts the visible preview first and sends a later settled frame from that same stream. Native browser opening and the rest of desktop control remain available.
 
 ## Action safety and reliability
 
